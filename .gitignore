@@ -1,0 +1,13 @@
+# Derived index and local captures. Approved memory documents are the
+# source of truth; the vector database is rebuilt from them.
+data/
+
+# Session captures and transcripts. These can contain secrets and
+# unredacted conversation. Review happens before anything is kept.
+inbox/
+transcripts/
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
