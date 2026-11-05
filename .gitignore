@@ -7,6 +7,9 @@ data/
 inbox/
 transcripts/
 
+# Approved memories. They stay on this machine and are not published.
+memories/
+
 # Local configuration and credentials.
 .env
 .env.*

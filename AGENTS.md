@@ -1,6 +1,6 @@
 # Agent brief
 
-This repo is a brief, not a product yet. There is no application code and no database.
+This repo is a brief, not a product yet. There is no application code. The vector engine is Qdrant server, started by `scripts/setup` into `data/qdrant/`. The embedding model is `BAAI/bge-small-en-v1.5`, run by `scripts/embed`. See [docs/vector-engine.md](docs/vector-engine.md) and [docs/embedding-model.md](docs/embedding-model.md).
 
 ## This session’s job
 
@@ -8,9 +8,10 @@ Research first. Read [docs/context.md](docs/context.md), [docs/harnesses.md](doc
 
 ## Do not
 
-- Add a dependency, a vector engine, or an embedding model until the questions in [docs/research.md](docs/research.md) are answered.
+- Swap the vector engine or the embedding model. They are Qdrant server and `BAAI/bge-small-en-v1.5`. A different model means deleting the collection and embedding again.
+- Add a dependency for capture or review until section 1 of [docs/research.md](docs/research.md) is answered.
 - Install hooks into `~/.cursor`, `~/.claude`, `~/.codex`, or Pi.
-- Commit transcripts, inbox dumps, or anything under `data/`.
+- Commit transcripts, inbox dumps, anything under `memories/`, or anything under `data/`.
 - Reopen the decisions in [docs/context.md](docs/context.md). Those are locked.
 - Build retrieval. The first build stops at capture, review, and embed.
 

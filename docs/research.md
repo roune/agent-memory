@@ -28,6 +28,8 @@ For each one, write:
 
 ## 2. Vector engine
 
+Answered in [vector-engine.md](vector-engine.md). Chosen: Qdrant server 1.20.0 (`qdrant/qdrant:v1.20.0`). `scripts/setup` mounts storage from `data/qdrant/`.
+
 Need a script that creates the database in this repo’s `data/` directory, and a path to run that same engine as a container later. One local data directory now. A server process later. Not a second product.
 
 Candidates:
@@ -50,6 +52,8 @@ Prefer the engine whose local directory and server process are the same format. 
 
 ## 3. Embedding model
 
+Answered in [embedding-model.md](embedding-model.md). Chosen: `BAAI/bge-small-en-v1.5` via ONNX revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55`. `scripts/embed` fetches it and writes the `memories` collection.
+
 An open-source model the same setup script can pull and run.
 
 For the model you recommend, record:
@@ -62,7 +66,9 @@ For the model you recommend, record:
 
 If a hosted API is clearly better for a later cloud deploy, say so as a second run mode. The local script still has to work without that API.
 
-## 4. Hook facts still unchecked
+## 4. Hook facts
+
+Checked on 2026-11-05 against current docs. The corrected map is in [harnesses.md](harnesses.md). The install shape is in [integration.md](integration.md). The engine is Qdrant server. The embedding model is `BAAI/bge-small-en-v1.5`. Question 1 is still open.
 
 Confirm against current docs, then correct [harnesses.md](harnesses.md) if the note is wrong:
 
@@ -73,11 +79,12 @@ Confirm against current docs, then correct [harnesses.md](harnesses.md) if the n
 
 ## Done when
 
-The research note names:
+Hook facts for Pi, Cursor `sessionEnd`, Claude Code, and Codex are recorded in [harnesses.md](harnesses.md) as of 2026-11-05.
+
+The research note still has to name:
 
 - the projects that do not cover the keep/drop step, and why
 - one vector engine
 - one embedding model
-- corrected hook facts for Pi and for Cursor `sessionEnd`
 
 Then implementation can start. The first build is capture, review, and embed. Retrieval at session start stays out.

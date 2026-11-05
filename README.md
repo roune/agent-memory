@@ -5,7 +5,7 @@ Memory for coding agents, free for noncommercial use. A session ends in Cursor, 
 ## Two jobs
 
 1. **Capture, then choose.** When a session ends, a hook writes an inbox bundle: which tool, which repo, the session id, and a pointer at the transcript and the diff. A later review command is where you keep nothing, the change summary, the learnings, or specific slices. The end hook does not ask. Those hooks cannot reliably stop the session and wait for an answer.
-2. **Index only what was kept.** Approved memory documents are the source of truth. A setup script creates the vector database in this repo’s `data/` directory and an embedding model turns those documents into vectors. Raw transcripts are never embedded.
+2. **Index only what was kept.** Approved memory documents are the source of truth. `scripts/setup` starts Qdrant server 1.20.0 with its storage in this repo’s `data/qdrant/` directory. `scripts/embed` runs `BAAI/bge-small-en-v1.5` and writes vectors for those documents. Raw transcripts are never embedded.
 
 The database belongs to this tool. Other repositories are tags on a memory (`repo`, `tool`, `session_id`). They do not each grow their own index.
 
@@ -31,4 +31,7 @@ Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agen
 
 - [docs/context.md](docs/context.md) — decisions already made.
 - [docs/harnesses.md](docs/harnesses.md) — where each tool’s hook will live, and the capture constraints.
-- [docs/research.md](docs/research.md) — questions the next session has to answer before any dependency is added.
+- [docs/integration.md](docs/integration.md) — how a person installs capture, and where the vector index stays out of the hook.
+- [docs/vector-engine.md](docs/vector-engine.md) — why the engine is Qdrant server, and how `scripts/setup` starts it.
+- [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
+- [docs/research.md](docs/research.md) — the “what already does this” question, still open.
