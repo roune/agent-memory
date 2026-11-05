@@ -1,6 +1,6 @@
 # Agent memory
 
-Open-source memory for coding agents. A session ends in Cursor, Claude Code, Codex, or Pi. A hook files what happened. You choose what is worth keeping. A script embeds only that.
+Memory for coding agents, free for noncommercial use. A session ends in Cursor, Claude Code, Codex, or Pi. A hook files what happened. You choose what is worth keeping. A script embeds only that.
 
 ## Two jobs
 
@@ -18,6 +18,14 @@ Inbox bundles and transcripts stay on disk and out of git. Review is also the re
 - No automatic save. Nothing is embedded without a review.
 - No retrieval hook at the start of the next session. The first build stops at capture, review, and embed.
 - No cloud deploy. A shared container is a later run mode of the same stack: hooks still write a local spool, and a sync step pushes only approved documents when a remote is configured.
+
+## License
+
+Noncommercial use is free under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, change, and share this software for a noncommercial purpose. That includes personal projects, research, study, hobby work, and use by charities, schools, public research organizations, and government institutions.
+
+Commercial use is not granted. That includes selling this software, offering it as a service, building it into a paid product, and using it inside a company for that company’s business. Any of those uses needs a separate license from the copyright holder. That license is discretionary and may include a fee.
+
+Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agent-memory)
 
 ## Where to read next
 
