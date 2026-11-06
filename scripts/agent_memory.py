@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""agent-memory command: capture, review, and land.
+"""agent-memory command: capture, review, hook install, and repo config.
 
-Editor hooks call `capture` and return. Review is a page on 127.0.0.1.
-`install` writes editor hooks only after a yes.
-`land` files a date window of default-branch commits. Approve can stamp who kept
-the note and link it to another record.
+Editor hooks call `capture` and return. Git post-commit/post-merge call `git-hook`.
+Review is a page on 127.0.0.1. `install` writes editor hooks only after a yes; with
+`--git-repo` it can also install git hooks and repo policy under `.agent-memory.toml`.
+Use `config` to change git hook policy and auto-approve without reinstalling.
 """
 
 import argparse
@@ -31,7 +31,9 @@ DOMAINS = ("code", "architecture", "operations")
 RECORDS = ("", "explanation", "history", "runbook")
 END_EVENTS = {"session-end", "sessionend", "session_shutdown"}
 MARKER = "agent-memory-hook"
+GIT_HOOK_MARKER = "agent-memory-git-hook"
 
+_CONFIG_BOOL_KEYS = frozenset({"capture", "git_hooks", "auto_approve"})
 
 
 def store_root():
@@ -90,12 +92,266 @@ def git_root(cwd):
     return found or cwd
 
 
+def repo_policy_path(repo):
+    return Path(repo) / ".agent-memory.toml"
+
+
+def parse_repo_config(text):
+    """Parse minimal key = value lines from .agent-memory.toml (TOML-like)."""
+    cfg = {
+        "capture": True,
+        "repo": "",
+        "git_hooks": False,
+        "auto_approve": False,
+    }
+    if not text or not str(text).strip():
+        return cfg
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip().lower().replace("-", "_")
+        val = rest.strip()
+        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            val = val[1:-1]
+        elif val.startswith("'") and val.endswith("'") and len(val) >= 2:
+            val = val[1:-1]
+        if key == "repo":
+            cfg["repo"] = val
+        elif key in _CONFIG_BOOL_KEYS:
+            low = val.lower()
+            if low in {"true", "1", "yes"}:
+                cfg[key] = True
+            elif low in {"false", "0", "no"}:
+                cfg[key] = False
+    return cfg
+
+
+def read_repo_config(repo):
+    path = repo_policy_path(repo)
+    if not path.is_file():
+        return parse_repo_config("")
+    return parse_repo_config(path.read_text(encoding="utf-8"))
+
+
+def format_repo_config_lines(cfg):
+    """Build TOML lines for known policy keys."""
+    chunks = []
+    repo_val = (cfg.get("repo") or "").strip()
+    if repo_val:
+        esc = str(repo_val).replace("\\", "\\\\").replace('"', '\\"')
+        chunks.append(f'repo = "{esc}"\n')
+    for bk in ("capture", "git_hooks", "auto_approve"):
+        if bk in cfg:
+            chunks.append(f"{bk} = {'true' if cfg[bk] else 'false'}\n")
+    return chunks
+
+
+def write_repo_config(repo, updates):
+    """Merge updates into .agent-memory.toml, keeping unrecognized lines."""
+    path = repo_policy_path(repo)
+    merged = dict(read_repo_config(repo))
+    merged.update(updates)
+    preserved = []
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw.split("#", 1)[0].strip()
+            if not stripped or "=" not in stripped:
+                preserved.append(raw)
+                continue
+            key = stripped.partition("=")[0].strip().lower().replace("-", "_")
+            if key in {"repo", "capture", "git_hooks", "auto_approve"}:
+                continue
+            preserved.append(raw)
+    while preserved and not preserved[-1].strip():
+        preserved.pop()
+    out = []
+    out.extend(preserved)
+    if preserved:
+        out.append("")
+    out.extend(format_repo_config_lines(merged))
+    text = "\n".join(out)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def git_hooks_installed(repo):
+    """True if .git/hooks post-commit and post-merge are agent-memory hooks."""
+    base = Path(repo) / ".git" / "hooks"
+    for name in ("post-commit", "post-merge"):
+        script = base / name
+        if not script.is_file():
+            return False
+        try:
+            txt = script.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        if GIT_HOOK_MARKER not in txt or "git-hook" not in txt:
+            return False
+    return True
+
+
+def write_git_hooks(repo):
+    """Install post-commit and post-merge hooks in the given repo."""
+    repo = str(Path(repo).resolve())
+    hooks_dir = Path(repo) / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    bin_escaped = str(BIN).replace('"', '\\"')
+    for name in ("post-commit", "post-merge"):
+        path = hooks_dir / name
+        body = f"""#!/bin/sh
+# {GIT_HOOK_MARKER}
+cd "$(git rev-parse --show-toplevel)" && exec "{bin_escaped}" git-hook "$@" --event {name}
+"""
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
+
+def remove_git_hooks(repo):
+    """Remove only hooks previously written by write_git_hooks."""
+    for name in ("post-commit", "post-merge"):
+        path = Path(repo) / ".git" / "hooks" / name
+        if not path.is_file():
+            continue
+        try:
+            txt = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if GIT_HOOK_MARKER in txt:
+            path.unlink()
+
+
+def draft_text_commit_only(repo, remote_id, commit_message, sha):
+    """Draft for git hook: commit message only (review-aligned)."""
+    lines = []
+    subj = commit_message.split("\n", 1)[0].strip() if commit_message else ""
+    lines.append(f"- {sha[:10]} {subj}")
+    body = (commit_message or "").strip()
+    if body:
+        lines.append(body)
+        lines.append("")
+    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
+    return "\n".join(lines).strip()
+
+
+def single_commit_hook_group(repo, sha, message):
+    ct_s = run(["git", "log", "-1", "--format=%ct", sha], repo)
+    try:
+        ct = int(ct_s) if ct_s else 0
+    except ValueError:
+        ct = 0
+    return {
+        "pr": None,
+        "commits": [{"sha": sha, "committer_date": ct, "message": message or ""}],
+    }
+
+
+def try_auto_approve_bundle(bundle):
+    """If identity is complete, approve with change/code and commit from draft. Else raise ValueError."""
+    draft = bundle.get("draft") or {}
+    text = (draft.get("text") or "").strip()
+    commit = (draft.get("commit") or "").strip()
+    kind = draft.get("kind") if draft.get("kind") in KINDS else "change"
+    domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
+    approve(
+        bundle,
+        kind,
+        domain,
+        text,
+        commit=commit,
+    )
+    return True
+
+
+def git_hook(args):
+    repo = Path(args.repo or os.getcwd()).resolve()
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        log("git-hook skipped: not a git repository")
+        return 0
+    repo_s = str(repo)
+    if capture_disabled(repo_s):
+        log("git-hook skipped: capture disabled for repo")
+        return 0
+    cfg = read_repo_config(repo_s)
+    if not cfg.get("git_hooks"):
+        return 0
+
+    event = (args.event or "post-commit").lower()
+    sha = run(["git", "rev-parse", "HEAD"], repo_s)
+    if not sha:
+        log("git-hook skipped: could not resolve HEAD")
+        return 0
+    msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
+    if memory_exists_for_commit(sha):
+        return 0
+
+    remote_id = git_remote_repo_id(repo_s)
+    group = single_commit_hook_group(repo_s, sha, msg)
+    session_id = land_session_id(remote_id or repo_s, sha[:12], None, [sha])
+    bundle_path = land_bundle_path("git", session_id)
+    if bundle_path.is_file():
+        return 0
+
+    branch, tip = default_branch_tip(repo_s)
+    since = parse_since("", 24)
+    draft_text = draft_text_commit_only(repo_s, remote_id, msg, sha)
+    ended = occurred_at_for_group(group)
+    bundle = {
+        "tool": "git",
+        "session_id": session_id,
+        "repo": repo_s,
+        "started_at": since,
+        "ended_at": ended,
+        "event": "git-" + event.replace("_", "-"),
+        "closed": True,
+        "transcript_copy": None,
+        "last_assistant_message": "",
+        "git": {
+            "branch": branch,
+            "head": tip,
+            "status": "",
+            "diff_stat": "",
+            "paths": commit_files(repo_s, sha),
+        },
+        "pinned": True,
+        "draft": {
+            "kind": "change",
+            "domain": "code",
+            "text": draft_text,
+            "commit": sha,
+        },
+        "land": {
+            "remote_repo": remote_id,
+            "pull_request": None,
+            "commits": [
+                {
+                    "sha": sha,
+                    "subject": (msg or "").split("\n", 1)[0].strip(),
+                }
+            ],
+        },
+    }
+    write_json(bundle_path, bundle)
+
+    if cfg.get("auto_approve"):
+        iden = read_identity()
+        if not all(iden.get(k) for k in ("org", "team", "person")):
+            log("git-hook: auto_approve set but identity incomplete; inbox bundle kept for review")
+            return 0
+        try:
+            try_auto_approve_bundle(bundle)
+        except (ValueError, OSError) as error:
+            log(f"git-hook: auto_approve failed: {error}")
+    return 0
+
+
 def capture_disabled(repo):
-    policy = Path(repo) / ".agent-memory.toml"
-    if policy.is_file():
-        for line in policy.read_text(encoding="utf-8").splitlines():
-            if line.strip().replace(" ", "") == "capture=false":
-                return True
+    cfg = read_repo_config(repo)
+    if not cfg.get("capture", True):
+        return True
     ignore = HOME / ".config" / "agent-memory" / "ignore"
     if ignore.is_file():
         repo_path = str(Path(repo).resolve())
@@ -104,6 +360,7 @@ def capture_disabled(repo):
             if item and (repo_path == item or repo_path.startswith(item.rstrip("/") + "/")):
                 return True
     return False
+
 
 def identity_path():
     return HOME / ".config" / "agent-memory" / "identity"
@@ -125,6 +382,10 @@ def read_identity():
         elif line.startswith("person"):
             person = line.split("=", 1)[1].strip() if "=" in line else ""
     return {"org": org, "team": team, "person": person}
+
+
+def policy_repo_id(repo):
+    return (read_repo_config(repo).get("repo") or "").strip()
 
 
 def normalize_remote_url(raw):
@@ -155,8 +416,12 @@ def normalize_remote_url(raw):
 
 
 def git_remote_repo_id(repo):
+    policy = policy_repo_id(repo)
+    if policy:
+        return policy
     url = run(["git", "remote", "get-url", "origin"], repo)
     return normalize_remote_url(url)
+
 
 def parse_since(value, default_hours):
     if not value or not str(value).strip():
@@ -651,6 +916,46 @@ def write_capture(args, payload):
         "pinned": previous.get("pinned", False),
     }
     write_json(bundle_path, bundle)
+
+
+    if event.lower() in END_EVENTS:
+        cfg = read_repo_config(repo)
+        if cfg.get("auto_approve"):
+            fresh = read_json(bundle_path)
+            draft = fresh.get("draft") or {}
+            head = (summary.get("head") or "").strip()
+            if head and run(["git", "rev-parse", "--is-inside-work-tree"], cwd) == "true":
+                remote_id = git_remote_repo_id(repo)
+                subj = run(["git", "log", "-1", "--format=%s", head], repo) or ""
+                body = run(["git", "log", "-1", "--format=%B", head], repo) or ""
+                kind = draft.get("kind") if draft.get("kind") in KINDS else "change"
+                domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
+                text = (draft.get("text") or "").strip()
+                if not text:
+                    text = (message or "").strip()
+                if not text and kind == "change":
+                    text = draft_text_commit_only(repo, remote_id, body, head)
+                if not text:
+                    text = subj
+                new_draft = {
+                    "kind": kind,
+                    "domain": domain,
+                    "text": text,
+                    "commit": (draft.get("commit") or "").strip() or head,
+                }
+                fresh["draft"] = new_draft
+                land_meta = fresh.get("land") if isinstance(fresh.get("land"), dict) else {}
+                land_meta.setdefault("remote_repo", remote_id)
+                fresh["land"] = land_meta
+                write_json(bundle_path, fresh)
+            iden = read_identity()
+            if all(iden.get(k) for k in ("org", "team", "person")):
+                try:
+                    try_auto_approve_bundle(read_json(bundle_path))
+                except (ValueError, OSError) as error:
+                    log(f"capture session-end auto_approve failed: {error}")
+            else:
+                log("capture session-end: auto_approve set but identity incomplete; inbox bundle kept")
 
 
 def bundles():
@@ -1308,25 +1613,141 @@ WRITERS = {
 }
 
 
+def prompt_yes_no(label, default_no=True):
+    if not sys.stdin.isatty():
+        raise SystemExit("re-run in a terminal, or pass --yes with explicit flags")
+    suffix = "[y/N]" if default_no else "[Y/n]"
+    answer = input(f"{label} {suffix} ").strip().lower()
+    if not answer:
+        return not default_no
+    return answer in {"y", "yes"}
+
+
 def install(args):
     tools = present_tools()
-    if not tools:
-        raise SystemExit("no Cursor, Claude Code, Codex, or Pi install was found")
-    print("This will write capture hooks for:")
-    for tool in tools:
-        print(f"  {tool}")
-    print("Other hooks already in those files are left in place.")
-    if not args.yes:
-        if not sys.stdin.isatty():
-            raise SystemExit("re-run in a terminal, or pass --yes")
-        answer = input("Write these hooks? [y/N] ").strip().lower()
-        if answer not in {"y", "yes"}:
-            print("left unchanged")
-            return 0
-    for tool in tools:
-        WRITERS[tool](HOME)
-        print(f"wrote {tool}")
+    if not tools and not args.git_repo:
+        raise SystemExit("no Cursor, Claude Code, Codex, or Pi install was found (pass --git-repo for repo-only setup)")
+
+    if tools:
+        print("This will write capture hooks for:")
+        for tool in tools:
+            print(f"  {tool}")
+        print("Other hooks already in those files are left in place.")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise SystemExit("re-run in a terminal, or pass --yes")
+            answer = input("Write these hooks? [y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("editor hooks left unchanged")
+            else:
+                for tool in tools:
+                    WRITERS[tool](HOME)
+                    print(f"wrote {tool}")
+        else:
+            for tool in tools:
+                WRITERS[tool](HOME)
+                print(f"wrote {tool}")
+
+    if args.git_repo:
+        repo = Path(args.git_repo).resolve()
+        if not repo.is_dir():
+            raise SystemExit(f"not a directory: {repo}")
+        if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+            raise SystemExit(f"not a git repository: {repo}")
+
+        want_git = False
+        auto_ap = False
+        if args.yes:
+            gh = getattr(args, "install_git_hooks", None)
+            if gh is None:
+                raise SystemExit("with --yes --git-repo, pass --install-git-hooks true|false")
+            want_git = gh == "true"
+            aa = getattr(args, "install_auto_approve", None)
+            auto_ap = aa == "true" if aa is not None else False
+        else:
+            print()
+            print("Git hooks: after each commit or merge, file an inbox bundle for this repo")
+            print(f"  ({repo})")
+            want_git = prompt_yes_no(
+                "Install post-commit and post-merge hooks here?",
+                default_no=True,
+            )
+            if want_git:
+                auto_ap = prompt_yes_no(
+                    "Auto-approve those memories (skip review UI)?",
+                    default_no=True,
+                )
+            else:
+                auto_ap = False
+
+        updates = {"git_hooks": want_git, "auto_approve": auto_ap}
+        write_repo_config(str(repo), updates)
+        if want_git:
+            write_git_hooks(str(repo))
+            print(f"wrote git hooks in {repo / '.git' / 'hooks'}")
+        else:
+            remove_git_hooks(str(repo))
+        print(f"repo policy: {repo_policy_path(repo)}")
+
     return 0
+
+
+def config_cmd(args):
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        raise SystemExit(f"not a directory: {repo}")
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        raise SystemExit(f"not a git repository: {repo}")
+    repo_s = str(repo)
+
+    def snapshot():
+        c = read_repo_config(repo_s)
+        return {
+            "repo": repo_s,
+            "git_hooks_config": c.get("git_hooks", False),
+            "git_hooks_installed": git_hooks_installed(repo_s),
+            "auto_approve": c.get("auto_approve", False),
+            "capture": c.get("capture", True),
+        }
+
+    gh_arg = getattr(args, "git_hooks", None)
+    mut = args.auto_approve is not None or gh_arg is not None
+    if not mut:
+        show = snapshot()
+        if getattr(args, "json_out", False):
+            print(json.dumps(show, indent=2))
+        else:
+            print(f"repo: {repo_s}")
+            print(f"git_hooks (config): {show['git_hooks_config']}")
+            print(f"git_hooks (installed): {show['git_hooks_installed']}")
+            print(f"auto_approve: {show['auto_approve']}")
+            print(f"capture: {show['capture']}")
+        return 0
+
+    updates = {}
+    if args.auto_approve is not None:
+        updates["auto_approve"] = args.auto_approve == "true"
+    if gh_arg is not None:
+        updates["git_hooks"] = gh_arg == "true"
+        if gh_arg == "true":
+            write_git_hooks(repo_s)
+            print(f"wrote git hooks in {repo / '.git' / 'hooks'}")
+        else:
+            remove_git_hooks(repo_s)
+            print("removed agent-memory git hooks (post-commit, post-merge)")
+    if updates:
+        write_repo_config(repo_s, updates)
+        print(f"updated {repo_policy_path(repo)}")
+
+    show = snapshot()
+    if getattr(args, "json_out", False):
+        print(json.dumps(show, indent=2))
+    else:
+        print(f"git_hooks (config): {show['git_hooks_config']}")
+        print(f"git_hooks (installed): {show['git_hooks_installed']}")
+        print(f"auto_approve: {show['auto_approve']}")
+    return 0
+
 
 def strip_commands(groups):
     kept = []
@@ -1399,6 +1820,24 @@ def build_parser():
 
     install_parser = sub.add_parser("install", help="write editor hooks after a yes")
     install_parser.add_argument("--yes", action="store_true", help="write without prompting")
+    install_parser.add_argument(
+        "--git-repo",
+        metavar="PATH",
+        default="",
+        help="optional git repo: prompt to install post-commit/post-merge hooks and policy",
+    )
+    install_parser.add_argument(
+        "--install-git-hooks",
+        choices=["true", "false"],
+        default=None,
+        help="with --yes --git-repo: install or skip git hooks (required with --yes)",
+    )
+    install_parser.add_argument(
+        "--install-auto-approve",
+        choices=["true", "false"],
+        default=None,
+        help="with --yes --git-repo: auto-approve on (default false if omitted)",
+    )
     install_parser.set_defaults(func=install)
 
     uninstall_parser = sub.add_parser("uninstall", help="remove only the hooks this tool added")
@@ -1442,6 +1881,28 @@ def build_parser():
     )
     land_parser.set_defaults(func=land)
 
+    git_hook_parser = sub.add_parser("git-hook", help="run from repo post-commit/post-merge (internal)")
+    git_hook_parser.add_argument("--repo", default="", help="repository root (default: cwd)")
+    git_hook_parser.add_argument("--event", default="post-commit", help="post-commit or post-merge")
+    git_hook_parser.set_defaults(func=git_hook)
+
+    config_parser = sub.add_parser("config", help="show or set repo policy (.agent-memory.toml)")
+    config_parser.add_argument("repo", help="path to the git repository")
+    config_parser.add_argument(
+        "--auto-approve",
+        choices=["true", "false"],
+        default=None,
+        help="turn auto-approve on or off",
+    )
+    config_parser.add_argument(
+        "--git-hooks",
+        choices=["true", "false"],
+        default=None,
+        dest="git_hooks",
+        help="install or remove post-commit/post-merge hooks",
+    )
+    config_parser.add_argument("--json", dest="json_out", action="store_true", help="machine-readable output")
+    config_parser.set_defaults(func=config_cmd)
     return parser
 
 

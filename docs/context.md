@@ -33,6 +33,17 @@ Optional **linked-record** fields (for standing explanations, architecture histo
 
 Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept. All three domains share the one `memories` collection. Search filters on `domain`. A second collection is for a different embedding model only.
 
+## Repo policy file (`.agent-memory.toml`)
+
+Optional file at the root of a git working tree. Keys are simple `key = value` lines (same style as today). The tool reads:
+
+- `capture` — when `false`, `capture`, `land`, and git post-commit/post-merge hooks skip that repo (default: true)
+- `repo` — optional override for the normalized remote id when there is no usable `origin` (same meaning as today)
+- `git_hooks` — when `true`, post-commit and post-merge run `agent-memory git-hook` for that clone so each new HEAD commit files a `tool: git` inbox bundle with a draft from the **commit message only** (no diff)
+- `auto_approve` — when `true`, git post-commit/post-merge hooks and session-end editor hooks try to call the same approve path as the review UI (requires a complete `~/.config/agent-memory/identity`). When `false` or identity is incomplete, they only leave the inbox bundle for review (default: false). `agent-memory land` always files bundles for the review UI only
+
+Change `git_hooks` or `auto_approve` later with `agent-memory config <path-to-repo> [--git-hooks true|false] [--auto-approve true|false]` without reinstalling editor hooks.
+
 ## What a kept item is
 
 Each approved item has one kind:
@@ -62,6 +73,13 @@ setup and embed script
   -> vectors in data/
 ```
 
+**Same clone, after each commit or merge (optional git hooks):**
+
+```
+post-commit / post-merge
+  -> inbox bundle (tool: git), draft = commit message only; or auto-approve into memories/ when configured
+```
+
 **Default-branch commits in another repo:**
 
 ```
@@ -83,7 +101,7 @@ The review command is where the person decides to keep nothing, the change summa
 
 ## Hooks, once they exist
 
-User-level hooks call one capture command. They are not installed yet. Locations and which event does the real capture are in [harnesses.md](harnesses.md).
+User-level hooks call one capture command. Locations and which event does the real capture are in [harnesses.md](harnesses.md).
 
 Hooks always write a local spool first. A sync step, later, pushes only approved documents when a remote is configured.
 
