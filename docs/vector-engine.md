@@ -15,7 +15,7 @@ Qdrant server is that shape:
 - Local setup is `docker run` with a bind mount. No Qdrant account, no API key required for the local process.
 - The directory under `data/qdrant/` is the server’s storage. A later container, Compose file, or Helm release mounts the same layout.
 - Horizontal scale is the same Apache-2.0 binary. Set `QDRANT__CLUSTER__ENABLED=true` and let peers talk on port 6335. Sharding and replication ship in the open-source server. Qdrant Cloud and the Private Cloud operator add operations on top (automatic rebalancing, resharding, backups, zero-downtime upgrades). They are optional. The engine and the API stay the same.
-- Payload indexes cover the locked tags `repo`, `tool`, and `session_id`.
+- Payload indexes cover the locked tags `repo`, `tool`, `session_id`, `kind`, and `domain`.
 - Re-embed is delete-and-upsert. Wipe the collection, or the storage directory, and embed the approved documents again. Switching engines later discards the index only.
 
 A company of coding-agent memories is a small corpus: approved slices, not raw transcripts. One Qdrant node is the company deployment until the index outgrows one disk. The cluster flag is there when that happens.

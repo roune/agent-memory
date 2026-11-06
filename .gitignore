@@ -10,6 +10,10 @@ transcripts/
 # Approved memories. They stay on this machine and are not published.
 memories/
 
+# Bytecode from local runs of the CLI.
+__pycache__/
+*.pyc
+
 # Local configuration and credentials.
 .env
 .env.*

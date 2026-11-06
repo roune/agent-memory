@@ -1,0 +1,41 @@
+#!/bin/sh
+# Put the agent-memory command on PATH. Does not write editor hooks.
+# Hook setup is a second step: agent-memory install, which asks first.
+
+set -eu
+
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+
+root=$(CDPATH= cd -- "$(dirname "$self")/.." && pwd)
+source="$root/bin/agent-memory"
+dest="${HOME}/.local/bin/agent-memory"
+
+if [ ! -x "$source" ]; then
+  echo "missing executable: $source" >&2
+  exit 1
+fi
+
+mkdir -p "${HOME}/.local/bin"
+ln -sfn "$source" "$dest"
+
+echo "Installed $dest"
+echo "It points at $source"
+echo
+echo "Next, connect the editors you want. This asks before it writes anything:"
+echo "  agent-memory install"
+
+case ":$PATH:" in
+  *":${HOME}/.local/bin:"*) ;;
+  *)
+    echo
+    echo "${HOME}/.local/bin is not on PATH in this shell. Open a new terminal, or add it:"
+    echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    ;;
+esac

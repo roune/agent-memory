@@ -2,6 +2,22 @@
 
 Memory for coding agents, free for noncommercial use. A session ends in Cursor, Claude Code, Codex, or Pi. A hook files what happened. You choose what is worth keeping. A script embeds only that.
 
+## Install
+
+From a clone of this repo:
+
+```
+./scripts/install
+```
+
+That links `agent-memory` into `~/.local/bin`. It does not change Cursor, Claude Code, Codex, or Pi. Connecting those is a second command, and it asks before it writes:
+
+```
+agent-memory install
+```
+
+`agent-memory review` opens the approve/reject page at `http://127.0.0.1:4173`.
+
 ## Two jobs
 
 1. **Capture, then choose.** When a session ends, a hook writes an inbox bundle: which tool, which repo, the session id, and a pointer at the transcript and the diff. A later review command is where you keep nothing, the change summary, the learnings, or specific slices. The end hook does not ask. Those hooks cannot reliably stop the session and wait for an answer.

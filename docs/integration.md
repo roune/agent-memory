@@ -25,7 +25,7 @@ One executable, four thin adapters, and an installer that asks once.
 | Piece | Job |
 | --- | --- |
 | `agent-memory capture` | Reads the adapter’s JSON on stdin, writes the inbox bundle, exits 0. |
-| `agent-memory review` | The keep-or-drop step. Also the redaction step. |
+| `agent-memory review` | Opens the browser UI on `127.0.0.1`. Approve and reject happen there. |
 | `agent-memory install` | Writes the user-level adapter for each tool the person selects. |
 | `agent-memory uninstall` | Removes only the entries this tool added. |
 
@@ -36,12 +36,11 @@ The adapters are a few lines each. They do not embed, and they do not import a v
 Suggested first-run shape:
 
 ```
+./scripts/install
 agent-memory install
 ```
 
-The installer prints the files it will touch, lists the tools it found (`~/.cursor`, `~/.claude`, `~/.codex`, `~/.pi/agent`), and waits for a yes. That yes is the permission to turn capture on. After that, session hooks stay silent.
-
-Nothing in this repo installs those files while the plan is still a document. The command exists so a later build can do it, and so a person can run it on their own machine.
+`./scripts/install` links the command into `~/.local/bin`. `agent-memory install` lists the tools it found (`~/.cursor`, `~/.claude`, `~/.codex`, `~/.pi/agent`) and waits for a yes. That yes is the permission to turn capture on. After that, session hooks stay silent.
 
 ## Hook map
 
@@ -64,13 +63,13 @@ Two different questions, two different moments.
 
 The installer asks once: which tools, and whether to edit those home files. That is the opt-in.
 
-The hook does not ask. Cursor `sessionEnd` ignores the response. Claude Code `SessionEnd` cannot block and discards output. Codex `SessionEnd` is advisory and capped at about 3 seconds. Pi could call `ctx.ui.confirm()` and must not. A prompt there would not work the same way in every tool, which is why review is a command the person runs when they want:
+The hook does not ask. Cursor `sessionEnd` ignores the response. Claude Code `SessionEnd` cannot block and discards output. Codex `SessionEnd` is advisory and capped at about 3 seconds. Pi could call `ctx.ui.confirm()` and must not. A prompt there would not work the same way in every tool.
 
-```
-agent-memory review
-```
+Review opens in the browser. `agent-memory review` starts a process bound to `127.0.0.1` and a chosen port, then opens `http://127.0.0.1:<port>`. If that process is already running, the command only opens the URL. Cursor, Claude Code, Codex, and Pi do the same: a command or a link to that address. They do not each draw their own form.
 
-Review offers keep nothing, or one or more documents of kind `change`, `learning`, or `decision`. Secrets come out before a document is approved. Only approved documents are eligible for embed.
+The page lists each offered session. A `change` asks for the context of one commit and stores that commit. The diff stays in git. A `learning` or `decision` asks for the note itself. The text can be edited before approval, which is the redaction step. Approve writes that document. Reject drops the bundle. The transcript stays out of the index either way.
+
+The end hook does not start this process and does not open the browser. Capture still writes the inbox and returns.
 
 ## Which sessions become memories
 
@@ -85,7 +84,7 @@ The inbox keeps every captured session on disk, gitignored. The memory is the ap
 
 `agent-memory drop` removes a bundle from the inbox. `agent-memory review --all` shows sessions the default view hides.
 
-The landing check is local git, run when review opens. It does not need a server. The bundle stores `started_at`, `ended_at`, the git root, the branch, `HEAD`, and the paths touched. Review then asks, in that clone:
+The landing check is local git, run when the page loads. The bundle stores `started_at`, `ended_at`, the git root, the branch, `HEAD`, and the paths touched. The page asks, in that clone:
 
 ```
 git merge-base --is-ancestor <sha> <default-branch>

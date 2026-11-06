@@ -20,16 +20,23 @@ Tags on every memory:
 - `repo` — the project the session was working in
 - `tool` — `cursor`, `claude-code`, `codex`, or `pi`
 - `session_id` — the harness session that produced it
+- `domain` — `code`, `architecture`, or `operations`
 
-Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept.
+Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept. All three domains share the one `memories` collection. Search filters on `domain`. A second collection is for a different embedding model only.
 
 ## What a kept item is
 
 Each approved item has one kind:
 
-- `change` — what the session changed
+- `change` — the context of one commit: what it was for. The diff stays in git. The document records the commit.
 - `learning` — what the session found out
 - `decision` — what was chosen, and the reason if it was stated
+
+Kind is the shape of the note. Domain is which job it is for:
+
+- `code` — what was implemented. The text is the context of the work. A change names the commit. The repository holds the source.
+- `architecture` — how a design or a flow works, and the reason when it was stated.
+- `operations` — what an incident, an alert, or a recurring situation means, and what to look at.
 
 Review is also the redaction step. Secrets and anything that should not be retrieved are removed before a document is approved. Raw transcripts are never embedded and never committed.
 

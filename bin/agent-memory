@@ -1,0 +1,15 @@
+#!/bin/sh
+# Resolve the repo even when this file is reached through a symlink.
+set -eu
+
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+
+root=$(CDPATH= cd -- "$(dirname "$self")/.." && pwd)
+exec python3 "$root/scripts/agent_memory.py" "$@"

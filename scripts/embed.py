@@ -20,7 +20,9 @@ DIMENSION = 384
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = "memories"
 
-REQUIRED = ("id", "kind", "repo", "tool", "session_id", "text")
+REQUIRED = ("id", "kind", "domain", "repo", "tool", "session_id", "text")
+KINDS = ("change", "learning", "decision")
+DOMAINS = ("code", "architecture", "operations")
 
 
 def api(method, path, body=None, missing_ok=False):
@@ -62,11 +64,20 @@ def load_memories():
     documents = []
     for path in sorted(MEMORIES.glob("*.json")):
         document = json.loads(path.read_text())
-        missing = [field for field in REQUIRED if not document.get(field)]
+        missing = [field for field in REQUIRED if field not in document or document[field] is None]
         if missing:
             raise SystemExit(f"{path.name} is missing {', '.join(missing)}")
-        if document["kind"] not in ("change", "learning", "decision"):
+        empty = [
+            field
+            for field in REQUIRED
+            if isinstance(document.get(field), str) and not document[field].strip()
+        ]
+        if empty:
+            raise SystemExit(f"{path.name} has empty {', '.join(empty)}")
+        if document["kind"] not in KINDS:
             raise SystemExit(f"{path.name} has kind {document['kind']!r}")
+        if document["domain"] not in DOMAINS:
+            raise SystemExit(f"{path.name} has domain {document['domain']!r}")
         document["_file"] = path.name
         documents.append(document)
     if not documents:
@@ -82,17 +93,21 @@ def ensure_collection():
             f"/collections/{COLLECTION}",
             {"vectors": {"size": DIMENSION, "distance": "Cosine"}},
         )
-        for field in ("repo", "tool", "session_id", "kind"):
-            api(
-                "PUT",
-                f"/collections/{COLLECTION}/index",
-                {"field_name": field, "field_schema": "keyword"},
+        info = api("GET", f"/collections/{COLLECTION}")
+    else:
+        size = info["result"]["config"]["params"]["vectors"]["size"]
+        if size != DIMENSION:
+            raise SystemExit(
+                f"collection {COLLECTION} has dimension {size}, model has {DIMENSION}"
             )
-        return
-    size = info["result"]["config"]["params"]["vectors"]["size"]
-    if size != DIMENSION:
-        raise SystemExit(
-            f"collection {COLLECTION} has dimension {size}, model has {DIMENSION}"
+    existing = (info.get("result") or {}).get("payload_schema") or {}
+    for field in ("repo", "tool", "session_id", "kind", "domain", "commit"):
+        if field in existing:
+            continue
+        api(
+            "PUT",
+            f"/collections/{COLLECTION}/index",
+            {"field_name": field, "field_schema": "keyword"},
         )
 
 
@@ -126,9 +141,11 @@ def main():
                 "payload": {
                     "document_id": document["id"],
                     "kind": document["kind"],
+                    "domain": document["domain"],
                     "repo": document["repo"],
                     "tool": document["tool"],
                     "session_id": document["session_id"],
+                    "commit": document.get("commit") or "",
                     "text": document["text"],
                     "embedding_model": MODEL_NAME,
                     "embedding_revision": REVISION,

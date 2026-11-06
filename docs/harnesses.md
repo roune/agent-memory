@@ -1,6 +1,6 @@
 # Harnesses
 
-One capture command, called from user-level hooks. Nothing here is installed yet. Facts below were checked on 2026-11-05 against current docs. Sources are linked on each tool.
+One capture command, called from user-level hooks. `./scripts/install` puts `agent-memory` on `PATH`. `agent-memory install` writes the hooks, and it asks first. Facts below were checked on 2026-11-05 against current docs. Sources are linked on each tool.
 
 The capture command copies what it needs into the local inbox and returns. It does not prompt, and it does not embed. It exits 0 and does not ask the agent to continue.
 
@@ -77,7 +77,7 @@ Whatever the harness, the capture command writes one bundle:
 - `event` — the harness event that wrote this copy
 - a copy of the transcript, or a path that was verified readable at capture time
 - `last_assistant_message` when the harness provides it and the transcript file lags
-- a short git summary (status, diff stat), not the full patch, unless the review step asks for it later
+- a short git summary (status, diff stat), used to find the commit. The approved `change` stores the commit and its context, not this diff.
 
 The bundle stays under `inbox/` and is gitignored. Approval copies a redacted slice into a memory document. The transcript itself is never committed and never embedded.
 
