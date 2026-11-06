@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""agent-memory command: capture, review, and hook install.
+"""agent-memory command: capture, review, and land.
 
-The hook calls `capture` and returns. Review is a page on 127.0.0.1.
+Editor hooks call `capture` and return. Review is a page on 127.0.0.1.
 `install` writes editor hooks only after a yes.
+`land` files a date window of default-branch commits into the inbox.
 """
 
 import argparse
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import hashlib
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +29,7 @@ KINDS = ("change", "learning", "decision")
 DOMAINS = ("code", "architecture", "operations")
 END_EVENTS = {"session-end", "sessionend", "session_shutdown"}
 MARKER = "agent-memory-hook"
+
 
 
 def store_root():
@@ -98,6 +102,387 @@ def capture_disabled(repo):
             if item and (repo_path == item or repo_path.startswith(item.rstrip("/") + "/")):
                 return True
     return False
+
+def normalize_remote_url(raw):
+    if not raw or not str(raw).strip():
+        return ""
+    s = str(raw).strip()
+    if s.startswith("git@"):
+        rest = s[4:]
+        if ":" in rest:
+            host, path = rest.split(":", 1)
+            host = host.strip().lower()
+            path = path.strip().rstrip("/")
+            if path.endswith(".git"):
+                path = path[:-4]
+            return f"{host}/{path}"
+        return ""
+    try:
+        parsed = urlparse(s)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return ""
+        path = (parsed.path or "").strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        return f"{host}/{path}" if path else ""
+    except Exception:
+        return ""
+
+
+def git_remote_repo_id(repo):
+    url = run(["git", "remote", "get-url", "origin"], repo)
+    return normalize_remote_url(url)
+
+def parse_since(value, default_hours):
+    if not value or not str(value).strip():
+        when = datetime.now(timezone.utc) - timedelta(hours=default_hours)
+        return when.replace(microsecond=0).isoformat()
+    s = str(value).strip()
+    if re.match(r"^-?\d+$", s):
+        when = datetime.now(timezone.utc) - timedelta(hours=int(s))
+        return when.replace(microsecond=0).isoformat()
+    try:
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.replace(microsecond=0).isoformat()
+    except ValueError:
+        raise SystemExit(
+            f"--since expects ISO-8601 datetime or hours as integer (got {value!r})"
+        ) from None
+
+
+def commit_files(repo, sha):
+    listing = run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha], repo)
+    return [line.strip() for line in listing.splitlines() if line.strip()]
+
+
+def unusual_path_hint(repo, shas):
+    if len(shas) < 2:
+        return ""
+    path_sets = []
+    for sha in shas:
+        path_sets.append(set(commit_files(repo, sha)))
+    union = set().union(*path_sets)
+    common = set.intersection(*path_sets) if path_sets else set()
+    unusual = union - common
+    if unusual:
+        sample = sorted(unusual)[0]
+        return f"Unusual vs rest of group: touched {sample}"
+    if len(shas) == 2:
+        a, b = path_sets[0], path_sets[1]
+        diff = sorted((a ^ b))
+        if diff:
+            return f"Unusual vs the other commit: only {diff[0]}"
+    return "No single file stands out from the rest of this group."
+
+
+_GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+)", re.IGNORECASE)
+_SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def pr_from_commit_message(message):
+    if not message:
+        return None
+    first = message.strip().split("\n", 1)[0].strip()
+    match = _GITHUB_MERGE_RE.match(first)
+    if match:
+        return int(match.group(1))
+    match_sq = _SQUASH_PR_RE.search(first)
+    if match_sq:
+        return int(match_sq.group(1))
+    return None
+
+
+def gh_pr_description(repo, pr_number):
+    out = run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--json",
+            "title,body",
+        ],
+        repo,
+    )
+    if not out:
+        return "", ""
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return "", ""
+    title = (data.get("title") or "").strip()
+    body = (data.get("body") or "").strip()
+    return title, body
+
+
+def gh_pr_for_sha(repo, sha):
+    out = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--search",
+            sha,
+            "--state",
+            "merged",
+            "--json",
+            "number,mergeCommit",
+            "--limit",
+            "20",
+        ],
+        repo,
+    )
+    if not out:
+        return None
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    for row in rows:
+        mc = (row.get("mergeCommit") or {}).get("oid") or ""
+        if mc == sha:
+            num = row.get("number")
+            return int(num) if num is not None else None
+    return None
+
+
+def land_session_id(repo_key, group_key, pr_number, shas):
+    raw = f"{repo_key}|{group_key}|{pr_number or ''}|" + ",".join(sorted(shas))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"land-{digest}"
+
+
+def land_bundle_path(tool, session_id):
+    return session_dir(tool, session_id) / "bundle.json"
+
+
+def memory_exists_for_commit(sha):
+    root = memories_root()
+    if not root.is_dir():
+        return False
+    needle = sha.strip().lower()
+    for path in root.glob("*.json"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        stored = doc.get("commit")
+        if isinstance(stored, str) and stored.strip().lower().startswith(needle[:7]):
+            return True
+    return False
+
+def default_branch_tip(repo):
+    branch = default_branch(repo)
+    sha = run(["git", "rev-parse", branch], repo)
+    return branch, sha
+
+
+def commits_on_branch_since(repo, branch, since_iso):
+    listing = run(
+        [
+            "git",
+            "log",
+            branch,
+            f"--since={since_iso}",
+            "--reverse",
+            "--pretty=format:%H%x00%ct%x00%B%x00---COMMIT---",
+        ],
+        repo,
+    )
+    commits = []
+    for block in listing.split("---COMMIT---"):
+        block = block.strip()
+        if not block:
+            continue
+        parts = block.split("\x00", 2)
+        if len(parts) < 3:
+            continue
+        sha, ct_s, message = parts[0], parts[1], parts[2]
+        try:
+            ct = int(ct_s)
+        except ValueError:
+            ct = 0
+        commits.append({"sha": sha, "committer_date": ct, "message": message.strip()})
+    return commits
+
+
+def build_land_groups(repo, commits):
+    """Split commits into single-parent only; group by PR number when present."""
+    merges = []
+    singles = []
+    for item in commits:
+        parents = run(["git", "rev-parse", f"{item['sha']}^@"], repo).split()
+        if len(parents) != 1:
+            merges.append(item)
+            continue
+        singles.append(item)
+
+    groups = []
+    by_pr = {}
+    orphan_singles = []
+
+    for item in singles:
+        prn = pr_from_commit_message(item["message"])
+        if prn is None:
+            prn = gh_pr_for_sha(repo, item["sha"])
+        if prn is not None:
+            by_pr.setdefault(prn, []).append(item)
+        else:
+            orphan_singles.append(item)
+
+    for prn, members in sorted(by_pr.items()):
+        groups.append({"pr": prn, "commits": sorted(members, key=lambda x: x["committer_date"])})
+
+    for item in orphan_singles:
+        groups.append({"pr": None, "commits": [item]})
+
+    merge_notes = []
+    for item in merges:
+        prn = pr_from_commit_message(item["message"])
+        if prn is not None:
+            merge_notes.append(f"Merge commit {item['sha'][:10]} for PR #{prn} (PR group uses its squashed or direct commits).")
+        else:
+            merge_notes.append(
+                f"Skipped merge commit {item['sha'][:10]}: {item['message'].splitlines()[0] if item['message'] else ''}".strip()
+            )
+
+    return groups, merge_notes
+
+
+def draft_text_for_group(repo, remote_id, group):
+    lines = []
+    pr_number = group.get("pr")
+    members = group["commits"]
+    shas = [m["sha"] for m in members]
+
+    if pr_number is not None:
+        title, body = gh_pr_description(repo, pr_number)
+        lines.append(f"Pull request #{pr_number}")
+        if title:
+            lines.append(title)
+        if body:
+            lines.append(body)
+        lines.append("")
+    lines.append("Commits:")
+    for m in members:
+        subj = m["message"].split("\n", 1)[0].strip() if m["message"] else ""
+        lines.append(f"- {m['sha'][:10]} {subj}")
+        body = m["message"].strip()
+        if body:
+            lines.append(body)
+            lines.append("")
+    lines.append(unusual_path_hint(repo, shas))
+    lines.append("")
+    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def git_paths_for_group(repo, shas):
+    paths = []
+    for sha in shas:
+        paths.extend(commit_files(repo, sha))
+    out = []
+    seen = set()
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def occurred_at_for_group(group):
+    times = [m["committer_date"] for m in group["commits"] if m.get("committer_date")]
+    if not times:
+        return now()
+    latest = max(times)
+    return datetime.fromtimestamp(latest, tz=timezone.utc).replace(microsecond=0).isoformat()
+
+
+def land(args):
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        raise SystemExit(f"not a directory: {repo}")
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        raise SystemExit(f"not a git repository: {repo}")
+    if capture_disabled(str(repo)):
+        log("land skipped: capture disabled for repo")
+        return 0
+
+    since = parse_since(args.since, args.since_hours)
+    branch, tip = default_branch_tip(str(repo))
+    remote_id = git_remote_repo_id(str(repo))
+    commits = commits_on_branch_since(str(repo), branch, since)
+    groups, merge_notes = build_land_groups(str(repo), commits)
+
+    tool = "git"
+    wrote = 0
+    for group in groups:
+        members = group["commits"]
+        shas = [m["sha"] for m in members]
+        any_kept = False
+        for sha in shas:
+            if not memory_exists_for_commit(sha):
+                any_kept = True
+                break
+        if not any_kept:
+            continue
+
+        prn = group.get("pr")
+        group_key = f"pr-{prn}" if prn is not None else shas[0]
+        session_id = land_session_id(remote_id or str(repo), group_key, prn, shas)
+        bundle_path = land_bundle_path(tool, session_id)
+        if bundle_path.is_file():
+            continue
+
+        paths = git_paths_for_group(str(repo), shas)
+        draft_text = draft_text_for_group(str(repo), remote_id, group)
+        ended = occurred_at_for_group(group)
+        bundle = {
+            "tool": tool,
+            "session_id": session_id,
+            "repo": str(repo),
+            "started_at": since,
+            "ended_at": ended,
+            "event": "land",
+            "closed": True,
+            "transcript_copy": None,
+            "last_assistant_message": "",
+            "git": {
+                "branch": branch,
+                "head": tip,
+                "status": "",
+                "diff_stat": "",
+                "paths": paths,
+            },
+            "pinned": True,
+            "draft": {
+                "kind": "change",
+                "domain": "code",
+                "text": draft_text,
+                "commit": shas[-1],
+            },
+            "land": {
+                "remote_repo": remote_id,
+                "pull_request": prn,
+                "commits": [
+                    {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
+                    for m in members
+                ],
+            },
+        }
+        write_json(bundle_path, bundle)
+        wrote += 1
+
+    for note in merge_notes:
+        log(f"land: {note}")
+    if wrote:
+        print(f"land: wrote {wrote} bundle(s) under {inbox_root() / tool}")
+    else:
+        print("land: no new bundles (nothing to file or all commits already kept)")
+    return 0
 
 
 def git_summary(repo):
@@ -371,7 +756,6 @@ def note(args):
     print(f"pinned {session_id}")
     print("Open it with: agent-memory review")
 
-
 def keep(args):
     bundle = find_bundle(args.session_id, args.tool)
     path = session_dir(bundle["tool"], bundle["session_id"]) / "bundle.json"
@@ -414,36 +798,6 @@ def approve(bundle, kind, domain, text, commit=""):
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     return document
 
-
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Agent memory</title>
-<style>
-  body { font: 16px/1.45 ui-sans-serif, system-ui, sans-serif; margin: 2rem auto; max-width: 46rem; color: #1c1917; background: #fafaf9; }
-  h1 { font-size: 1.4rem; }
-  article { background: white; border: 1px solid #e7e5e4; border-radius: 8px; padding: 1rem 1.1rem; margin: 1rem 0; }
-  .meta { color: #57534e; font-size: 0.92rem; }
-  pre { white-space: pre-wrap; background: #f5f5f4; padding: 0.7rem; border-radius: 6px; }
-  fieldset { border: 1px solid #e7e5e4; border-radius: 6px; margin: 0.8rem 0; }
-  fieldset label { font-family: ui-monospace, monospace; font-size: 0.92rem; }
-  label { display: block; margin-top: 0.7rem; }
-  textarea { width: 100%; min-height: 7rem; font: inherit; }
-  select { font: inherit; }
-  button { font: inherit; margin-right: 0.4rem; margin-top: 0.8rem; }
-  a { color: #1d4ed8; }
-</style>
-</head>
-<body>
-<h1>Review</h1>
-<p class="meta">__LEAD__</p>
-__ITEMS__
-</body>
-</html>
-"""
-
-
 def select_options(choices, selected):
     return "".join(
         f'<option{" selected" if choice == selected else ""}>{html.escape(choice)}</option>'
@@ -465,7 +819,15 @@ def render_page(items, include_all):
             draft = item.get("draft") or {}
             domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
             draft_text = html.escape(draft.get("text") or "")
-            commits = candidate_commits(item)
+            land_meta = item.get("land") or {}
+            if land_meta.get("commits"):
+                commits = [
+                    {"sha": c.get("sha", ""), "subject": c.get("subject", "")}
+                    for c in land_meta["commits"]
+                    if c.get("sha")
+                ]
+            else:
+                commits = candidate_commits(item)
             kinds = KINDS if commits else tuple(name for name in KINDS if name != "change")
             draft_kind = draft.get("kind")
             if draft_kind in kinds:
@@ -476,13 +838,18 @@ def render_page(items, include_all):
                 kind = "learning"
             if commits:
                 radios = []
+                default_sha = (draft.get("commit") or "").strip()
                 for index, commit in enumerate(commits):
-                    checked = " checked" if index == 0 else ""
+                    checked = (
+                        " checked"
+                        if (default_sha and commit["sha"] == default_sha)
+                        else (not default_sha and index == 0)
+                    )
                     short = html.escape(commit["sha"][:10])
-                    subject = html.escape(commit["subject"])
+                    subj = html.escape(commit.get("subject") or "")
                     sha = html.escape(commit["sha"])
                     radios.append(
-                        f'<label><input type="radio" name="commit" value="{sha}"{checked}> {short} {subject}</label>'
+                        f'<label><input type="radio" name="commit" value="{sha}"{checked}> {short} {subj}</label>'
                     )
                 commit_block = "<fieldset><legend>Commit</legend>" + "".join(radios) + "</fieldset>"
             else:
@@ -784,7 +1151,6 @@ def install(args):
         print(f"wrote {tool}")
     return 0
 
-
 def strip_commands(groups):
     kept = []
     for group in groups:
@@ -870,13 +1236,35 @@ def build_parser():
 
     keep_parser = sub.add_parser("keep", help="pin a session so review shows it")
     keep_parser.add_argument("session_id")
-    keep_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi"])
+    keep_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi", "git"])
     keep_parser.set_defaults(func=keep)
 
     drop_parser = sub.add_parser("drop", help="delete an inbox bundle")
     drop_parser.add_argument("session_id")
-    drop_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi"])
+    drop_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi", "git"])
     drop_parser.set_defaults(func=drop)
+
+    land_parser = sub.add_parser(
+        "land",
+        help="file inbox bundles for recent default-branch commits (grouped by PR when possible)",
+    )
+    land_parser.add_argument(
+        "repo",
+        help="path to the git repository to scan",
+    )
+    land_parser.add_argument(
+        "--since",
+        default="",
+        help="start time (ISO-8601) or integer hours ago; default: 24 hours before now",
+    )
+    land_parser.add_argument(
+        "--since-hours",
+        type=int,
+        default=24,
+        help="used as the default window when --since is omitted (default: 24)",
+    )
+    land_parser.set_defaults(func=land)
+
     return parser
 
 

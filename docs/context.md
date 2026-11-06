@@ -4,7 +4,7 @@ Do not reopen these. The research session picks an engine and a model. It does n
 
 ## What this is
 
-A tool that files a coding-agent session, lets a person choose what to keep, and embeds only that choice.
+A tool that files a coding-agent session (or a slice of default-branch history), lets a person choose what to keep, and embeds only that choice.
 
 The two jobs, in order:
 
@@ -17,9 +17,9 @@ The vector database belongs to this tool. A setup script creates it in this repo
 
 Tags on every memory:
 
-- `repo` — the project the session was working in
-- `tool` — `cursor`, `claude-code`, `codex`, or `pi`
-- `session_id` — the harness session that produced it
+- `repo` — normalized remote project id (`host/owner/name`, e.g. `github.com/roune/agent-memory` from `origin`)
+- `tool` — `cursor`, `claude-code`, `codex`, `pi`, or `git` (for bundles filed by `land`)
+- `session_id` — the harness session, or a stable id from `land`
 - `domain` — `code`, `architecture`, or `operations`
 
 Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept. All three domains share the one `memories` collection. Search filters on `domain`. A second collection is for a different embedding model only.
@@ -40,16 +40,29 @@ Kind is the shape of the note. Domain is which job it is for:
 
 Review is also the redaction step. Secrets and anything that should not be retrieved are removed before a document is approved. Raw transcripts are never embedded and never committed.
 
-## How a session becomes a memory
+## How work becomes a memory
+
+**Agent sessions (hooks):**
 
 ```
 session end hook
   -> local inbox bundle
-review command
-  -> keep nothing, or one or more documents (change, learning, decision)
+agent-memory review
+  -> keep nothing, or one document (change, learning, or decision)
 setup and embed script
   -> vectors in data/
 ```
+
+**Default-branch commits in another repo:**
+
+```
+agent-memory land <path-to-repo> [--since …]
+  -> inbox bundles under inbox/git/ (one per PR group or orphan commit), draft prefilled
+agent-memory review
+  -> same approve/reject flow; nothing is written to memories/ until Approve
+```
+
+`land` lists commits on that clone’s default branch since `--since` (default: 24 hours before now). It skips merge commits and groups single-parent commits by pull request when it can tell the PR (merge/squash message lines, or `gh pr list` when `gh` is available and authenticated). It uses file names across the group to add a short “unusual vs the rest” hint — it does not store diffs. PR title/body and each commit message seed `draft.text`. Bundles use `tool` `git` and a stable `session_id` derived from the group.
 
 The hook writes the inbox bundle and returns. It does not prompt. End hooks cannot reliably stop the session and wait for a choice:
 
