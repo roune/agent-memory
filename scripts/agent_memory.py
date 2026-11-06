@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""agent-memory command: capture, review, and hook install.
+"""agent-memory command: capture, review, hook install, and repo config.
 
-The hook calls `capture` and returns. Review is a page on 127.0.0.1.
-`install` writes editor hooks only after a yes.
+Editor hooks call `capture` and return. Git post-commit/post-merge call `git-hook`.
+Review is a page on 127.0.0.1. `install` writes editor hooks only after a yes; with
+`--git-repo` it can also install git hooks and repo policy under `.agent-memory.toml`.
+Use `config` to change git hook policy and auto-approve without reinstalling.
 """
 
 import argparse
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import hashlib
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -24,8 +28,12 @@ BIN = ROOT / "bin" / "agent-memory"
 PORT_START = 4173
 KINDS = ("change", "learning", "decision")
 DOMAINS = ("code", "architecture", "operations")
+RECORDS = ("", "explanation", "history", "runbook")
 END_EVENTS = {"session-end", "sessionend", "session_shutdown"}
 MARKER = "agent-memory-hook"
+GIT_HOOK_MARKER = "agent-memory-git-hook"
+
+_CONFIG_BOOL_KEYS = frozenset({"capture", "git_hooks", "auto_approve"})
 
 
 def store_root():
@@ -84,12 +92,370 @@ def git_root(cwd):
     return found or cwd
 
 
+def repo_policy_path(repo):
+    return Path(repo) / ".agent-memory.toml"
+
+
+def parse_repo_config(text):
+    """Parse minimal key = value lines from .agent-memory.toml (TOML-like)."""
+    cfg = {
+        "capture": True,
+        "repo": "",
+        "git_hooks": False,
+        "auto_approve": False,
+    }
+    if not text or not str(text).strip():
+        return cfg
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip().lower().replace("-", "_")
+        val = rest.strip()
+        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            val = val[1:-1]
+        elif val.startswith("'") and val.endswith("'") and len(val) >= 2:
+            val = val[1:-1]
+        if key == "repo":
+            cfg["repo"] = val
+        elif key in _CONFIG_BOOL_KEYS:
+            low = val.lower()
+            if low in {"true", "1", "yes"}:
+                cfg[key] = True
+            elif low in {"false", "0", "no"}:
+                cfg[key] = False
+    return cfg
+
+
+def read_repo_config(repo):
+    path = repo_policy_path(repo)
+    if not path.is_file():
+        return parse_repo_config("")
+    return parse_repo_config(path.read_text(encoding="utf-8"))
+
+
+def format_repo_config_lines(cfg):
+    """Build TOML lines for known policy keys."""
+    chunks = []
+    repo_val = (cfg.get("repo") or "").strip()
+    if repo_val:
+        esc = str(repo_val).replace("\\", "\\\\").replace('"', '\\"')
+        chunks.append(f'repo = "{esc}"\n')
+    for bk in ("capture", "git_hooks", "auto_approve"):
+        if bk in cfg:
+            chunks.append(f"{bk} = {'true' if cfg[bk] else 'false'}\n")
+    return chunks
+
+
+def write_repo_config(repo, updates):
+    """Merge updates into .agent-memory.toml, keeping unrecognized lines."""
+    path = repo_policy_path(repo)
+    merged = dict(read_repo_config(repo))
+    merged.update(updates)
+    preserved = []
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw.split("#", 1)[0].strip()
+            if not stripped or "=" not in stripped:
+                preserved.append(raw)
+                continue
+            key = stripped.partition("=")[0].strip().lower().replace("-", "_")
+            if key in {"repo", "capture", "git_hooks", "auto_approve"}:
+                continue
+            preserved.append(raw)
+    while preserved and not preserved[-1].strip():
+        preserved.pop()
+    out = []
+    out.extend(preserved)
+    if preserved:
+        out.append("")
+    out.extend(format_repo_config_lines(merged))
+    text = "\n".join(out)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def sh_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def git_hooks_dir(repo):
+    """Directory git actually runs hooks from.
+
+    `core.hooksPath` wins. Otherwise this is `git rev-parse --git-path hooks`,
+    which follows the common git dir (linked worktrees do not have their own).
+    """
+    repo = str(Path(repo).resolve())
+    custom = run(["git", "config", "--get", "core.hooksPath"], repo).strip()
+    if custom:
+        path = Path(os.path.expanduser(custom))
+        if not path.is_absolute():
+            path = Path(repo) / path
+        return path
+    found = run(["git", "rev-parse", "--git-path", "hooks"], repo).strip()
+    if not found:
+        return None
+    path = Path(found)
+    if not path.is_absolute():
+        path = Path(repo) / path
+    return path
+
+
+def git_hooks_installed(repo):
+    """True if post-commit and post-merge in the active hooks dir are ours."""
+    base = git_hooks_dir(repo)
+    if base is None:
+        return False
+    for name in ("post-commit", "post-merge"):
+        script = base / name
+        if not script.is_file():
+            return False
+        try:
+            txt = script.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        if GIT_HOOK_MARKER not in txt or "git-hook" not in txt:
+            return False
+    return True
+
+
+def write_git_hooks(repo):
+    """Install post-commit and post-merge hooks in the directory git will run.
+
+    A hook we did not write is moved aside and called after ours. Reinstall
+    rewrites only our script and leaves that saved hook in place.
+    """
+    repo = str(Path(repo).resolve())
+    hooks_dir = git_hooks_dir(repo)
+    if hooks_dir is None:
+        raise SystemExit(f"could not locate the git hooks directory for {repo}")
+    if hooks_dir.exists() and not hooks_dir.is_dir():
+        raise SystemExit(f"git hooks path is not a directory: {hooks_dir}")
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    bin_quoted = sh_quote(BIN)
+    for name in ("post-commit", "post-merge"):
+        path = hooks_dir / name
+        user_path = hooks_dir / f"{name}.agent-memory-user"
+        if path.is_file():
+            try:
+                txt = path.read_text(encoding="utf-8")
+            except OSError as error:
+                raise SystemExit(f"could not read {path}: {error}") from error
+            if GIT_HOOK_MARKER not in txt:
+                if user_path.exists():
+                    raise SystemExit(
+                        f"{path} is not an agent-memory hook and {user_path.name} already exists"
+                    )
+                path.rename(user_path)
+        user_quoted = sh_quote(user_path)
+        # Do not forward "$@" to git-hook. post-merge is invoked with a squash
+        # flag, and git-hook has no positional arguments.
+        body = f"""#!/bin/sh
+# {GIT_HOOK_MARKER}
+cd "$(git rev-parse --show-toplevel)" && {bin_quoted} git-hook --event {name}
+_am_status=$?
+if [ -f {user_quoted} ]; then
+  if [ -x {user_quoted} ]; then
+    {user_quoted} "$@"
+  else
+    sh {user_quoted} "$@"
+  fi
+  _user_status=$?
+  if [ "$_user_status" -ne 0 ]; then
+    exit "$_user_status"
+  fi
+fi
+exit "$_am_status"
+"""
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+    return hooks_dir
+
+
+def remove_git_hooks(repo):
+    """Remove only hooks previously written by write_git_hooks.
+
+    A hook that was moved aside is restored to its original name.
+    """
+    base = git_hooks_dir(repo)
+    if base is None:
+        return
+    for name in ("post-commit", "post-merge"):
+        path = base / name
+        user_path = base / f"{name}.agent-memory-user"
+        if path.is_file():
+            try:
+                txt = path.read_text(encoding="utf-8")
+            except OSError:
+                txt = ""
+            if GIT_HOOK_MARKER in txt:
+                path.unlink()
+        if not path.exists() and user_path.is_file():
+            user_path.rename(path)
+
+
+def draft_text_commit_only(repo, remote_id, commit_message, sha):
+    """Draft for git hook: commit message only (review-aligned)."""
+    lines = []
+    subj = commit_message.split("\n", 1)[0].strip() if commit_message else ""
+    lines.append(f"- {sha[:10]} {subj}")
+    body = (commit_message or "").strip()
+    if body:
+        lines.append(body)
+        lines.append("")
+    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
+    return "\n".join(lines).strip()
+
+
+def single_commit_hook_group(repo, sha, message):
+    ct_s = run(["git", "log", "-1", "--format=%ct", sha], repo)
+    try:
+        ct = int(ct_s) if ct_s else 0
+    except ValueError:
+        ct = 0
+    return {
+        "pr": None,
+        "commits": [{"sha": sha, "committer_date": ct, "message": message or ""}],
+    }
+
+
+def try_auto_approve_bundle(bundle):
+    """If identity is complete, approve with change/code and commit from draft. Else raise ValueError."""
+    draft = bundle.get("draft") or {}
+    text = (draft.get("text") or "").strip()
+    commit = (draft.get("commit") or "").strip()
+    kind = draft.get("kind") if draft.get("kind") in KINDS else "change"
+    domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
+    approve(
+        bundle,
+        kind,
+        domain,
+        text,
+        commit=commit,
+    )
+    return True
+
+
+def is_merge_commit(repo, sha):
+    parents = run(["git", "rev-parse", f"{sha}^@"], repo).split()
+    return len(parents) > 1
+
+
+def hook_commit_shas(repo, event, head):
+    """Commits this hook invocation should file.
+
+    post-commit files the new HEAD. post-merge files every single-parent commit
+    reachable from HEAD but not from ORIG_HEAD, so a fast-forward or merge does
+    not keep only the tip.
+    """
+    if event == "post-merge":
+        orig = run(["git", "rev-parse", "--verify", "ORIG_HEAD"], repo)
+        if orig and orig != head:
+            listing = run(["git", "rev-list", "--reverse", f"{orig}..{head}"], repo)
+            shas = [line.strip() for line in listing.splitlines() if line.strip()]
+            return [sha for sha in shas if not is_merge_commit(repo, sha)]
+    return [head]
+
+
+def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve):
+    if memory_exists_for_commit(sha):
+        return
+    msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
+    group = single_commit_hook_group(repo_s, sha, msg)
+    session_id = land_session_id(remote_id or repo_s, sha[:12], None, [sha])
+    bundle_path = land_bundle_path("git", session_id)
+    if bundle_path.is_file():
+        return
+    draft_text = draft_text_commit_only(repo_s, remote_id, msg, sha)
+    bundle = {
+        "tool": "git",
+        "session_id": session_id,
+        "repo": repo_s,
+        "started_at": since,
+        "ended_at": occurred_at_for_group(group),
+        "event": "git-" + event.replace("_", "-"),
+        "closed": True,
+        "transcript_copy": None,
+        "last_assistant_message": "",
+        "git": {
+            "branch": branch,
+            "head": tip,
+            "status": "",
+            "diff_stat": "",
+            "paths": commit_files(repo_s, sha),
+        },
+        "pinned": True,
+        "draft": {
+            "kind": "change",
+            "domain": "code",
+            "text": draft_text,
+            "commit": sha,
+        },
+        "land": {
+            "remote_repo": remote_id,
+            "pull_request": None,
+            "commits": [
+                {
+                    "sha": sha,
+                    "subject": (msg or "").split("\n", 1)[0].strip(),
+                }
+            ],
+        },
+    }
+    write_json(bundle_path, bundle)
+    if not auto_approve:
+        return
+    try:
+        try_auto_approve_bundle(bundle)
+    except (ValueError, OSError) as error:
+        log(f"git-hook: auto_approve failed: {error}")
+
+
+def git_hook(args):
+    repo = Path(args.repo or os.getcwd()).resolve()
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        log("git-hook skipped: not a git repository")
+        return 0
+    repo_s = str(repo)
+    if capture_disabled(repo_s):
+        log("git-hook skipped: capture disabled for repo")
+        return 0
+    cfg = read_repo_config(repo_s)
+    if not cfg.get("git_hooks"):
+        return 0
+
+    event = (args.event or "post-commit").lower()
+    head = run(["git", "rev-parse", "HEAD"], repo_s)
+    if not head:
+        log("git-hook skipped: could not resolve HEAD")
+        return 0
+    shas = hook_commit_shas(repo_s, event, head)
+    if not shas:
+        return 0
+
+    auto_approve = False
+    if cfg.get("auto_approve"):
+        iden = read_identity()
+        if all(iden.get(k) for k in ("org", "team", "person")):
+            auto_approve = True
+        else:
+            log("git-hook: auto_approve set but identity incomplete; inbox bundle kept for review")
+
+    remote_id = git_remote_repo_id(repo_s)
+    branch, tip = default_branch_tip(repo_s)
+    since = parse_since("", 24)
+    for sha in shas:
+        file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve)
+    return 0
+
+
 def capture_disabled(repo):
-    policy = Path(repo) / ".agent-memory.toml"
-    if policy.is_file():
-        for line in policy.read_text(encoding="utf-8").splitlines():
-            if line.strip().replace(" ", "") == "capture=false":
-                return True
+    cfg = read_repo_config(repo)
+    if not cfg.get("capture", True):
+        return True
     ignore = HOME / ".config" / "agent-memory" / "ignore"
     if ignore.is_file():
         repo_path = str(Path(repo).resolve())
@@ -98,6 +464,432 @@ def capture_disabled(repo):
             if item and (repo_path == item or repo_path.startswith(item.rstrip("/") + "/")):
                 return True
     return False
+
+
+def identity_path():
+    return HOME / ".config" / "agent-memory" / "identity"
+
+
+def read_identity():
+    path = identity_path()
+    if not path.is_file():
+        return {"org": "", "team": "", "person": ""}
+    org = team = person = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("org"):
+            org = line.split("=", 1)[1].strip() if "=" in line else ""
+        elif line.startswith("team"):
+            team = line.split("=", 1)[1].strip() if "=" in line else ""
+        elif line.startswith("person"):
+            person = line.split("=", 1)[1].strip() if "=" in line else ""
+    return {"org": org, "team": team, "person": person}
+
+
+def policy_repo_id(repo):
+    return (read_repo_config(repo).get("repo") or "").strip()
+
+
+def normalize_remote_url(raw):
+    if not raw or not str(raw).strip():
+        return ""
+    s = str(raw).strip()
+    if s.startswith("git@"):
+        rest = s[4:]
+        if ":" in rest:
+            host, path = rest.split(":", 1)
+            host = host.strip().lower()
+            path = path.strip().rstrip("/")
+            if path.endswith(".git"):
+                path = path[:-4]
+            return f"{host}/{path}"
+        return ""
+    try:
+        parsed = urlparse(s)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return ""
+        path = (parsed.path or "").strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        return f"{host}/{path}" if path else ""
+    except Exception:
+        return ""
+
+
+def git_remote_repo_id(repo):
+    policy = policy_repo_id(repo)
+    if policy:
+        return policy
+    url = run(["git", "remote", "get-url", "origin"], repo)
+    return normalize_remote_url(url)
+
+
+def parse_since(value, default_hours):
+    if not value or not str(value).strip():
+        when = datetime.now(timezone.utc) - timedelta(hours=default_hours)
+        return when.replace(microsecond=0).isoformat()
+    s = str(value).strip()
+    if re.match(r"^-?\d+$", s):
+        when = datetime.now(timezone.utc) - timedelta(hours=int(s))
+        return when.replace(microsecond=0).isoformat()
+    try:
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.replace(microsecond=0).isoformat()
+    except ValueError:
+        raise SystemExit(
+            f"--since expects ISO-8601 datetime or hours as integer (got {value!r})"
+        ) from None
+
+
+def commit_files(repo, sha):
+    listing = run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha], repo)
+    return [line.strip() for line in listing.splitlines() if line.strip()]
+
+
+def unusual_path_hint(repo, shas):
+    if len(shas) < 2:
+        return ""
+    path_sets = []
+    for sha in shas:
+        path_sets.append(set(commit_files(repo, sha)))
+    union = set().union(*path_sets)
+    common = set.intersection(*path_sets) if path_sets else set()
+    unusual = union - common
+    if unusual:
+        sample = sorted(unusual)[0]
+        return f"Unusual vs rest of group: touched {sample}"
+    if len(shas) == 2:
+        a, b = path_sets[0], path_sets[1]
+        diff = sorted((a ^ b))
+        if diff:
+            return f"Unusual vs the other commit: only {diff[0]}"
+    return "No single file stands out from the rest of this group."
+
+
+_GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+)", re.IGNORECASE)
+_SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def pr_from_commit_message(message):
+    if not message:
+        return None
+    first = message.strip().split("\n", 1)[0].strip()
+    match = _GITHUB_MERGE_RE.match(first)
+    if match:
+        return int(match.group(1))
+    match_sq = _SQUASH_PR_RE.search(first)
+    if match_sq:
+        return int(match_sq.group(1))
+    return None
+
+
+def gh_pr_description(repo, pr_number):
+    out = run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--json",
+            "title,body",
+        ],
+        repo,
+    )
+    if not out:
+        return "", ""
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return "", ""
+    title = (data.get("title") or "").strip()
+    body = (data.get("body") or "").strip()
+    return title, body
+
+
+def gh_pr_for_sha(repo, sha):
+    out = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--search",
+            sha,
+            "--state",
+            "merged",
+            "--json",
+            "number,mergeCommit",
+            "--limit",
+            "20",
+        ],
+        repo,
+    )
+    if not out:
+        return None
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    for row in rows:
+        mc = (row.get("mergeCommit") or {}).get("oid") or ""
+        if mc == sha:
+            num = row.get("number")
+            return int(num) if num is not None else None
+    return None
+
+
+def land_session_id(repo_key, group_key, pr_number, shas):
+    raw = f"{repo_key}|{group_key}|{pr_number or ''}|" + ",".join(sorted(shas))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"land-{digest}"
+
+
+def land_bundle_path(tool, session_id):
+    return session_dir(tool, session_id) / "bundle.json"
+
+
+def memory_exists_for_commit(sha):
+    """True when a kept document already explains this commit.
+
+    A stored abbreviated hash matches the full id, and the other way around.
+    Sharing the first 7 hex digits is not enough: that skipped unrelated commits.
+    """
+    root = memories_root()
+    if not root.is_dir():
+        return False
+    needle = sha.strip().lower()
+    if len(needle) < 7:
+        return False
+    for path in root.glob("*.json"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        stored = doc.get("commit")
+        if not isinstance(stored, str):
+            continue
+        stored = stored.strip().lower()
+        if len(stored) < 7:
+            continue
+        if needle.startswith(stored) or stored.startswith(needle):
+            return True
+    return False
+
+
+def default_branch_tip(repo):
+    branch = default_branch(repo)
+    sha = run(["git", "rev-parse", branch], repo)
+    return branch, sha
+
+
+def commits_on_branch_since(repo, branch, since_iso):
+    listing = run(
+        [
+            "git",
+            "log",
+            branch,
+            f"--since={since_iso}",
+            "--reverse",
+            "--pretty=format:%H%x00%ct%x00%B%x00---COMMIT---",
+        ],
+        repo,
+    )
+    commits = []
+    for block in listing.split("---COMMIT---"):
+        block = block.strip()
+        if not block:
+            continue
+        parts = block.split("\x00", 2)
+        if len(parts) < 3:
+            continue
+        sha, ct_s, message = parts[0], parts[1], parts[2]
+        try:
+            ct = int(ct_s)
+        except ValueError:
+            ct = 0
+        commits.append({"sha": sha, "committer_date": ct, "message": message.strip()})
+    return commits
+
+
+def build_land_groups(repo, commits):
+    """Split commits into single-parent only; group by PR number when present."""
+    merges = []
+    singles = []
+    for item in commits:
+        parents = run(["git", "rev-parse", f"{item['sha']}^@"], repo).split()
+        if len(parents) != 1:
+            merges.append(item)
+            continue
+        singles.append(item)
+
+    groups = []
+    by_pr = {}
+    orphan_singles = []
+
+    for item in singles:
+        prn = pr_from_commit_message(item["message"])
+        if prn is None:
+            prn = gh_pr_for_sha(repo, item["sha"])
+        if prn is not None:
+            by_pr.setdefault(prn, []).append(item)
+        else:
+            orphan_singles.append(item)
+
+    for prn, members in sorted(by_pr.items()):
+        groups.append({"pr": prn, "commits": sorted(members, key=lambda x: x["committer_date"])})
+
+    for item in orphan_singles:
+        groups.append({"pr": None, "commits": [item]})
+
+    merge_notes = []
+    for item in merges:
+        prn = pr_from_commit_message(item["message"])
+        if prn is not None:
+            merge_notes.append(f"Merge commit {item['sha'][:10]} for PR #{prn} (PR group uses its squashed or direct commits).")
+        else:
+            merge_notes.append(
+                f"Skipped merge commit {item['sha'][:10]}: {item['message'].splitlines()[0] if item['message'] else ''}".strip()
+            )
+
+    return groups, merge_notes
+
+
+def draft_text_for_group(repo, remote_id, group):
+    lines = []
+    pr_number = group.get("pr")
+    members = group["commits"]
+    shas = [m["sha"] for m in members]
+
+    if pr_number is not None:
+        title, body = gh_pr_description(repo, pr_number)
+        lines.append(f"Pull request #{pr_number}")
+        if title:
+            lines.append(title)
+        if body:
+            lines.append(body)
+        lines.append("")
+    lines.append("Commits:")
+    for m in members:
+        subj = m["message"].split("\n", 1)[0].strip() if m["message"] else ""
+        lines.append(f"- {m['sha'][:10]} {subj}")
+        body = m["message"].strip()
+        if body:
+            lines.append(body)
+            lines.append("")
+    lines.append(unusual_path_hint(repo, shas))
+    lines.append("")
+    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def git_paths_for_group(repo, shas):
+    paths = []
+    for sha in shas:
+        paths.extend(commit_files(repo, sha))
+    out = []
+    seen = set()
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def occurred_at_for_group(group):
+    times = [m["committer_date"] for m in group["commits"] if m.get("committer_date")]
+    if not times:
+        return now()
+    latest = max(times)
+    return datetime.fromtimestamp(latest, tz=timezone.utc).replace(microsecond=0).isoformat()
+
+
+def land(args):
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        raise SystemExit(f"not a directory: {repo}")
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        raise SystemExit(f"not a git repository: {repo}")
+    if capture_disabled(str(repo)):
+        log("land skipped: capture disabled for repo")
+        return 0
+
+    since = parse_since(args.since, args.since_hours)
+    branch = local_default_branch(str(repo))
+    tip = run(["git", "rev-parse", branch], str(repo))
+    remote_id = git_remote_repo_id(str(repo))
+    commits = commits_on_branch_since(str(repo), branch, since)
+    groups, merge_notes = build_land_groups(str(repo), commits)
+
+    tool = "git"
+    wrote = 0
+    for group in groups:
+        members = group["commits"]
+        shas = [m["sha"] for m in members]
+        any_kept = False
+        for sha in shas:
+            if not memory_exists_for_commit(sha):
+                any_kept = True
+                break
+        if not any_kept:
+            continue
+
+        prn = group.get("pr")
+        group_key = f"pr-{prn}" if prn is not None else shas[0]
+        session_id = land_session_id(remote_id or str(repo), group_key, prn, shas)
+        bundle_path = land_bundle_path(tool, session_id)
+        if bundle_path.is_file():
+            continue
+
+        paths = git_paths_for_group(str(repo), shas)
+        draft_text = draft_text_for_group(str(repo), remote_id, group)
+        ended = occurred_at_for_group(group)
+        bundle = {
+            "tool": tool,
+            "session_id": session_id,
+            "repo": str(repo),
+            "started_at": since,
+            "ended_at": ended,
+            "event": "land",
+            "closed": True,
+            "transcript_copy": None,
+            "last_assistant_message": "",
+            "git": {
+                "branch": branch,
+                "head": tip,
+                "status": "",
+                "diff_stat": "",
+                "paths": paths,
+            },
+            "pinned": True,
+            "draft": {
+                "kind": "change",
+                "domain": "code",
+                "text": draft_text,
+                "commit": shas[-1],
+            },
+            "land": {
+                "remote_repo": remote_id,
+                "pull_request": prn,
+                "commits": [
+                    {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
+                    for m in members
+                ],
+            },
+        }
+        write_json(bundle_path, bundle)
+        wrote += 1
+
+    for note in merge_notes:
+        log(f"land: {note}")
+    if wrote:
+        print(f"land: wrote {wrote} bundle(s) under {inbox_root() / tool}")
+    else:
+        print("land: no new bundles (nothing to file or all commits already kept)")
+    return 0
 
 
 def git_summary(repo):
@@ -162,6 +954,84 @@ def load_payload(args):
     if not raw.strip():
         return {}
     return json.loads(raw)
+
+
+def commit_after_session_start(started_at, committer_epoch):
+    if not started_at or not committer_epoch:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return committer_epoch >= int(parsed.timestamp())
+
+
+def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
+    """Approve a commit this session actually made. Otherwise leave the inbox.
+
+    The text is the commit message, never the last assistant reply, and HEAD
+    from before the session is not treated as already kept.
+    """
+    cfg = read_repo_config(repo)
+    if not cfg.get("auto_approve"):
+        return
+    iden = read_identity()
+    if not all(iden.get(k) for k in ("org", "team", "person")):
+        log("capture session-end: auto_approve set but identity incomplete; inbox bundle kept")
+        return
+    started = previous.get("started_at")
+    if not started:
+        log("capture session-end: auto_approve left inbox; session has no earlier capture")
+        return
+    if run(["git", "rev-parse", "--is-inside-work-tree"], cwd) != "true":
+        log("capture session-end: auto_approve left inbox; not a git checkout")
+        return
+    head = run(["git", "rev-parse", "HEAD"], repo)
+    if not head:
+        log("capture session-end: auto_approve left inbox; could not resolve HEAD")
+        return
+    if memory_exists_for_commit(head):
+        log("capture session-end: commit already kept; inbox left for review")
+        return
+    if is_merge_commit(repo, head):
+        log("capture session-end: HEAD is a merge commit; inbox left for review")
+        return
+    ct_s = run(["git", "log", "-1", "--format=%ct", head], repo)
+    try:
+        ct = int(ct_s) if ct_s else 0
+    except ValueError:
+        ct = 0
+    if not commit_after_session_start(started, ct):
+        log("capture session-end: HEAD is older than this session; inbox left for review")
+        return
+    remote_id = git_remote_repo_id(repo)
+    body = run(["git", "log", "-1", "--format=%B", head], repo) or ""
+    text = draft_text_commit_only(repo, remote_id, body, head)
+    if not text.strip():
+        log("capture session-end: empty commit message; inbox left for review")
+        return
+    fresh = read_json(bundle_path)
+    group = single_commit_hook_group(repo, head, body)
+    fresh["draft"] = {
+        "kind": "change",
+        "domain": "code",
+        "text": text,
+        "commit": head,
+    }
+    fresh["ended_at"] = occurred_at_for_group(group)
+    land_meta = fresh.get("land") if isinstance(fresh.get("land"), dict) else {}
+    land_meta["remote_repo"] = remote_id or land_meta.get("remote_repo") or ""
+    land_meta["commits"] = [
+        {"sha": head, "subject": (body or "").split("\n", 1)[0].strip()}
+    ]
+    fresh["land"] = land_meta
+    write_json(bundle_path, fresh)
+    try:
+        try_auto_approve_bundle(read_json(bundle_path))
+    except (ValueError, OSError) as error:
+        log(f"capture session-end auto_approve failed: {error}")
 
 
 def capture(args):
@@ -243,6 +1113,9 @@ def write_capture(args, payload):
     }
     write_json(bundle_path, bundle)
 
+    if event.lower() in END_EVENTS:
+        maybe_auto_approve_session(repo, cwd, bundle_path, previous)
+
 
 def bundles():
     root = inbox_root()
@@ -277,6 +1150,27 @@ def default_branch(repo):
         if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
             return name
     return "main"
+
+
+def local_default_branch(repo):
+    """Local branch `land` should read.
+
+    `origin/HEAD` only supplies the name (`main` or `master`). Logging the
+    remote-tracking ref skips commits that are on the local branch and not
+    pushed, and files commits that are not on the local branch.
+    """
+    ref = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repo)
+    if ref:
+        name = ref.split("/", 1)[1] if "/" in ref else ref
+        if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
+            return name
+    for name in ("main", "master"):
+        if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
+            return name
+    head = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo)
+    if head and head != "HEAD":
+        return head
+    return ref or "main"
 
 
 def candidate_commits(bundle):
@@ -353,6 +1247,8 @@ def note(args):
     folder = session_dir("cursor", session_id)
     bundle_path = folder / "bundle.json"
     previous = read_json(bundle_path) if bundle_path.is_file() else {}
+    iden = read_identity()
+    rr = git_remote_repo_id(repo)
     bundle = {
         "tool": "cursor",
         "session_id": session_id,
@@ -365,6 +1261,7 @@ def note(args):
         "last_assistant_message": "",
         "git": {"branch": "", "head": "", "status": "", "diff_stat": "", "paths": []},
         "pinned": True,
+        "land": {"remote_repo": rr},
         "draft": {"kind": args.kind, "domain": args.domain, "text": text},
     }
     write_json(bundle_path, bundle)
@@ -387,30 +1284,106 @@ def drop(args):
     print(f"dropped {args.session_id}")
 
 
-def approve(bundle, kind, domain, text, commit=""):
+def approve(
+    bundle,
+    kind,
+    domain,
+    text,
+    commit="",
+    org="",
+    team="",
+    person="",
+    occurred_at="",
+    remote_repo="",
+    record="",
+    subject="",
+    alarm="",
+    look_at="",
+    supersedes="",
+    superseded_by="",
+    updates="",
+):
     text = text.strip()
     if kind not in KINDS or domain not in DOMAINS or not text:
         raise ValueError("kind, domain, and text are required")
-    repo = str(bundle.get("repo") or "").strip()
+    repo_path = str(bundle.get("repo") or "").strip()
     tool = str(bundle.get("tool") or "").strip()
     session_id = str(bundle.get("session_id") or "").strip()
-    if not repo or not tool or not session_id:
+    if not repo_path or not tool or not session_id:
         raise ValueError("repo, tool, and session id are required")
-    document = {
-        "id": f"{kind}-{session_id}",
-        "kind": kind,
-        "domain": domain,
-        "repo": repo,
-        "tool": tool,
-        "session_id": session_id,
-        "text": text,
-    }
+
+    iden = read_identity()
+    org = (org or iden.get("org") or "").strip()
+    team = (team or iden.get("team") or "").strip()
+    person = (person or iden.get("person") or "").strip()
+    if not org or not team or not person:
+        raise ValueError("org, team, and person are required (identity file or form)")
+    if "/" in person or person in {".", ".."}:
+        raise ValueError("person must be a single path segment")
+    land = bundle.get("land") or {}
+    remote_repo = (remote_repo or land.get("remote_repo") or "").strip()
+    if not remote_repo:
+        remote_repo = git_remote_repo_id(repo_path)
+    if not remote_repo:
+        raise ValueError("remote repo id is required (origin URL or .agent-memory.toml repo=)")
+
+    occurred_at = (occurred_at or bundle.get("ended_at") or "").strip()
+    if not occurred_at:
+        occurred_at = now()
+
+    if record not in RECORDS:
+        raise ValueError("record must be empty, explanation, history, or runbook")
+    subject = subject.strip()
+    alarm = alarm.strip()
+    look_at = look_at.strip()
+    supersedes = supersedes.strip()
+    superseded_by = superseded_by.strip()
+    updates = updates.strip()
+
     if kind == "change":
         commit = commit.strip()
         if len(commit) < 7 or any(char not in "0123456789abcdefABCDEF" for char in commit):
             raise ValueError("a change needs the commit it explains")
+
+    document = {
+        "id": f"{person}-{kind}-{session_id}",
+        "kind": kind,
+        "domain": domain,
+        "repo": remote_repo,
+        "tool": tool,
+        "session_id": session_id,
+        "text": text,
+        "org": org,
+        "team": team,
+        "person": person,
+        "occurred_at": occurred_at,
+    }
+    if kind == "change":
         document["commit"] = commit
-    write_json(memories_root() / f"{document['id']}.json", document)
+    if record:
+        document["record"] = record
+    if subject:
+        document["subject"] = subject
+    if alarm:
+        document["alarm"] = alarm
+    if look_at:
+        document["look_at"] = look_at
+    if supersedes:
+        document["supersedes"] = supersedes
+    if superseded_by:
+        document["superseded_by"] = superseded_by
+    if updates:
+        document["updates"] = updates
+
+    new_id = document["id"]
+    write_json(memories_root() / f"{new_id}.json", document)
+    if supersedes:
+        old_path = memories_root() / f"{supersedes}.json"
+        if old_path.is_file():
+            old_doc = read_json(old_path)
+            old_doc["superseded_by"] = new_id
+            write_json(old_path, old_doc)
+
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     return document
 
@@ -465,7 +1438,15 @@ def render_page(items, include_all):
             draft = item.get("draft") or {}
             domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
             draft_text = html.escape(draft.get("text") or "")
-            commits = candidate_commits(item)
+            land_meta = item.get("land") or {}
+            if land_meta.get("commits"):
+                commits = [
+                    {"sha": c.get("sha", ""), "subject": c.get("subject", "")}
+                    for c in land_meta["commits"]
+                    if c.get("sha")
+                ]
+            else:
+                commits = candidate_commits(item)
             kinds = KINDS if commits else tuple(name for name in KINDS if name != "change")
             draft_kind = draft.get("kind")
             if draft_kind in kinds:
@@ -476,13 +1457,18 @@ def render_page(items, include_all):
                 kind = "learning"
             if commits:
                 radios = []
+                default_sha = (draft.get("commit") or "").strip()
                 for index, commit in enumerate(commits):
-                    checked = " checked" if index == 0 else ""
+                    checked = (
+                        " checked"
+                        if (default_sha and commit["sha"] == default_sha)
+                        else (not default_sha and index == 0)
+                    )
                     short = html.escape(commit["sha"][:10])
-                    subject = html.escape(commit["subject"])
+                    subj = html.escape(commit.get("subject") or "")
                     sha = html.escape(commit["sha"])
                     radios.append(
-                        f'<label><input type="radio" name="commit" value="{sha}"{checked}> {short} {subject}</label>'
+                        f'<label><input type="radio" name="commit" value="{sha}"{checked}> {short} {subj}</label>'
                     )
                 commit_block = "<fieldset><legend>Commit</legend>" + "".join(radios) + "</fieldset>"
             else:
@@ -492,18 +1478,49 @@ def render_page(items, include_all):
             if message:
                 message_block = f"<pre>{html.escape(message[:4000])}</pre>"
             text_label = "Context of this commit" if kind == "change" else "Keep this text"
+            iden = read_identity()
+            rr_default = (land_meta.get("remote_repo") or "").strip()
+            org_d = html.escape(iden.get("org") or "")
+            team_d = html.escape(iden.get("team") or "")
+            person_d = html.escape(iden.get("person") or "")
+            remote_d = html.escape(rr_default)
+            occurred_default = html.escape(item.get("ended_at") or "")
+            record_val = ""
+            record_block = (
+                '<label>Record <select name="record">'
+                + "".join(
+                    f'<option value="{html.escape(r)}"{" selected" if r == record_val else ""}>{html.escape(r or "(none)")}</option>'
+                    for r in RECORDS
+                )
+                + "</select></label>"
+            )
+            extra_fields = f"""
+<label>Organization <input name="org" type="text" value="{org_d}" autocomplete="organization"></label>
+<label>Team <input name="team" type="text" value="{team_d}" autocomplete="organization-title"></label>
+<label>Person (id prefix) <input name="person" type="text" value="{person_d}"></label>
+<label>Occurred at <input name="occurred_at" type="text" value="{occurred_default}"></label>
+<label>Remote repo id <input name="remote_repo" type="text" value="{remote_d}" placeholder="github.com/owner/repo"></label>
+{record_block}
+<label>Subject <input name="subject" type="text" value=""></label>
+<label>Alarm <input name="alarm" type="text" value=""></label>
+<label>Look at <input name="look_at" type="text" value=""></label>
+<label>Supersedes (document id) <input name="supersedes" type="text" value=""></label>
+<label>Superseded by <input name="superseded_by" type="text" value=""></label>
+<label>Updates (document id) <input name="updates" type="text" value=""></label>
+"""
             blocks.append(
                 f"""<article>
 <p><strong>{html.escape(item.get("repo") or "")}</strong></p>
 <p class="meta">{tool} · {sid} · {html.escape(item.get("ended_at") or "")}</p>
 <p class="meta">A change stores the context of the commit you pick. The diff stays in git.</p>
-{commit_block}
-{message_block}
 <form method="post" action="/approve">
 <input type="hidden" name="session_id" value="{sid}">
 <input type="hidden" name="tool" value="{tool}">
+{commit_block}
+{message_block}
 <label>Kind <select name="kind">{select_options(kinds, kind)}</select></label>
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
+{extra_fields}
 <label>{text_label} <textarea name="text">{draft_text}</textarea></label>
 <button type="submit">Approve</button>
 </form>
@@ -564,6 +1581,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     form.get("domain", ""),
                     form.get("text", ""),
                     form.get("commit", ""),
+                    org=form.get("org", ""),
+                    team=form.get("team", ""),
+                    person=form.get("person", ""),
+                    occurred_at=form.get("occurred_at", ""),
+                    remote_repo=form.get("remote_repo", ""),
+                    record=form.get("record", ""),
+                    subject=form.get("subject", ""),
+                    alarm=form.get("alarm", ""),
+                    look_at=form.get("look_at", ""),
+                    supersedes=form.get("supersedes", ""),
+                    superseded_by=form.get("superseded_by", ""),
+                    updates=form.get("updates", ""),
                 )
             elif path == "/reject":
                 shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
@@ -764,24 +1793,139 @@ WRITERS = {
 }
 
 
+def prompt_yes_no(label, default_no=True):
+    if not sys.stdin.isatty():
+        raise SystemExit("re-run in a terminal, or pass --yes with explicit flags")
+    suffix = "[y/N]" if default_no else "[Y/n]"
+    answer = input(f"{label} {suffix} ").strip().lower()
+    if not answer:
+        return not default_no
+    return answer in {"y", "yes"}
+
+
 def install(args):
     tools = present_tools()
-    if not tools:
-        raise SystemExit("no Cursor, Claude Code, Codex, or Pi install was found")
-    print("This will write capture hooks for:")
-    for tool in tools:
-        print(f"  {tool}")
-    print("Other hooks already in those files are left in place.")
-    if not args.yes:
-        if not sys.stdin.isatty():
-            raise SystemExit("re-run in a terminal, or pass --yes")
-        answer = input("Write these hooks? [y/N] ").strip().lower()
-        if answer not in {"y", "yes"}:
-            print("left unchanged")
-            return 0
-    for tool in tools:
-        WRITERS[tool](HOME)
-        print(f"wrote {tool}")
+    if not tools and not args.git_repo:
+        raise SystemExit("no Cursor, Claude Code, Codex, or Pi install was found (pass --git-repo for repo-only setup)")
+
+    if tools:
+        print("This will write capture hooks for:")
+        for tool in tools:
+            print(f"  {tool}")
+        print("Other hooks already in those files are left in place.")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise SystemExit("re-run in a terminal, or pass --yes")
+            answer = input("Write these hooks? [y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("editor hooks left unchanged")
+            else:
+                for tool in tools:
+                    WRITERS[tool](HOME)
+                    print(f"wrote {tool}")
+        else:
+            for tool in tools:
+                WRITERS[tool](HOME)
+                print(f"wrote {tool}")
+
+    if args.git_repo:
+        repo = Path(args.git_repo).resolve()
+        if not repo.is_dir():
+            raise SystemExit(f"not a directory: {repo}")
+        if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+            raise SystemExit(f"not a git repository: {repo}")
+
+        want_git = False
+        auto_ap = False
+        if args.yes:
+            gh = getattr(args, "install_git_hooks", None)
+            if gh is None:
+                raise SystemExit("with --yes --git-repo, pass --install-git-hooks true|false")
+            want_git = gh == "true"
+            aa = getattr(args, "install_auto_approve", None)
+            auto_ap = aa == "true" if aa is not None else False
+        else:
+            print()
+            print("Git hooks: after each commit or merge, file an inbox bundle for this repo")
+            print(f"  ({repo})")
+            want_git = prompt_yes_no(
+                "Install post-commit and post-merge hooks here?",
+                default_no=True,
+            )
+            if want_git:
+                auto_ap = prompt_yes_no(
+                    "Auto-approve those memories (skip review UI)?",
+                    default_no=True,
+                )
+            else:
+                auto_ap = False
+
+        if want_git:
+            hooks_dir = write_git_hooks(str(repo))
+            print(f"wrote git hooks in {hooks_dir}")
+        else:
+            remove_git_hooks(str(repo))
+        updates = {"git_hooks": want_git, "auto_approve": auto_ap}
+        write_repo_config(str(repo), updates)
+        print(f"repo policy: {repo_policy_path(repo)}")
+
+    return 0
+
+
+def config_cmd(args):
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        raise SystemExit(f"not a directory: {repo}")
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        raise SystemExit(f"not a git repository: {repo}")
+    repo_s = str(repo)
+
+    def snapshot():
+        c = read_repo_config(repo_s)
+        return {
+            "repo": repo_s,
+            "git_hooks_config": c.get("git_hooks", False),
+            "git_hooks_installed": git_hooks_installed(repo_s),
+            "auto_approve": c.get("auto_approve", False),
+            "capture": c.get("capture", True),
+        }
+
+    gh_arg = getattr(args, "git_hooks", None)
+    mut = args.auto_approve is not None or gh_arg is not None
+    if not mut:
+        show = snapshot()
+        if getattr(args, "json_out", False):
+            print(json.dumps(show, indent=2))
+        else:
+            print(f"repo: {repo_s}")
+            print(f"git_hooks (config): {show['git_hooks_config']}")
+            print(f"git_hooks (installed): {show['git_hooks_installed']}")
+            print(f"auto_approve: {show['auto_approve']}")
+            print(f"capture: {show['capture']}")
+        return 0
+
+    updates = {}
+    if args.auto_approve is not None:
+        updates["auto_approve"] = args.auto_approve == "true"
+    if gh_arg is not None:
+        updates["git_hooks"] = gh_arg == "true"
+        if gh_arg == "true":
+            hooks_dir = write_git_hooks(repo_s)
+            print(f"wrote git hooks in {hooks_dir}")
+        else:
+            remove_git_hooks(repo_s)
+            print("removed agent-memory git hooks (post-commit, post-merge)")
+    if updates:
+        write_repo_config(repo_s, updates)
+        print(f"updated {repo_policy_path(repo)}")
+
+    show = snapshot()
+    if getattr(args, "json_out", False):
+        print(json.dumps(show, indent=2))
+    else:
+        print(f"git_hooks (config): {show['git_hooks_config']}")
+        print(f"git_hooks (installed): {show['git_hooks_installed']}")
+        print(f"auto_approve: {show['auto_approve']}")
     return 0
 
 
@@ -856,6 +2000,24 @@ def build_parser():
 
     install_parser = sub.add_parser("install", help="write editor hooks after a yes")
     install_parser.add_argument("--yes", action="store_true", help="write without prompting")
+    install_parser.add_argument(
+        "--git-repo",
+        metavar="PATH",
+        default="",
+        help="optional git repo: prompt to install post-commit/post-merge hooks and policy",
+    )
+    install_parser.add_argument(
+        "--install-git-hooks",
+        choices=["true", "false"],
+        default=None,
+        help="with --yes --git-repo: install or skip git hooks (required with --yes)",
+    )
+    install_parser.add_argument(
+        "--install-auto-approve",
+        choices=["true", "false"],
+        default=None,
+        help="with --yes --git-repo: auto-approve on (default false if omitted)",
+    )
     install_parser.set_defaults(func=install)
 
     uninstall_parser = sub.add_parser("uninstall", help="remove only the hooks this tool added")
@@ -870,13 +2032,57 @@ def build_parser():
 
     keep_parser = sub.add_parser("keep", help="pin a session so review shows it")
     keep_parser.add_argument("session_id")
-    keep_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi"])
+    keep_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi", "git"])
     keep_parser.set_defaults(func=keep)
 
     drop_parser = sub.add_parser("drop", help="delete an inbox bundle")
     drop_parser.add_argument("session_id")
-    drop_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi"])
+    drop_parser.add_argument("--tool", choices=["cursor", "claude-code", "codex", "pi", "git"])
     drop_parser.set_defaults(func=drop)
+
+    land_parser = sub.add_parser(
+        "land",
+        help="file inbox bundles for recent default-branch commits (grouped by PR when possible)",
+    )
+    land_parser.add_argument(
+        "repo",
+        help="path to the git repository to scan",
+    )
+    land_parser.add_argument(
+        "--since",
+        default="",
+        help="start time (ISO-8601) or integer hours ago; default: 24 hours before now",
+    )
+    land_parser.add_argument(
+        "--since-hours",
+        type=int,
+        default=24,
+        help="used as the default window when --since is omitted (default: 24)",
+    )
+    land_parser.set_defaults(func=land)
+
+    git_hook_parser = sub.add_parser("git-hook", help="run from repo post-commit/post-merge (internal)")
+    git_hook_parser.add_argument("--repo", default="", help="repository root (default: cwd)")
+    git_hook_parser.add_argument("--event", default="post-commit", help="post-commit or post-merge")
+    git_hook_parser.set_defaults(func=git_hook)
+
+    config_parser = sub.add_parser("config", help="show or set repo policy (.agent-memory.toml)")
+    config_parser.add_argument("repo", help="path to the git repository")
+    config_parser.add_argument(
+        "--auto-approve",
+        choices=["true", "false"],
+        default=None,
+        help="turn auto-approve on or off",
+    )
+    config_parser.add_argument(
+        "--git-hooks",
+        choices=["true", "false"],
+        default=None,
+        dest="git_hooks",
+        help="install or remove post-commit/post-merge hooks",
+    )
+    config_parser.add_argument("--json", dest="json_out", action="store_true", help="machine-readable output")
+    config_parser.set_defaults(func=config_cmd)
     return parser
 
 
