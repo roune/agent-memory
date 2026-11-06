@@ -22,7 +22,7 @@ DIMENSION = 384
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = "memories"
 
-REQUIRED = ("id", "kind", "domain", "repo", "tool", "session_id", "text", "org", "team", "person", "occurred_at")
+REQUIRED = ("id", "kind", "domain", "repo", "tool", "session_id", "text")
 KINDS = ("change", "learning", "decision")
 DOMAINS = ("code", "architecture", "operations")
 
@@ -168,13 +168,15 @@ def main():
             "session_id": document["session_id"],
             "commit": document.get("commit") or "",
             "text": document["text"],
-            "org": document["org"],
-            "team": document["team"],
-            "person": document["person"],
-            "occurred_at": document["occurred_at"],
+            "org": document.get("org") or "",
+            "team": document.get("team") or "",
+            "person": document.get("person") or "",
             "embedding_model": MODEL_NAME,
             "embedding_revision": REVISION,
         }
+        occurred = document.get("occurred_at")
+        if isinstance(occurred, str) and occurred.strip():
+            payload["occurred_at"] = occurred.strip()
         for optional in (
             "record",
             "subject",

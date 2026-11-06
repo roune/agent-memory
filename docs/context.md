@@ -39,8 +39,8 @@ Optional file at the root of a git working tree. Keys are simple `key = value` l
 
 - `capture` — when `false`, `capture`, `land`, and git post-commit/post-merge hooks skip that repo (default: true)
 - `repo` — optional override for the normalized remote id when there is no usable `origin` (same meaning as today)
-- `git_hooks` — when `true`, post-commit and post-merge run `agent-memory git-hook` for that clone so each new HEAD commit files a `tool: git` inbox bundle with a draft from the **commit message only** (no diff)
-- `auto_approve` — when `true`, git post-commit/post-merge hooks and session-end editor hooks try to call the same approve path as the review UI (requires a complete `~/.config/agent-memory/identity`). When `false` or identity is incomplete, they only leave the inbox bundle for review (default: false). `agent-memory land` always files bundles for the review UI only
+- `git_hooks` — when `true`, post-commit and post-merge run `agent-memory git-hook` for that clone. Each new commit files a `tool: git` inbox bundle with a draft from the **commit message only** (no diff). A merge or fast-forward files every new single-parent commit, not only the tip. An existing hook is kept and run after this one. Hooks are written where git runs them (`core.hooksPath`, or the common git dir for a linked worktree).
+- `auto_approve` — when `true`, those git hooks approve the commit-message draft (requires a complete `~/.config/agent-memory/identity`). A session-end hook does that only for a commit made after this session’s first capture, and only from the commit message. It does not file the last assistant reply against whatever `HEAD` is. Otherwise the inbox bundle stays for review (default: false). `agent-memory land` always files bundles for the review UI only
 
 Change `git_hooks` or `auto_approve` later with `agent-memory config <path-to-repo> [--git-hooks true|false] [--auto-approve true|false]` without reinstalling editor hooks.
 
@@ -89,7 +89,7 @@ agent-memory review
   -> same approve/reject flow; nothing is written to memories/ until Approve
 ```
 
-`land` lists commits on that clone’s default branch since `--since` (default: 24 hours before now). It skips merge commits and groups single-parent commits by pull request when it can tell the PR (merge/squash message lines, or `gh pr list` when `gh` is available and authenticated). It uses file names across the group to add a short “unusual vs the rest” hint — it does not store diffs. PR title/body and each commit message seed `draft.text`. Bundles use `tool` `git` and a stable `session_id` derived from the group.
+`land` lists commits on that clone’s local default branch since `--since` (default: 24 hours before now). The branch name comes from `origin/HEAD` when that local branch exists; otherwise `main` or `master`. It does not read the remote-tracking ref, so unpushed local commits are included. It skips merge commits and groups single-parent commits by pull request when it can tell the PR (merge/squash message lines, or `gh pr list` when `gh` is available and authenticated). It uses file names across the group to add a short “unusual vs the rest” hint — it does not store diffs. PR title/body and each commit message seed `draft.text`. Bundles use `tool` `git` and a stable `session_id` derived from the group.
 
 The hook writes the inbox bundle and returns. It does not prompt. End hooks cannot reliably stop the session and wait for a choice:
 

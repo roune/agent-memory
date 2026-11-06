@@ -178,9 +178,37 @@ def write_repo_config(repo, updates):
     path.write_text(text, encoding="utf-8")
 
 
+def sh_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def git_hooks_dir(repo):
+    """Directory git actually runs hooks from.
+
+    `core.hooksPath` wins. Otherwise this is `git rev-parse --git-path hooks`,
+    which follows the common git dir (linked worktrees do not have their own).
+    """
+    repo = str(Path(repo).resolve())
+    custom = run(["git", "config", "--get", "core.hooksPath"], repo).strip()
+    if custom:
+        path = Path(os.path.expanduser(custom))
+        if not path.is_absolute():
+            path = Path(repo) / path
+        return path
+    found = run(["git", "rev-parse", "--git-path", "hooks"], repo).strip()
+    if not found:
+        return None
+    path = Path(found)
+    if not path.is_absolute():
+        path = Path(repo) / path
+    return path
+
+
 def git_hooks_installed(repo):
-    """True if .git/hooks post-commit and post-merge are agent-memory hooks."""
-    base = Path(repo) / ".git" / "hooks"
+    """True if post-commit and post-merge in the active hooks dir are ours."""
+    base = git_hooks_dir(repo)
+    if base is None:
+        return False
     for name in ("post-commit", "post-merge"):
         script = base / name
         if not script.is_file():
@@ -195,33 +223,78 @@ def git_hooks_installed(repo):
 
 
 def write_git_hooks(repo):
-    """Install post-commit and post-merge hooks in the given repo."""
+    """Install post-commit and post-merge hooks in the directory git will run.
+
+    A hook we did not write is moved aside and called after ours. Reinstall
+    rewrites only our script and leaves that saved hook in place.
+    """
     repo = str(Path(repo).resolve())
-    hooks_dir = Path(repo) / ".git" / "hooks"
+    hooks_dir = git_hooks_dir(repo)
+    if hooks_dir is None:
+        raise SystemExit(f"could not locate the git hooks directory for {repo}")
+    if hooks_dir.exists() and not hooks_dir.is_dir():
+        raise SystemExit(f"git hooks path is not a directory: {hooks_dir}")
     hooks_dir.mkdir(parents=True, exist_ok=True)
-    bin_escaped = str(BIN).replace('"', '\\"')
+    bin_quoted = sh_quote(BIN)
     for name in ("post-commit", "post-merge"):
         path = hooks_dir / name
+        user_path = hooks_dir / f"{name}.agent-memory-user"
+        if path.is_file():
+            try:
+                txt = path.read_text(encoding="utf-8")
+            except OSError as error:
+                raise SystemExit(f"could not read {path}: {error}") from error
+            if GIT_HOOK_MARKER not in txt:
+                if user_path.exists():
+                    raise SystemExit(
+                        f"{path} is not an agent-memory hook and {user_path.name} already exists"
+                    )
+                path.rename(user_path)
+        user_quoted = sh_quote(user_path)
+        # Do not forward "$@" to git-hook. post-merge is invoked with a squash
+        # flag, and git-hook has no positional arguments.
         body = f"""#!/bin/sh
 # {GIT_HOOK_MARKER}
-cd "$(git rev-parse --show-toplevel)" && exec "{bin_escaped}" git-hook "$@" --event {name}
+cd "$(git rev-parse --show-toplevel)" && {bin_quoted} git-hook --event {name}
+_am_status=$?
+if [ -f {user_quoted} ]; then
+  if [ -x {user_quoted} ]; then
+    {user_quoted} "$@"
+  else
+    sh {user_quoted} "$@"
+  fi
+  _user_status=$?
+  if [ "$_user_status" -ne 0 ]; then
+    exit "$_user_status"
+  fi
+fi
+exit "$_am_status"
 """
         path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
+    return hooks_dir
 
 
 def remove_git_hooks(repo):
-    """Remove only hooks previously written by write_git_hooks."""
+    """Remove only hooks previously written by write_git_hooks.
+
+    A hook that was moved aside is restored to its original name.
+    """
+    base = git_hooks_dir(repo)
+    if base is None:
+        return
     for name in ("post-commit", "post-merge"):
-        path = Path(repo) / ".git" / "hooks" / name
-        if not path.is_file():
-            continue
-        try:
-            txt = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if GIT_HOOK_MARKER in txt:
-            path.unlink()
+        path = base / name
+        user_path = base / f"{name}.agent-memory-user"
+        if path.is_file():
+            try:
+                txt = path.read_text(encoding="utf-8")
+            except OSError:
+                txt = ""
+            if GIT_HOOK_MARKER in txt:
+                path.unlink()
+        if not path.exists() and user_path.is_file():
+            user_path.rename(path)
 
 
 def draft_text_commit_only(repo, remote_id, commit_message, sha):
@@ -266,45 +339,43 @@ def try_auto_approve_bundle(bundle):
     return True
 
 
-def git_hook(args):
-    repo = Path(args.repo or os.getcwd()).resolve()
-    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
-        log("git-hook skipped: not a git repository")
-        return 0
-    repo_s = str(repo)
-    if capture_disabled(repo_s):
-        log("git-hook skipped: capture disabled for repo")
-        return 0
-    cfg = read_repo_config(repo_s)
-    if not cfg.get("git_hooks"):
-        return 0
+def is_merge_commit(repo, sha):
+    parents = run(["git", "rev-parse", f"{sha}^@"], repo).split()
+    return len(parents) > 1
 
-    event = (args.event or "post-commit").lower()
-    sha = run(["git", "rev-parse", "HEAD"], repo_s)
-    if not sha:
-        log("git-hook skipped: could not resolve HEAD")
-        return 0
-    msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
+
+def hook_commit_shas(repo, event, head):
+    """Commits this hook invocation should file.
+
+    post-commit files the new HEAD. post-merge files every single-parent commit
+    reachable from HEAD but not from ORIG_HEAD, so a fast-forward or merge does
+    not keep only the tip.
+    """
+    if event == "post-merge":
+        orig = run(["git", "rev-parse", "--verify", "ORIG_HEAD"], repo)
+        if orig and orig != head:
+            listing = run(["git", "rev-list", "--reverse", f"{orig}..{head}"], repo)
+            shas = [line.strip() for line in listing.splitlines() if line.strip()]
+            return [sha for sha in shas if not is_merge_commit(repo, sha)]
+    return [head]
+
+
+def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve):
     if memory_exists_for_commit(sha):
-        return 0
-
-    remote_id = git_remote_repo_id(repo_s)
+        return
+    msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
     group = single_commit_hook_group(repo_s, sha, msg)
     session_id = land_session_id(remote_id or repo_s, sha[:12], None, [sha])
     bundle_path = land_bundle_path("git", session_id)
     if bundle_path.is_file():
-        return 0
-
-    branch, tip = default_branch_tip(repo_s)
-    since = parse_since("", 24)
+        return
     draft_text = draft_text_commit_only(repo_s, remote_id, msg, sha)
-    ended = occurred_at_for_group(group)
     bundle = {
         "tool": "git",
         "session_id": session_id,
         "repo": repo_s,
         "started_at": since,
-        "ended_at": ended,
+        "ended_at": occurred_at_for_group(group),
         "event": "git-" + event.replace("_", "-"),
         "closed": True,
         "transcript_copy": None,
@@ -335,16 +406,49 @@ def git_hook(args):
         },
     }
     write_json(bundle_path, bundle)
+    if not auto_approve:
+        return
+    try:
+        try_auto_approve_bundle(bundle)
+    except (ValueError, OSError) as error:
+        log(f"git-hook: auto_approve failed: {error}")
 
+
+def git_hook(args):
+    repo = Path(args.repo or os.getcwd()).resolve()
+    if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
+        log("git-hook skipped: not a git repository")
+        return 0
+    repo_s = str(repo)
+    if capture_disabled(repo_s):
+        log("git-hook skipped: capture disabled for repo")
+        return 0
+    cfg = read_repo_config(repo_s)
+    if not cfg.get("git_hooks"):
+        return 0
+
+    event = (args.event or "post-commit").lower()
+    head = run(["git", "rev-parse", "HEAD"], repo_s)
+    if not head:
+        log("git-hook skipped: could not resolve HEAD")
+        return 0
+    shas = hook_commit_shas(repo_s, event, head)
+    if not shas:
+        return 0
+
+    auto_approve = False
     if cfg.get("auto_approve"):
         iden = read_identity()
-        if not all(iden.get(k) for k in ("org", "team", "person")):
+        if all(iden.get(k) for k in ("org", "team", "person")):
+            auto_approve = True
+        else:
             log("git-hook: auto_approve set but identity incomplete; inbox bundle kept for review")
-            return 0
-        try:
-            try_auto_approve_bundle(bundle)
-        except (ValueError, OSError) as error:
-            log(f"git-hook: auto_approve failed: {error}")
+
+    remote_id = git_remote_repo_id(repo_s)
+    branch, tip = default_branch_tip(repo_s)
+    since = parse_since("", 24)
+    for sha in shas:
+        file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve)
     return 0
 
 
@@ -549,19 +653,32 @@ def land_bundle_path(tool, session_id):
 
 
 def memory_exists_for_commit(sha):
+    """True when a kept document already explains this commit.
+
+    A stored abbreviated hash matches the full id, and the other way around.
+    Sharing the first 7 hex digits is not enough: that skipped unrelated commits.
+    """
     root = memories_root()
     if not root.is_dir():
         return False
     needle = sha.strip().lower()
+    if len(needle) < 7:
+        return False
     for path in root.glob("*.json"):
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
         stored = doc.get("commit")
-        if isinstance(stored, str) and stored.strip().lower().startswith(needle[:7]):
+        if not isinstance(stored, str):
+            continue
+        stored = stored.strip().lower()
+        if len(stored) < 7:
+            continue
+        if needle.startswith(stored) or stored.startswith(needle):
             return True
     return False
+
 
 def default_branch_tip(repo):
     branch = default_branch(repo)
@@ -701,7 +818,8 @@ def land(args):
         return 0
 
     since = parse_since(args.since, args.since_hours)
-    branch, tip = default_branch_tip(str(repo))
+    branch = local_default_branch(str(repo))
+    tip = run(["git", "rev-parse", branch], str(repo))
     remote_id = git_remote_repo_id(str(repo))
     commits = commits_on_branch_since(str(repo), branch, since)
     groups, merge_notes = build_land_groups(str(repo), commits)
@@ -838,6 +956,84 @@ def load_payload(args):
     return json.loads(raw)
 
 
+def commit_after_session_start(started_at, committer_epoch):
+    if not started_at or not committer_epoch:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return committer_epoch >= int(parsed.timestamp())
+
+
+def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
+    """Approve a commit this session actually made. Otherwise leave the inbox.
+
+    The text is the commit message, never the last assistant reply, and HEAD
+    from before the session is not treated as already kept.
+    """
+    cfg = read_repo_config(repo)
+    if not cfg.get("auto_approve"):
+        return
+    iden = read_identity()
+    if not all(iden.get(k) for k in ("org", "team", "person")):
+        log("capture session-end: auto_approve set but identity incomplete; inbox bundle kept")
+        return
+    started = previous.get("started_at")
+    if not started:
+        log("capture session-end: auto_approve left inbox; session has no earlier capture")
+        return
+    if run(["git", "rev-parse", "--is-inside-work-tree"], cwd) != "true":
+        log("capture session-end: auto_approve left inbox; not a git checkout")
+        return
+    head = run(["git", "rev-parse", "HEAD"], repo)
+    if not head:
+        log("capture session-end: auto_approve left inbox; could not resolve HEAD")
+        return
+    if memory_exists_for_commit(head):
+        log("capture session-end: commit already kept; inbox left for review")
+        return
+    if is_merge_commit(repo, head):
+        log("capture session-end: HEAD is a merge commit; inbox left for review")
+        return
+    ct_s = run(["git", "log", "-1", "--format=%ct", head], repo)
+    try:
+        ct = int(ct_s) if ct_s else 0
+    except ValueError:
+        ct = 0
+    if not commit_after_session_start(started, ct):
+        log("capture session-end: HEAD is older than this session; inbox left for review")
+        return
+    remote_id = git_remote_repo_id(repo)
+    body = run(["git", "log", "-1", "--format=%B", head], repo) or ""
+    text = draft_text_commit_only(repo, remote_id, body, head)
+    if not text.strip():
+        log("capture session-end: empty commit message; inbox left for review")
+        return
+    fresh = read_json(bundle_path)
+    group = single_commit_hook_group(repo, head, body)
+    fresh["draft"] = {
+        "kind": "change",
+        "domain": "code",
+        "text": text,
+        "commit": head,
+    }
+    fresh["ended_at"] = occurred_at_for_group(group)
+    land_meta = fresh.get("land") if isinstance(fresh.get("land"), dict) else {}
+    land_meta["remote_repo"] = remote_id or land_meta.get("remote_repo") or ""
+    land_meta["commits"] = [
+        {"sha": head, "subject": (body or "").split("\n", 1)[0].strip()}
+    ]
+    fresh["land"] = land_meta
+    write_json(bundle_path, fresh)
+    try:
+        try_auto_approve_bundle(read_json(bundle_path))
+    except (ValueError, OSError) as error:
+        log(f"capture session-end auto_approve failed: {error}")
+
+
 def capture(args):
     try:
         payload = load_payload(args)
@@ -917,45 +1113,8 @@ def write_capture(args, payload):
     }
     write_json(bundle_path, bundle)
 
-
     if event.lower() in END_EVENTS:
-        cfg = read_repo_config(repo)
-        if cfg.get("auto_approve"):
-            fresh = read_json(bundle_path)
-            draft = fresh.get("draft") or {}
-            head = (summary.get("head") or "").strip()
-            if head and run(["git", "rev-parse", "--is-inside-work-tree"], cwd) == "true":
-                remote_id = git_remote_repo_id(repo)
-                subj = run(["git", "log", "-1", "--format=%s", head], repo) or ""
-                body = run(["git", "log", "-1", "--format=%B", head], repo) or ""
-                kind = draft.get("kind") if draft.get("kind") in KINDS else "change"
-                domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
-                text = (draft.get("text") or "").strip()
-                if not text:
-                    text = (message or "").strip()
-                if not text and kind == "change":
-                    text = draft_text_commit_only(repo, remote_id, body, head)
-                if not text:
-                    text = subj
-                new_draft = {
-                    "kind": kind,
-                    "domain": domain,
-                    "text": text,
-                    "commit": (draft.get("commit") or "").strip() or head,
-                }
-                fresh["draft"] = new_draft
-                land_meta = fresh.get("land") if isinstance(fresh.get("land"), dict) else {}
-                land_meta.setdefault("remote_repo", remote_id)
-                fresh["land"] = land_meta
-                write_json(bundle_path, fresh)
-            iden = read_identity()
-            if all(iden.get(k) for k in ("org", "team", "person")):
-                try:
-                    try_auto_approve_bundle(read_json(bundle_path))
-                except (ValueError, OSError) as error:
-                    log(f"capture session-end auto_approve failed: {error}")
-            else:
-                log("capture session-end: auto_approve set but identity incomplete; inbox bundle kept")
+        maybe_auto_approve_session(repo, cwd, bundle_path, previous)
 
 
 def bundles():
@@ -991,6 +1150,27 @@ def default_branch(repo):
         if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
             return name
     return "main"
+
+
+def local_default_branch(repo):
+    """Local branch `land` should read.
+
+    `origin/HEAD` only supplies the name (`main` or `master`). Logging the
+    remote-tracking ref skips commits that are on the local branch and not
+    pushed, and files commits that are not on the local branch.
+    """
+    ref = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repo)
+    if ref:
+        name = ref.split("/", 1)[1] if "/" in ref else ref
+        if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
+            return name
+    for name in ("main", "master"):
+        if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
+            return name
+    head = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo)
+    if head and head != "HEAD":
+        return head
+    return ref or "main"
 
 
 def candidate_commits(bundle):
@@ -1333,11 +1513,11 @@ def render_page(items, include_all):
 <p><strong>{html.escape(item.get("repo") or "")}</strong></p>
 <p class="meta">{tool} · {sid} · {html.escape(item.get("ended_at") or "")}</p>
 <p class="meta">A change stores the context of the commit you pick. The diff stays in git.</p>
-{commit_block}
-{message_block}
 <form method="post" action="/approve">
 <input type="hidden" name="session_id" value="{sid}">
 <input type="hidden" name="tool" value="{tool}">
+{commit_block}
+{message_block}
 <label>Kind <select name="kind">{select_options(kinds, kind)}</select></label>
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
 {extra_fields}
@@ -1680,13 +1860,13 @@ def install(args):
             else:
                 auto_ap = False
 
-        updates = {"git_hooks": want_git, "auto_approve": auto_ap}
-        write_repo_config(str(repo), updates)
         if want_git:
-            write_git_hooks(str(repo))
-            print(f"wrote git hooks in {repo / '.git' / 'hooks'}")
+            hooks_dir = write_git_hooks(str(repo))
+            print(f"wrote git hooks in {hooks_dir}")
         else:
             remove_git_hooks(str(repo))
+        updates = {"git_hooks": want_git, "auto_approve": auto_ap}
+        write_repo_config(str(repo), updates)
         print(f"repo policy: {repo_policy_path(repo)}")
 
     return 0
@@ -1730,8 +1910,8 @@ def config_cmd(args):
     if gh_arg is not None:
         updates["git_hooks"] = gh_arg == "true"
         if gh_arg == "true":
-            write_git_hooks(repo_s)
-            print(f"wrote git hooks in {repo / '.git' / 'hooks'}")
+            hooks_dir = write_git_hooks(repo_s)
+            print(f"wrote git hooks in {hooks_dir}")
         else:
             remove_git_hooks(repo_s)
             print("removed agent-memory git hooks (post-commit, post-merge)")
