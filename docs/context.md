@@ -17,10 +17,19 @@ The vector database belongs to this tool. A setup script creates it in this repo
 
 Tags on every memory:
 
-- `repo` — normalized remote project id (`host/owner/name`, e.g. `github.com/roune/agent-memory` from `origin`)
+- `repo` — normalized remote project id (`host/owner/name`, e.g. `github.com/roune/agent-memory` from `origin`, or `repo=` in `.agent-memory.toml` when there is no `origin`)
 - `tool` — `cursor`, `claude-code`, `codex`, `pi`, or `git` (for bundles filed by `land`)
-- `session_id` — the harness session, or a stable id from `land`
+- `session_id` — the harness session, a `note` id, or a stable id from `land`
 - `domain` — `code`, `architecture`, or `operations`
+- `org`, `team`, `person` — who is keeping the note (defaults from `~/.config/agent-memory/identity`; overridable per document on the review form)
+- `occurred_at` — when the work applies (from the bundle’s `ended_at` by default; overridable on the form)
+
+Optional **linked-record** fields (for standing explanations, architecture history, and runbooks; omit for a plain note):
+
+- `record` — empty, `explanation`, `history`, or `runbook`
+- `subject` or `alarm` — stable name for the system, flow, or alert
+- `look_at` — short names of signals or places to check (often for operations)
+- `supersedes`, `superseded_by`, `updates` — links between documents (when you file a newer explanation or runbook, stamp `superseded_by` on the old file; `approve` can also set `supersedes` to patch the old file in place)
 
 Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept. All three domains share the one `memories` collection. Search filters on `domain`. A second collection is for a different embedding model only.
 
@@ -70,7 +79,7 @@ The hook writes the inbox bundle and returns. It does not prompt. End hooks cann
 - Codex `SessionEnd` is advisory and capped at about 3 seconds.
 - Transcript files are sometimes missing or stale by the time `SessionEnd` runs.
 
-The review command is where the person decides to keep nothing, the change summary, the learnings, or specific slices.
+The review command is where the person decides to keep nothing, the change summary, the learnings, or specific slices. Approve stamps `org`, `team`, `person`, `occurred_at`, and the remote `repo` id, then writes `memories/<person>-<kind>-<session_id>.json` and deletes the inbox folder. If you set `supersedes` to an existing document id, the old file gets `superseded_by` set to this document’s id.
 
 ## Hooks, once they exist
 

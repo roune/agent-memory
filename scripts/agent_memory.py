@@ -3,7 +3,8 @@
 
 Editor hooks call `capture` and return. Review is a page on 127.0.0.1.
 `install` writes editor hooks only after a yes.
-`land` files a date window of default-branch commits into the inbox.
+`land` files a date window of default-branch commits. Approve can stamp who kept
+the note and link it to another record.
 """
 
 import argparse
@@ -27,6 +28,7 @@ BIN = ROOT / "bin" / "agent-memory"
 PORT_START = 4173
 KINDS = ("change", "learning", "decision")
 DOMAINS = ("code", "architecture", "operations")
+RECORDS = ("", "explanation", "history", "runbook")
 END_EVENTS = {"session-end", "sessionend", "session_shutdown"}
 MARKER = "agent-memory-hook"
 
@@ -102,6 +104,28 @@ def capture_disabled(repo):
             if item and (repo_path == item or repo_path.startswith(item.rstrip("/") + "/")):
                 return True
     return False
+
+def identity_path():
+    return HOME / ".config" / "agent-memory" / "identity"
+
+
+def read_identity():
+    path = identity_path()
+    if not path.is_file():
+        return {"org": "", "team": "", "person": ""}
+    org = team = person = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("org"):
+            org = line.split("=", 1)[1].strip() if "=" in line else ""
+        elif line.startswith("team"):
+            team = line.split("=", 1)[1].strip() if "=" in line else ""
+        elif line.startswith("person"):
+            person = line.split("=", 1)[1].strip() if "=" in line else ""
+    return {"org": org, "team": team, "person": person}
+
 
 def normalize_remote_url(raw):
     if not raw or not str(raw).strip():
@@ -738,6 +762,8 @@ def note(args):
     folder = session_dir("cursor", session_id)
     bundle_path = folder / "bundle.json"
     previous = read_json(bundle_path) if bundle_path.is_file() else {}
+    iden = read_identity()
+    rr = git_remote_repo_id(repo)
     bundle = {
         "tool": "cursor",
         "session_id": session_id,
@@ -750,11 +776,13 @@ def note(args):
         "last_assistant_message": "",
         "git": {"branch": "", "head": "", "status": "", "diff_stat": "", "paths": []},
         "pinned": True,
+        "land": {"remote_repo": rr},
         "draft": {"kind": args.kind, "domain": args.domain, "text": text},
     }
     write_json(bundle_path, bundle)
     print(f"pinned {session_id}")
     print("Open it with: agent-memory review")
+
 
 def keep(args):
     bundle = find_bundle(args.session_id, args.tool)
@@ -771,32 +799,138 @@ def drop(args):
     print(f"dropped {args.session_id}")
 
 
-def approve(bundle, kind, domain, text, commit=""):
+def approve(
+    bundle,
+    kind,
+    domain,
+    text,
+    commit="",
+    org="",
+    team="",
+    person="",
+    occurred_at="",
+    remote_repo="",
+    record="",
+    subject="",
+    alarm="",
+    look_at="",
+    supersedes="",
+    superseded_by="",
+    updates="",
+):
     text = text.strip()
     if kind not in KINDS or domain not in DOMAINS or not text:
         raise ValueError("kind, domain, and text are required")
-    repo = str(bundle.get("repo") or "").strip()
+    repo_path = str(bundle.get("repo") or "").strip()
     tool = str(bundle.get("tool") or "").strip()
     session_id = str(bundle.get("session_id") or "").strip()
-    if not repo or not tool or not session_id:
+    if not repo_path or not tool or not session_id:
         raise ValueError("repo, tool, and session id are required")
-    document = {
-        "id": f"{kind}-{session_id}",
-        "kind": kind,
-        "domain": domain,
-        "repo": repo,
-        "tool": tool,
-        "session_id": session_id,
-        "text": text,
-    }
+
+    iden = read_identity()
+    org = (org or iden.get("org") or "").strip()
+    team = (team or iden.get("team") or "").strip()
+    person = (person or iden.get("person") or "").strip()
+    if not org or not team or not person:
+        raise ValueError("org, team, and person are required (identity file or form)")
+    if "/" in person or person in {".", ".."}:
+        raise ValueError("person must be a single path segment")
+    land = bundle.get("land") or {}
+    remote_repo = (remote_repo or land.get("remote_repo") or "").strip()
+    if not remote_repo:
+        remote_repo = git_remote_repo_id(repo_path)
+    if not remote_repo:
+        raise ValueError("remote repo id is required (origin URL or .agent-memory.toml repo=)")
+
+    occurred_at = (occurred_at or bundle.get("ended_at") or "").strip()
+    if not occurred_at:
+        occurred_at = now()
+
+    if record not in RECORDS:
+        raise ValueError("record must be empty, explanation, history, or runbook")
+    subject = subject.strip()
+    alarm = alarm.strip()
+    look_at = look_at.strip()
+    supersedes = supersedes.strip()
+    superseded_by = superseded_by.strip()
+    updates = updates.strip()
+
     if kind == "change":
         commit = commit.strip()
         if len(commit) < 7 or any(char not in "0123456789abcdefABCDEF" for char in commit):
             raise ValueError("a change needs the commit it explains")
+
+    document = {
+        "id": f"{person}-{kind}-{session_id}",
+        "kind": kind,
+        "domain": domain,
+        "repo": remote_repo,
+        "tool": tool,
+        "session_id": session_id,
+        "text": text,
+        "org": org,
+        "team": team,
+        "person": person,
+        "occurred_at": occurred_at,
+    }
+    if kind == "change":
         document["commit"] = commit
-    write_json(memories_root() / f"{document['id']}.json", document)
+    if record:
+        document["record"] = record
+    if subject:
+        document["subject"] = subject
+    if alarm:
+        document["alarm"] = alarm
+    if look_at:
+        document["look_at"] = look_at
+    if supersedes:
+        document["supersedes"] = supersedes
+    if superseded_by:
+        document["superseded_by"] = superseded_by
+    if updates:
+        document["updates"] = updates
+
+    new_id = document["id"]
+    write_json(memories_root() / f"{new_id}.json", document)
+    if supersedes:
+        old_path = memories_root() / f"{supersedes}.json"
+        if old_path.is_file():
+            old_doc = read_json(old_path)
+            old_doc["superseded_by"] = new_id
+            write_json(old_path, old_doc)
+
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     return document
+
+
+PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent memory</title>
+<style>
+  body { font: 16px/1.45 ui-sans-serif, system-ui, sans-serif; margin: 2rem auto; max-width: 46rem; color: #1c1917; background: #fafaf9; }
+  h1 { font-size: 1.4rem; }
+  article { background: white; border: 1px solid #e7e5e4; border-radius: 8px; padding: 1rem 1.1rem; margin: 1rem 0; }
+  .meta { color: #57534e; font-size: 0.92rem; }
+  pre { white-space: pre-wrap; background: #f5f5f4; padding: 0.7rem; border-radius: 6px; }
+  fieldset { border: 1px solid #e7e5e4; border-radius: 6px; margin: 0.8rem 0; }
+  fieldset label { font-family: ui-monospace, monospace; font-size: 0.92rem; }
+  label { display: block; margin-top: 0.7rem; }
+  textarea { width: 100%; min-height: 7rem; font: inherit; }
+  select { font: inherit; }
+  button { font: inherit; margin-right: 0.4rem; margin-top: 0.8rem; }
+  a { color: #1d4ed8; }
+</style>
+</head>
+<body>
+<h1>Review</h1>
+<p class="meta">__LEAD__</p>
+__ITEMS__
+</body>
+</html>
+"""
+
 
 def select_options(choices, selected):
     return "".join(
@@ -859,6 +993,36 @@ def render_page(items, include_all):
             if message:
                 message_block = f"<pre>{html.escape(message[:4000])}</pre>"
             text_label = "Context of this commit" if kind == "change" else "Keep this text"
+            iden = read_identity()
+            rr_default = (land_meta.get("remote_repo") or "").strip()
+            org_d = html.escape(iden.get("org") or "")
+            team_d = html.escape(iden.get("team") or "")
+            person_d = html.escape(iden.get("person") or "")
+            remote_d = html.escape(rr_default)
+            occurred_default = html.escape(item.get("ended_at") or "")
+            record_val = ""
+            record_block = (
+                '<label>Record <select name="record">'
+                + "".join(
+                    f'<option value="{html.escape(r)}"{" selected" if r == record_val else ""}>{html.escape(r or "(none)")}</option>'
+                    for r in RECORDS
+                )
+                + "</select></label>"
+            )
+            extra_fields = f"""
+<label>Organization <input name="org" type="text" value="{org_d}" autocomplete="organization"></label>
+<label>Team <input name="team" type="text" value="{team_d}" autocomplete="organization-title"></label>
+<label>Person (id prefix) <input name="person" type="text" value="{person_d}"></label>
+<label>Occurred at <input name="occurred_at" type="text" value="{occurred_default}"></label>
+<label>Remote repo id <input name="remote_repo" type="text" value="{remote_d}" placeholder="github.com/owner/repo"></label>
+{record_block}
+<label>Subject <input name="subject" type="text" value=""></label>
+<label>Alarm <input name="alarm" type="text" value=""></label>
+<label>Look at <input name="look_at" type="text" value=""></label>
+<label>Supersedes (document id) <input name="supersedes" type="text" value=""></label>
+<label>Superseded by <input name="superseded_by" type="text" value=""></label>
+<label>Updates (document id) <input name="updates" type="text" value=""></label>
+"""
             blocks.append(
                 f"""<article>
 <p><strong>{html.escape(item.get("repo") or "")}</strong></p>
@@ -871,6 +1035,7 @@ def render_page(items, include_all):
 <input type="hidden" name="tool" value="{tool}">
 <label>Kind <select name="kind">{select_options(kinds, kind)}</select></label>
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
+{extra_fields}
 <label>{text_label} <textarea name="text">{draft_text}</textarea></label>
 <button type="submit">Approve</button>
 </form>
@@ -931,6 +1096,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     form.get("domain", ""),
                     form.get("text", ""),
                     form.get("commit", ""),
+                    org=form.get("org", ""),
+                    team=form.get("team", ""),
+                    person=form.get("person", ""),
+                    occurred_at=form.get("occurred_at", ""),
+                    remote_repo=form.get("remote_repo", ""),
+                    record=form.get("record", ""),
+                    subject=form.get("subject", ""),
+                    alarm=form.get("alarm", ""),
+                    look_at=form.get("look_at", ""),
+                    supersedes=form.get("supersedes", ""),
+                    superseded_by=form.get("superseded_by", ""),
+                    updates=form.get("updates", ""),
                 )
             elif path == "/reject":
                 shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))

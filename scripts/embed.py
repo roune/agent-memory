@@ -4,6 +4,7 @@ Reads memories/*.json. Talks to the server over HTTP. Does not open data/qdrant.
 """
 
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -11,7 +12,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
-MEMORIES = ROOT / "memories"
+_MEM_OVERRIDE = os.environ.get("AGENT_MEMORY_DIR")
+MEMORIES = Path(_MEM_OVERRIDE) / "memories" if _MEM_OVERRIDE else ROOT / "memories"
 MODEL_DIR = ROOT / "data" / "models" / "bge-small-en-v1.5-onnx-q"
 REVISION = "aa8f8b060edb00e03bfdd08813a2949946c8ba55"
 ONNX_REPO = "Qdrant/bge-small-en-v1.5-onnx-Q"
@@ -20,7 +22,7 @@ DIMENSION = 384
 QDRANT = "http://127.0.0.1:6333"
 COLLECTION = "memories"
 
-REQUIRED = ("id", "kind", "domain", "repo", "tool", "session_id", "text")
+REQUIRED = ("id", "kind", "domain", "repo", "tool", "session_id", "text", "org", "team", "person", "occurred_at")
 KINDS = ("change", "learning", "decision")
 DOMAINS = ("code", "architecture", "operations")
 
@@ -101,13 +103,36 @@ def ensure_collection():
                 f"collection {COLLECTION} has dimension {size}, model has {DIMENSION}"
             )
     existing = (info.get("result") or {}).get("payload_schema") or {}
-    for field in ("repo", "tool", "session_id", "kind", "domain", "commit"):
+    for field in (
+        "repo",
+        "tool",
+        "session_id",
+        "kind",
+        "domain",
+        "commit",
+        "org",
+        "team",
+        "person",
+        "record",
+        "subject",
+        "alarm",
+        "look_at",
+        "supersedes",
+        "superseded_by",
+        "updates",
+    ):
         if field in existing:
             continue
         api(
             "PUT",
             f"/collections/{COLLECTION}/index",
             {"field_name": field, "field_schema": "keyword"},
+        )
+    if "occurred_at" not in existing:
+        api(
+            "PUT",
+            f"/collections/{COLLECTION}/index",
+            {"field_name": "occurred_at", "field_schema": "datetime"},
         )
 
 
@@ -134,22 +159,39 @@ def main():
     for document, vector in zip(documents, vectors):
         if len(vector) != DIMENSION:
             raise SystemExit(f"{document['id']} vector has length {len(vector)}")
+        payload = {
+            "document_id": document["id"],
+            "kind": document["kind"],
+            "domain": document["domain"],
+            "repo": document["repo"],
+            "tool": document["tool"],
+            "session_id": document["session_id"],
+            "commit": document.get("commit") or "",
+            "text": document["text"],
+            "org": document["org"],
+            "team": document["team"],
+            "person": document["person"],
+            "occurred_at": document["occurred_at"],
+            "embedding_model": MODEL_NAME,
+            "embedding_revision": REVISION,
+        }
+        for optional in (
+            "record",
+            "subject",
+            "alarm",
+            "look_at",
+            "supersedes",
+            "superseded_by",
+            "updates",
+        ):
+            val = document.get(optional)
+            if val:
+                payload[optional] = val
         points.append(
             {
                 "id": point_id(document["id"]),
                 "vector": vector,
-                "payload": {
-                    "document_id": document["id"],
-                    "kind": document["kind"],
-                    "domain": document["domain"],
-                    "repo": document["repo"],
-                    "tool": document["tool"],
-                    "session_id": document["session_id"],
-                    "commit": document.get("commit") or "",
-                    "text": document["text"],
-                    "embedding_model": MODEL_NAME,
-                    "embedding_revision": REVISION,
-                },
+                "payload": payload,
             }
         )
     api("PUT", f"/collections/{COLLECTION}/points?wait=true", {"points": points})
