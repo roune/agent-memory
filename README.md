@@ -1,6 +1,6 @@
 # Agent memory
 
-Memory for coding agents, free for noncommercial use. A session ends in Cursor, Claude Code, Codex, or Pi. A hook files what happened. You choose what is worth keeping. A script embeds only that.
+Agent memory files a coding-agent session, or a slice of git history, and lets you choose what to keep. Only the notes you approve are saved, and only those notes are embedded for search.
 
 ## Install
 
@@ -10,44 +10,73 @@ From a clone of this repo:
 ./scripts/install
 ```
 
-That links `agent-memory` into `~/.local/bin`. It does not change Cursor, Claude Code, Codex, or Pi. Connecting those is a second command, and it asks before it writes:
+That links `agent-memory` into `~/.local/bin`. It leaves Cursor, Claude Code, Codex, and Pi alone. Connecting those is a second command, and it asks before it writes:
 
 ```
 agent-memory install
 ```
 
-`agent-memory review` opens the approve/reject page at `http://127.0.0.1:4173`.
+Pass `--yes` to skip that prompt. To set up one git repository in the same step, pass its path. The command then asks whether to install post-commit and post-merge hooks, and whether those hooks should approve the commit message without the review page:
 
-## Two jobs
+```
+agent-memory install --git-repo /path/to/repo
+```
 
-1. **Capture, then choose.** When a session ends, a hook writes an inbox bundle: which tool, which repo, the session id, and a pointer at the transcript and the diff. A later review command is where you keep nothing, the change summary, the learnings, or specific slices. The end hook does not ask. Those hooks cannot reliably stop the session and wait for an answer.
-2. **Index only what was kept.** Approved memory documents are the source of truth. `scripts/setup` starts Qdrant server 1.20.0 with its storage in this repo’s `data/qdrant/` directory. `scripts/embed` runs `BAAI/bge-small-en-v1.5` and writes vectors for those documents. Raw transcripts are never embedded.
+With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. Add `--install-auto-approve true` to approve those git drafts immediately. Omitting it leaves auto-approve off.
 
-The database belongs to this tool. Other repositories are tags on a memory (`repo`, `tool`, `session_id`). They do not each grow their own index.
+## Features
 
-## Privacy
+- **Session capture.** Hooks for Cursor, Claude Code, Codex, and Pi write an inbox bundle (which tool, which repo, the session id, and a pointer at the transcript) and return. The choice happens later, in review.
+- **Review.** `agent-memory review` opens an approve/reject page on `127.0.0.1`, starting at port 4173. You keep one note per bundle: a `change`, a `learning`, or a `decision`, in the domain `code`, `architecture`, or `operations`. Edit the text before you approve. Reject drops the bundle.
+- **Land.** `agent-memory land` files recent commits on a clone’s local default branch, grouped by pull request when it can tell the PR. It skips merge commits. The draft comes from the PR title, body, and commit messages. Diffs stay in git. These bundles always wait for review.
+- **Git hooks.** With `git_hooks` on, post-commit and post-merge run `agent-memory git-hook`. Each new commit becomes an inbox bundle whose draft is the commit message. A merge or fast-forward files every new single-parent commit, not only the tip. `auto_approve` keeps that draft when `~/.config/agent-memory/identity` has org, team, and person.
+- **Repo policy.** `.agent-memory.toml` holds `capture`, `repo`, `git_hooks`, and `auto_approve`. `agent-memory config` shows them and can turn the git hooks and auto-approve on or off without reinstalling editor hooks. `capture = false` skips capture, `land`, and the git hooks for that clone.
+- **Index.** Approved files in `memories/` are the source of truth. `scripts/setup` starts a local Qdrant server. `scripts/embed` embeds those files with `BAAI/bge-small-en-v1.5`. Raw transcripts are never embedded.
 
-Inbox bundles and transcripts stay on disk and out of git. Review is also the redaction step: secrets and anything you do not want retrieved come out before a document is approved. Only approved documents are embedded.
+## Use
 
-## Out of scope for now
+Work in Cursor, Claude Code, Codex, or Pi. When a session ends, the hook files the inbox. Open the queue:
 
-- No automatic save. Nothing is embedded without a review.
-- No retrieval hook at the start of the next session. The first build stops at capture, review, and embed.
-- No cloud deploy. A shared container is a later run mode of the same stack: hooks still write a local spool, and a sync step pushes only approved documents when a remote is configured.
+```
+agent-memory review
+```
+
+The page lists sessions whose work is on the default branch, plus anything you pinned. A link on the page shows the rest of the inbox. If the server is already running, the command only opens its URL.
+
+Approve writes `memories/<person>-<kind>-<session_id>.json` and removes the inbox folder. It needs org, team, and person, from the form or from `~/.config/agent-memory/identity`, and a remote repo id from `origin` or from `repo` in `.agent-memory.toml`. A change also needs the commit it explains.
+
+File commits that are already on the local default branch. The window defaults to the last 24 hours. `--since` takes an ISO-8601 time or a number of hours ago. The branch name comes from `origin/HEAD` when that local branch exists, otherwise `main` or `master`, and unpushed local commits are included:
+
+```
+agent-memory land /path/to/repo
+agent-memory land /path/to/repo --since 72
+```
+
+Turn git hooks on or off later:
+
+```
+agent-memory config /path/to/repo
+agent-memory config /path/to/repo --git-hooks true --auto-approve false
+```
+
+Pin a draft, force a captured session into the default queue, drop a bundle, or remove the editor hooks this tool added:
+
+```
+agent-memory note --session-id my-note --kind learning --domain code --text "what to keep"
+agent-memory keep <session-id>
+agent-memory drop <session-id>
+agent-memory uninstall
+```
+
+After you approve, index what you kept:
+
+```
+./scripts/setup
+./scripts/embed
+```
 
 ## License
 
-Noncommercial use is free under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, change, and share this software for a noncommercial purpose. That includes personal projects, research, study, hobby work, and use by charities, schools, public research organizations, and government institutions.
-
-Commercial use is not granted. That includes selling this software, offering it as a service, building it into a paid product, and using it inside a company for that company’s business. Any of those uses needs a separate license from the copyright holder. That license is discretionary and may include a fee.
+Noncommercial use is free under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 
 Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agent-memory)
-
-## Where to read next
-
-- [docs/context.md](docs/context.md) — decisions already made.
-- [docs/harnesses.md](docs/harnesses.md) — where each tool’s hook will live, and the capture constraints.
-- [docs/integration.md](docs/integration.md) — how a person installs capture, and where the vector index stays out of the hook.
-- [docs/vector-engine.md](docs/vector-engine.md) — why the engine is Qdrant server, and how `scripts/setup` starts it.
-- [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
-- [docs/research.md](docs/research.md) — the “what already does this” question, still open.
