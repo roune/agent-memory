@@ -80,3 +80,12 @@ After you approve, index what you kept:
 Noncommercial use is free under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 
 Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agent-memory)
+
+## Where to read next
+
+- [docs/context.md](docs/context.md) — decisions already made.
+- [docs/harnesses.md](docs/harnesses.md) — where each tool’s hook will live, and the capture constraints.
+- [docs/integration.md](docs/integration.md) — how a person installs capture, and where the vector index stays out of the hook.
+- [docs/vector-engine.md](docs/vector-engine.md) — why the engine is Qdrant server, and how `scripts/setup` starts it.
+- [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
+- [docs/research.md](docs/research.md) — the “what already does this” question, still open.
