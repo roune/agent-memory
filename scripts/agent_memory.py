@@ -2,8 +2,9 @@
 """agent-memory command: capture, review, hook install, and repo config.
 
 Editor hooks call `capture` and return. Git post-commit/post-merge call `git-hook`.
-Review is a page on 127.0.0.1. `install` writes editor hooks only after a yes; with
-`--git-repo` it can also install git hooks and repo policy under `.agent-memory.toml`.
+Review is a page on 127.0.0.1. Approve writes the local SQLite database.
+`install` writes editor hooks only after a yes; with `--git-repo` it can also
+install git hooks and repo policy under `.agent-memory.toml`.
 Use `config` to change git hook policy and auto-approve without reinstalling.
 """
 
@@ -23,6 +24,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+import memory_store
 HOME = Path.home()
 BIN = ROOT / "bin" / "agent-memory"
 PORT_START = 4173
@@ -43,10 +48,6 @@ def store_root():
 
 def inbox_root():
     return store_root() / "inbox"
-
-
-def memories_root():
-    return store_root() / "memories"
 
 
 def now():
@@ -361,7 +362,7 @@ def hook_commit_shas(repo, event, head):
 
 
 def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve):
-    if memory_exists_for_commit(sha):
+    if memory_exists_for_commit(sha, remote_id):
         return
     msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
     group = single_commit_hook_group(repo_s, sha, msg)
@@ -652,32 +653,13 @@ def land_bundle_path(tool, session_id):
     return session_dir(tool, session_id) / "bundle.json"
 
 
-def memory_exists_for_commit(sha):
-    """True when a kept document already explains this commit.
+def memory_exists_for_commit(sha, remote_id=None):
+    """True when a kept row already explains this commit.
 
     A stored abbreviated hash matches the full id, and the other way around.
     Sharing the first 7 hex digits is not enough: that skipped unrelated commits.
     """
-    root = memories_root()
-    if not root.is_dir():
-        return False
-    needle = sha.strip().lower()
-    if len(needle) < 7:
-        return False
-    for path in root.glob("*.json"):
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            continue
-        stored = doc.get("commit")
-        if not isinstance(stored, str):
-            continue
-        stored = stored.strip().lower()
-        if len(stored) < 7:
-            continue
-        if needle.startswith(stored) or stored.startswith(needle):
-            return True
-    return False
+    return memory_store.memory_exists_for_commit(sha, remote_id)
 
 
 def default_branch_tip(repo):
@@ -831,7 +813,7 @@ def land(args):
         shas = [m["sha"] for m in members]
         any_kept = False
         for sha in shas:
-            if not memory_exists_for_commit(sha):
+            if not memory_exists_for_commit(sha, remote_id):
                 any_kept = True
                 break
         if not any_kept:
@@ -992,7 +974,7 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     if not head:
         log("capture session-end: auto_approve left inbox; could not resolve HEAD")
         return
-    if memory_exists_for_commit(head):
+    if memory_exists_for_commit(head, git_remote_repo_id(repo)):
         log("capture session-end: commit already kept; inbox left for review")
         return
     if is_merge_commit(repo, head):
@@ -1375,14 +1357,10 @@ def approve(
     if updates:
         document["updates"] = updates
 
-    new_id = document["id"]
-    write_json(memories_root() / f"{new_id}.json", document)
-    if supersedes:
-        old_path = memories_root() / f"{supersedes}.json"
-        if old_path.is_file():
-            old_doc = read_json(old_path)
-            old_doc["superseded_by"] = new_id
-            write_json(old_path, old_doc)
+    try:
+        memory_store.save_approved(document)
+    except memory_store.StoreError as error:
+        raise ValueError(str(error)) from error
 
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     return document
@@ -1985,6 +1963,62 @@ def uninstall(args):
     return 0
 
 
+def list_memories(args):
+    mode = memory_store.database_config()["mode"]
+    remote = (args.database or "").strip()
+    if mode == "shared" and remote:
+        raise SystemExit("database is only used in per-repo mode")
+    if mode == "per-repo" and not remote:
+        remote = git_remote_repo_id(os.getcwd())
+        if not remote:
+            raise SystemExit("per-repo list needs --database <remote id>")
+    try:
+        hits = memory_store.query_memories(
+            remote_id=remote if mode == "per-repo" else None,
+            team=args.team,
+            org=args.org,
+            repo=args.repo,
+            person=args.person,
+            since=args.since,
+            until=args.until,
+            kind=args.kind,
+            domain=args.domain,
+            tool=args.tool,
+            session_id=args.session_id,
+            limit=args.limit,
+            offset=args.offset,
+        )
+    except (ValueError, memory_store.StoreError) as error:
+        raise SystemExit(str(error)) from error
+    print(json.dumps(hits, indent=2))
+    return 0
+
+
+def flush_cmd(args):
+    mode = memory_store.database_config()["mode"]
+    remote = (args.repo or "").strip()
+    if mode == "per-repo":
+        if remote and Path(remote).is_dir():
+            remote = git_remote_repo_id(str(Path(remote).resolve()))
+        elif not remote:
+            remote = git_remote_repo_id(os.getcwd())
+        if not remote:
+            raise SystemExit("per-repo flush needs --repo <remote id or checkout>")
+    else:
+        remote = None
+    try:
+        return memory_store.flush(remote)
+    except memory_store.StoreError as error:
+        raise SystemExit(str(error)) from error
+
+
+def import_json(args):
+    try:
+        return memory_store.import_json()
+    except memory_store.StoreError as error:
+        raise SystemExit(str(error)) from error
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="agent-memory")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2083,6 +2117,33 @@ def build_parser():
     )
     config_parser.add_argument("--json", dest="json_out", action="store_true", help="machine-readable output")
     config_parser.set_defaults(func=config_cmd)
+
+    list_parser = sub.add_parser("list", help="query approved memories by team, org, repo, and date")
+    list_parser.add_argument("--team", default=None)
+    list_parser.add_argument("--org", default=None)
+    list_parser.add_argument("--repo", default=None, help="remote id, for example github.com/owner/name")
+    list_parser.add_argument("--person", default=None)
+    list_parser.add_argument("--since", default=None, help="occurred_at lower bound, ISO-8601")
+    list_parser.add_argument("--until", default=None, help="occurred_at upper bound, ISO-8601")
+    list_parser.add_argument("--kind", default=None, choices=KINDS)
+    list_parser.add_argument("--domain", default=None, choices=DOMAINS)
+    list_parser.add_argument("--tool", default=None)
+    list_parser.add_argument("--session-id", default=None)
+    list_parser.add_argument("--database", default=None, help="per-repo remote id; omit in shared mode")
+    list_parser.add_argument("--limit", type=int, default=20)
+    list_parser.add_argument("--offset", type=int, default=0)
+    list_parser.set_defaults(func=list_memories)
+
+    flush_parser = sub.add_parser("flush", help="copy pending rows to the container when it is reachable")
+    flush_parser.add_argument(
+        "--repo",
+        default="",
+        help="per-repo remote id or checkout; ignored in shared mode",
+    )
+    flush_parser.set_defaults(func=flush_cmd)
+
+    import_parser = sub.add_parser("import-json", help="load memories/*.json into SQLite once")
+    import_parser.set_defaults(func=import_json)
     return parser
 
 

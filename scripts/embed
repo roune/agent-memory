@@ -1,14 +1,10 @@
 #!/bin/sh
-# Embed memories/*.json into the local Qdrant server.
-# Fetches the pinned ONNX checkpoint into data/models on first run.
+# Embed pending SQLite rows into Qdrant.
+# The URL comes from ~/.config/agent-memory/database.
+# The default is http://127.0.0.1:6333. Fetches the pinned ONNX checkpoint on first run.
 
 set -eu
 
 cd "$(dirname "$0")/.."
 
-if ! curl -fsS "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; then
-  echo "Qdrant is not ready at http://127.0.0.1:6333. Run scripts/setup first." >&2
-  exit 1
-fi
-
-exec uv run --python 3.12 --with "fastembed==0.9.1" python scripts/embed.py
+exec uv run --python 3.12 --with "fastembed==0.9.1" python scripts/embed.py "$@"

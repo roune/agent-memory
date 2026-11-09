@@ -24,6 +24,20 @@ def run_agent_memory(env, args, cwd=None, stdin=None):
     )
 
 
+def memory_rows(store):
+    import sqlite3
+
+    path = Path(store) / "data" / "memories.sqlite"
+    if not path.is_file():
+        return []
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute("SELECT * FROM memory")]
+    finally:
+        connection.close()
+
+
 class AgentMemoryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -121,8 +135,8 @@ class AgentMemoryTest(unittest.TestCase):
         subprocess.run(["git", "add", "b.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "second commit"], cwd=repo, env=env, check=True)
 
-        memories = list((store / "memories").glob("*.json"))
-        self.assertEqual(len(memories), 1)
+        self.assertEqual(len(memory_rows(store)), 1)
+        self.assertEqual(list((store / "memories").glob("*.json")), [])
         inbox = store / "inbox" / "git"
         bundles = list(inbox.glob("**/bundle.json"))
         self.assertEqual(len(bundles), 0)
@@ -150,8 +164,8 @@ class AgentMemoryTest(unittest.TestCase):
         (repo / "c.txt").write_text("z\n", encoding="utf-8")
         subprocess.run(["git", "add", "c.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "third"], cwd=repo, env=env, check=True)
-        memories = list((store / "memories").glob("*.json"))
-        self.assertEqual(len(memories), 1)
+        self.assertEqual(len(memory_rows(store)), 1)
+        self.assertEqual(list((store / "memories").glob("*.json")), [])
 
     def _install(self, env, repo, hooks="true", auto="false"):
         result = run_agent_memory(
@@ -261,6 +275,7 @@ class AgentMemoryTest(unittest.TestCase):
             stdin=payload,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(memory_rows(store), [])
         self.assertEqual(list((store / "memories").glob("*.json")), [])
         bundles = list((store / "inbox").glob("**/bundle.json"))
         self.assertEqual(len(bundles), 1)
@@ -294,9 +309,10 @@ class AgentMemoryTest(unittest.TestCase):
             stdin=end,
         )
         self.assertEqual(ended.returncode, 0, ended.stderr)
-        memories = list((store / "memories").glob("*.json"))
-        self.assertEqual(len(memories), 1)
-        document = json.loads(memories[0].read_text(encoding="utf-8"))
+        rows = memory_rows(store)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(list((store / "memories").glob("*.json")), [])
+        document = rows[0]
         self.assertIn("session commit", document["text"])
         self.assertNotIn("Done, the tests pass", document["text"])
         head = subprocess.run(
@@ -306,7 +322,7 @@ class AgentMemoryTest(unittest.TestCase):
             capture_output=True,
             check=True,
         ).stdout.strip()
-        self.assertEqual(document["commit"], head)
+        self.assertEqual(document["commit_sha"], head)
 
     def test_land_includes_unpushed_local_commits(self):
         store = Path(self.tmp.name) / "store-land"
@@ -373,7 +389,9 @@ class AgentMemoryTest(unittest.TestCase):
         }
         (memories / "old.json").write_text(json.dumps(old), encoding="utf-8")
         previous = os.environ.get("AGENT_MEMORY_DIR")
+        previous_home = os.environ.get("HOME")
         os.environ["AGENT_MEMORY_DIR"] = str(store)
+        os.environ["HOME"] = str(self.home)
         try:
             spec = importlib.util.spec_from_file_location(
                 "embed_under_test",
@@ -381,12 +399,18 @@ class AgentMemoryTest(unittest.TestCase):
             )
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            imported = module.memory_store.import_json()
+            self.assertEqual(imported, 0)
             loaded = module.load_memories()
         finally:
             if previous is None:
                 os.environ.pop("AGENT_MEMORY_DIR", None)
             else:
                 os.environ["AGENT_MEMORY_DIR"] = previous
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
         self.assertEqual(loaded[0]["id"], "old-change-1")
         payload = {
             "org": loaded[0].get("org") or "",
@@ -394,6 +418,8 @@ class AgentMemoryTest(unittest.TestCase):
             "person": loaded[0].get("person") or "",
         }
         self.assertEqual(payload, {"org": "", "team": "", "person": ""})
+        self.assertFalse(memories.exists())
+        self.assertTrue((store / "memories.imported").is_dir())
 
 
 if __name__ == "__main__":

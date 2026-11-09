@@ -13,3 +13,4 @@ services:
       QDRANT__TELEMETRY_DISABLED: "true"
     volumes:
       - ./data/qdrant:/qdrant/storage
+      - ./data/shared:/agent-memory

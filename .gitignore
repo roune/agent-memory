@@ -8,7 +8,9 @@ inbox/
 transcripts/
 
 # Approved memories. They stay on this machine and are not published.
+# The source of truth is data/memories.sqlite. memories/ is only the old JSON folder.
 memories/
+memories.imported/
 
 # Bytecode from local runs of the CLI.
 __pycache__/

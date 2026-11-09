@@ -31,7 +31,7 @@ With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. 
 - **Land.** `agent-memory land` files recent commits on a clone’s local default branch, grouped by pull request when it can tell the PR. It skips merge commits. The draft comes from the PR title, body, and commit messages. Diffs stay in git. These bundles always wait for review.
 - **Git hooks.** With `git_hooks` on, post-commit and post-merge run `agent-memory git-hook`. Each new commit becomes an inbox bundle whose draft is the commit message. A merge or fast-forward files every new single-parent commit, not only the tip. `auto_approve` keeps that draft when `~/.config/agent-memory/identity` has org, team, and person.
 - **Repo policy.** `.agent-memory.toml` holds `capture`, `repo`, `git_hooks`, and `auto_approve`. `agent-memory config` shows them and can turn the git hooks and auto-approve on or off without reinstalling editor hooks. `capture = false` skips capture, `land`, and the git hooks for that clone.
-- **Index.** Approved files in `memories/` are the source of truth. `scripts/setup` starts a local Qdrant server. `scripts/embed` embeds those files with `BAAI/bge-small-en-v1.5`. Raw transcripts are never embedded.
+- **Index.** Approved memories live in a local SQLite file, `data/memories.sqlite`. `scripts/setup` starts Qdrant, which is only the vector index. `scripts/embed` reads that SQLite file and embeds with `BAAI/bge-small-en-v1.5`. Raw transcripts are never embedded.
 
 ## Use
 
@@ -43,7 +43,19 @@ agent-memory review
 
 The page lists sessions whose work is on the default branch, plus anything you pinned. A link on the page shows the rest of the inbox. If the server is already running, the command only opens its URL.
 
-Approve writes `memories/<person>-<kind>-<session_id>.json` and removes the inbox folder. It needs org, team, and person, from the form or from `~/.config/agent-memory/identity`, and a remote repo id from `origin` or from `repo` in `.agent-memory.toml`. A change also needs the commit it explains.
+Approve writes a row in the local SQLite database and removes the inbox folder. It needs org, team, and person, from the form or from `~/.config/agent-memory/identity`, and a remote repo id from `origin` or from `repo` in `.agent-memory.toml`. A change also needs the commit it explains. Capture, review, and land do not need Qdrant.
+
+`~/.config/agent-memory/database` sets `mode` (`shared` or `per-repo`) and `qdrant_url`. The default is shared mode and `http://127.0.0.1:6333`, so a laptop works with no company host. A company deployment sets `qdrant_url` to its own container. Embed and flush use that URL. In per-repo mode, `~/.config/agent-memory/databases` maps each remote id to that remote's URL, and each remote has its own SQLite file.
+
+```
+agent-memory list --team platform --since 2026-11-01T00:00:00+00:00
+agent-memory list --org acme --since 2026-11-01T00:00:00+00:00
+agent-memory list --repo github.com/owner/name
+agent-memory flush
+agent-memory import-json
+```
+
+`import-json` loads an existing `memories/*.json` folder once. `flush` copies pending rows into the SQLite file mounted in the container when that URL answers `/readyz`, and leaves the laptop file unchanged when it does not.
 
 File commits that are already on the local default branch. The window defaults to the last 24 hours. `--since` takes an ISO-8601 time or a number of hours ago. The branch name comes from `origin/HEAD` when that local branch exists, otherwise `main` or `master`, and unpushed local commits are included:
 
