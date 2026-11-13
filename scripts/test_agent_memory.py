@@ -408,6 +408,29 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(bundles[0]["land"]["commits"][0]["subject"], "init")
         self.assertIn("README", bundles[0]["git"]["paths"])
 
+    def test_land_groups_commits_of_a_merge_commit_pr(self):
+        store = Path(self.tmp.name) / "store-mergepr"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=repo, check=True)
+        self._commit(repo, env, repo / "one.txt", "feature one")
+        self._commit(repo, env, repo / "two.txt", "feature two")
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+        self._commit(repo, env, repo / "main.txt", "on main meanwhile")
+        subprocess.run(
+            ["git", "merge", "-q", "--no-ff", "-m", "Merge pull request #7 from x/feature", "feature"],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        grouped = [b for b in self._land_bundles(store) if b["land"]["pull_request"] == 7]
+        self.assertEqual(len(grouped), 1, self._land_bundles(store))
+        subjects = [c["subject"] for c in grouped[0]["land"]["commits"]]
+        self.assertEqual(subjects, ["feature one", "feature two"])
+
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_under_test",

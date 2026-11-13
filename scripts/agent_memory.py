@@ -703,6 +703,26 @@ def commits_on_branch_since(repo, branch, since_iso):
     return commits
 
 
+def pr_numbers_from_merges(repo, merges):
+    """Map each commit a "Merge pull request #N" commit brought in to N.
+
+    The PR number is only on the merge commit, which land skips. The commits it
+    merged are the ones reachable from its second parent and not from its first.
+    """
+    found = {}
+    for item in merges:
+        prn = pr_from_commit_message(item["message"])
+        if prn is None:
+            continue
+        sha = item["sha"]
+        listing = run(["git", "rev-list", f"{sha}^1..{sha}^2"], repo)
+        for line in listing.splitlines():
+            member = line.strip()
+            if member:
+                found.setdefault(member, prn)
+    return found
+
+
 def build_land_groups(repo, commits):
     """Split off merge commits; group the rest by PR number when present.
 
@@ -717,12 +737,16 @@ def build_land_groups(repo, commits):
             continue
         singles.append(item)
 
+    merged_by_pr = pr_numbers_from_merges(repo, merges)
+
     groups = []
     by_pr = {}
     orphan_singles = []
 
     for item in singles:
-        prn = pr_from_commit_message(item["message"])
+        prn = merged_by_pr.get(item["sha"])
+        if prn is None:
+            prn = pr_from_commit_message(item["message"])
         if prn is None:
             prn = gh_pr_for_sha(repo, item["sha"])
         if prn is not None:
