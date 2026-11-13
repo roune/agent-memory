@@ -382,6 +382,20 @@ class AgentMemoryTest(unittest.TestCase):
         texts = [bundle["draft"]["text"] for bundle in self._land_bundles(store)]
         self.assertTrue(any("one" in text for text in texts), texts)
 
+    def test_land_messages_keep_no_nul(self):
+        store = Path(self.tmp.name) / "store-nul"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        self._commit(repo, env, repo / "one.txt", "one\n\nA body that mentions ---COMMIT--- once.")
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        texts = [bundle["draft"]["text"] for bundle in self._land_bundles(store)]
+        self.assertTrue(texts)
+        for text in texts:
+            self.assertNotIn("\x00", text)
+        self.assertTrue(any("mentions ---COMMIT--- once." in text for text in texts), texts)
+
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_under_test",

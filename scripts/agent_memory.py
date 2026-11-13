@@ -680,16 +680,18 @@ def commits_on_branch_since(repo, branch, since_iso):
             branch,
             f"--since={since_iso}",
             "--reverse",
-            "--pretty=format:%H%x00%ct%x00%B%x00---COMMIT---",
+            # Unit separator between fields, record separator after each commit.
+            # A commit message cannot end up holding either one.
+            "--pretty=format:%H%x1f%ct%x1f%B%x1e",
         ],
         repo,
     )
     commits = []
-    for block in listing.split("---COMMIT---"):
+    for block in listing.split("\x1e"):
         block = block.strip()
         if not block:
             continue
-        parts = block.split("\x00", 2)
+        parts = block.split("\x1f", 2)
         if len(parts) < 3:
             continue
         sha, ct_s, message = parts[0], parts[1], parts[2]
