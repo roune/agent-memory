@@ -302,17 +302,56 @@ def remove_git_hooks(repo):
             user_path.rename(path)
 
 
-def draft_text_commit_only(repo, remote_id, commit_message, sha):
-    """Draft for git hook: commit message only (review-aligned)."""
-    lines = []
-    subj = commit_message.split("\n", 1)[0].strip() if commit_message else ""
-    lines.append(f"- {sha[:10]} {subj}")
-    body = (commit_message or "").strip()
-    if body:
-        lines.append(body)
-        lines.append("")
-    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
-    return "\n".join(lines).strip()
+# A trailer token has a hyphen (Co-Authored-By, Signed-off-by, Claude-Session).
+# One-word lines such as "Note: ..." are prose and stay.
+_TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+:\s*\S")
+_GENERATED_RE = re.compile(r"^\s*\W*\s*Generated with \[?Claude Code", re.IGNORECASE)
+_BARE_URL_RE = re.compile(r"^\s*<?https?://\S+>?\s*$")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_SQUASH_SUFFIX_RE = re.compile(r"\s*\(#\d+\)\s*$")
+
+
+def _paragraphs(text):
+    text = (text or "").replace("\x00", "").replace("\r\n", "\n")
+    return [part.strip() for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
+
+
+def _drop_generated_footer(paragraphs):
+    """Remove a "Generated with Claude Code" line and a bare link right after it."""
+    kept = []
+    skip_url = False
+    for part in paragraphs:
+        lines = []
+        for line in part.splitlines():
+            if _GENERATED_RE.match(line):
+                skip_url = True
+                continue
+            if skip_url and _BARE_URL_RE.match(line):
+                skip_url = False
+                continue
+            skip_url = skip_url and not line.strip()
+            lines.append(line)
+        if any(line.strip() for line in lines):
+            kept.append("\n".join(lines).strip())
+    return kept
+
+
+def clean_message(message):
+    """A commit message without NUL, trailers, or a generated-with footer."""
+    paragraphs = _drop_generated_footer(_paragraphs(message))
+    if len(paragraphs) > 1 and all(_TRAILER_RE.match(line) for line in paragraphs[-1].splitlines()):
+        paragraphs = paragraphs[:-1]
+    return "\n\n".join(paragraphs)
+
+
+def clean_pr_body(body):
+    """A PR description without template comments or a generated-with footer."""
+    return "\n\n".join(_drop_generated_footer(_paragraphs(_HTML_COMMENT_RE.sub("", body or ""))))
+
+
+def draft_text_commit_only(commit_message):
+    """Draft for git hook: the commit message only. The sha and repo are columns."""
+    return clean_message(commit_message)
 
 
 def single_commit_hook_group(repo, sha, message):
@@ -374,7 +413,7 @@ def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_app
     bundle_path = land_bundle_path("git", session_id)
     if bundle_path.is_file():
         return
-    draft_text = draft_text_commit_only(repo_s, remote_id, msg, sha)
+    draft_text = draft_text_commit_only(msg)
     bundle = {
         "tool": "git",
         "session_id": session_id,
@@ -573,7 +612,7 @@ def unusual_path_hint(repo, shas):
         diff = sorted((a ^ b))
         if diff:
             return f"Unusual vs the other commit: only {diff[0]}"
-    return "No single file stands out from the rest of this group."
+    return ""
 
 
 _GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+)", re.IGNORECASE)
@@ -773,32 +812,30 @@ def build_land_groups(repo, commits):
     return groups, merge_notes
 
 
-def draft_text_for_group(repo, remote_id, group):
-    lines = []
-    pr_number = group.get("pr")
-    members = group["commits"]
-    shas = [m["sha"] for m in members]
+def draft_text_for_group(repo, group):
+    """PR title and description, then each commit message, each said once.
 
+    The PR number, shas, repo id, and path hint are stored beside the text, so
+    they are not repeated in what gets embedded.
+    """
+    parts = []
+    title = ""
+    pr_number = group.get("pr")
     if pr_number is not None:
         title, body = gh_pr_description(repo, pr_number)
-        lines.append(f"Pull request #{pr_number}")
         if title:
-            lines.append(title)
+            parts.append(title)
+        body = clean_pr_body(body)
         if body:
-            lines.append(body)
-        lines.append("")
-    lines.append("Commits:")
-    for m in members:
-        subj = m["message"].split("\n", 1)[0].strip() if m["message"] else ""
-        lines.append(f"- {m['sha'][:10]} {subj}")
-        body = m["message"].strip()
-        if body:
-            lines.append(body)
-            lines.append("")
-    lines.append(unusual_path_hint(repo, shas))
-    lines.append("")
-    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
-    return "\n".join(line for line in lines if line is not None).strip()
+            parts.append(body)
+    for member in group["commits"]:
+        message = clean_message(member["message"])
+        subject, _, rest = message.partition("\n")
+        if title and _SQUASH_SUFFIX_RE.sub("", subject).strip() == title:
+            message = rest.strip()
+        if message:
+            parts.append(message)
+    return "\n\n".join(parts)
 
 
 def git_paths_for_group(repo, shas):
@@ -859,7 +896,7 @@ def land(args):
             continue
 
         paths = git_paths_for_group(str(repo), shas)
-        draft_text = draft_text_for_group(str(repo), remote_id, group)
+        draft_text = draft_text_for_group(str(repo), group)
         ended = occurred_at_for_group(group)
         bundle = {
             "tool": tool,
@@ -888,6 +925,7 @@ def land(args):
             "land": {
                 "remote_repo": remote_id,
                 "pull_request": prn,
+                "hint": unusual_path_hint(str(repo), shas),
                 "commits": [
                     {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
                     for m in members
@@ -1022,7 +1060,7 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
         return
     remote_id = git_remote_repo_id(repo)
     body = run(["git", "log", "-1", "--format=%B", head], repo) or ""
-    text = draft_text_commit_only(repo, remote_id, body, head)
+    text = draft_text_commit_only(body)
     if not text.strip():
         log("capture session-end: empty commit message; inbox left for review")
         return

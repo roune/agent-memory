@@ -134,7 +134,7 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(len(bundles), 1, "expected one inbox bundle")
         data = json.loads(bundles[0].read_text(encoding="utf-8"))
         self.assertEqual(data.get("tool"), "git")
-        self.assertTrue((data.get("draft") or {}).get("text"))
+        self.assertEqual((data.get("draft") or {}).get("text"), "add a file\n\nBody line.")
         memories = list((store / "memories").glob("*.json"))
         self.assertEqual(len(memories), 0)
 
@@ -510,6 +510,58 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(len(bundles), 1, bundles)
         self.assertEqual([c["sha"] for c in bundles[0]["land"]["commits"]], [third])
         self.assertNotEqual(bundles[0]["session_id"], rows[second]["session_id"])
+
+    def _gh_with_pr(self, env, title, body):
+        """A gh whose pr view prints one PR. Everything else fails, as before."""
+        folder = Path(self.tmp.name) / "gh-pr-bin"
+        folder.mkdir(exist_ok=True)
+        payload = json.dumps({"title": title, "body": body})
+        script = folder / "gh"
+        script.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = pr ] && [ "$2" = view ]; then\n'
+            f"  cat <<'JSON'\n{payload}\nJSON\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        env = dict(env)
+        env["PATH"] = str(folder) + os.pathsep + env["PATH"]
+        return env
+
+    def test_land_draft_says_each_thing_once(self):
+        store = Path(self.tmp.name) / "store-draft"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        trailer = "\n\nCo-Authored-By: Bot <bot@example.com>"
+        self._commit(repo, env, repo / "one.txt", "Add the parser (#5)\n\nIt reads the header first." + trailer)
+        self._commit(repo, env, repo / "two.txt", "Wire the parser in (#5)" + trailer)
+        env = self._gh_with_pr(
+            env,
+            "Add the parser",
+            "<!-- Describe the change -->\nThe old reader skipped headers.\n\n"
+            "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)\n\n"
+            "https://claude.ai/code/session_x",
+        )
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        [bundle] = [b for b in self._land_bundles(store) if b["land"]["pull_request"] == 5]
+        text = bundle["draft"]["text"]
+        self.assertEqual(
+            text,
+            "Add the parser\n\n"
+            "The old reader skipped headers.\n\n"
+            "It reads the header first.\n\n"
+            "Wire the parser in (#5)",
+        )
+        for sha in (c["sha"] for c in bundle["land"]["commits"]):
+            self.assertNotIn(sha[:10], text)
+        self.assertNotIn("Remote repo id", text)
+        self.assertIn("one.txt", bundle["land"]["hint"])
+        self.assertNotIn(bundle["land"]["hint"], text)
 
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
