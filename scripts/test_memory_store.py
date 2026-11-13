@@ -303,6 +303,121 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual(self._rows(shared)[0]["text"], "clash")
         self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
 
+    def _change(self, suffix, commits, pull_request=None):
+        document = self._doc(suffix, "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00")
+        document["id"] = f"person-change-{suffix}"
+        document["kind"] = "change"
+        document["commit"] = commits[-1]
+        document["commits"] = commits
+        if pull_request is not None:
+            document["pull_request"] = pull_request
+        return document
+
+    def _commit_rows(self, path):
+        connection = sqlite3.connect(path)
+        try:
+            return connection.execute(
+                "SELECT memory_id, sha, position FROM memory_commit ORDER BY memory_id, position"
+            ).fetchall()
+        finally:
+            connection.close()
+
+    def test_change_stores_every_commit_and_the_pull_request(self):
+        a, b, c = "a" * 40, "b" * 40, "c" * 40
+        self.db.save_approved(self._change("pr", [a, b, c], pull_request=5))
+        for sha in (a, b[:7], c.upper()):
+            self.assertTrue(self.db.memory_exists_for_commit(sha), sha)
+        self.assertFalse(self.db.memory_exists_for_commit("d" * 40))
+        self.assertFalse(self.db.memory_exists_for_commit("a" * 6))
+        hits = self.db.query_memories(kind="change")
+        self.assertEqual(hits[0]["commits"], [a, b, c])
+        self.assertEqual(hits[0]["pull_request"], 5)
+        self.assertEqual(hits[0]["commit"], c)
+        documents = self.db.pending_documents()
+        self.assertEqual(documents[0]["commits"], [a, b, c])
+        self.assertEqual(documents[0]["pull_request"], 5)
+
+        # Approving the same id again replaces its commits instead of adding to them.
+        self.db.save_approved(self._change("pr", [c]))
+        path = self.store / "data" / "memories.sqlite"
+        self.assertEqual(self._commit_rows(path), [("person-change-pr", c, 0)])
+        self.assertFalse(self.db.memory_exists_for_commit(a))
+
+    def test_abbreviated_stored_commit_matches_the_full_id(self):
+        full = "1234567" + "e" * 33
+        document = self._change("short", [full[:10]])
+        del document["commits"]
+        self.db.save_approved(document)
+        self.assertTrue(self.db.memory_exists_for_commit(full))
+        self.assertFalse(self.db.memory_exists_for_commit("1234567" + "f" * 33))
+
+    def test_old_file_is_migrated_and_backfilled(self):
+        path = self.store / "data" / "memories.sqlite"
+        path.parent.mkdir(parents=True)
+        old_schema = self.db.SCHEMA.split("CREATE TABLE IF NOT EXISTS memory_commit", 1)[0]
+        old_schema = old_schema.replace("  pull_request INTEGER,\n", "")
+        connection = sqlite3.connect(path)
+        connection.executescript(old_schema)
+        connection.execute(
+            """
+            INSERT INTO memory (id, kind, domain, repo, tool, session_id, text, commit_sha,
+                                org, team, person, updated_at)
+            VALUES ('old', 'change', 'code', 'github.com/example/one', 'git', 's', 'old note',
+                    'ABCDEF1234', 'Acme', 'Platform', 'person', '2026-11-01T00:00:00+00:00')
+            """
+        )
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+        connection.close()
+
+        self.assertTrue(self.db.memory_exists_for_commit("abcdef1234" + "0" * 30))
+        hits = self.db.query_memories()
+        self.assertEqual(hits[0]["commits"], ["abcdef1234"])
+        self.assertIsNone(hits[0]["pull_request"])
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        finally:
+            connection.close()
+
+    def test_flush_copies_commit_rows(self):
+        server, url = start_ready()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        (self.home / ".config" / "agent-memory" / "database").write_text(
+            f"mode = shared\nqdrant_url = {url}\n",
+            encoding="utf-8",
+        )
+        a, b = "a" * 40, "b" * 40
+        self.db.save_approved(self._change("pr", [a, b], pull_request=9))
+        self.assertEqual(self.db.flush(), 0)
+        shared = self.store / "data" / "shared" / "memories.sqlite"
+        self.assertEqual(
+            self._commit_rows(shared),
+            [("person-change-pr", a, 0), ("person-change-pr", b, 1)],
+        )
+        self.assertEqual(self._rows(shared)[0]["pull_request"], 9)
+
+    def test_import_writes_commit_rows(self):
+        folder = self.store / "memories"
+        folder.mkdir()
+        document = self._change("imported", ["f" * 40])
+        del document["commits"]
+        (folder / f"{document['id']}.json").write_text(json.dumps(document), encoding="utf-8")
+        self.assertEqual(self.db.import_json(), 0)
+        self.assertTrue(self.db.memory_exists_for_commit("f" * 40))
+
+    def test_embed_payload_carries_the_pointer(self):
+        a, b, c = "a" * 40, "b" * 40, "c" * 40
+        self.db.save_approved(self._change("pr", [a, b, c], pull_request=5))
+        self.db.save_approved(self._doc("note", "Platform", "Acme", "github.com/example/one", None))
+        embed = load_embed()
+        payloads = {doc["id"]: embed.payload_for(doc) for doc in self.db.pending_documents()}
+        self.assertEqual(payloads["person-change-pr"]["commits"], [a, b, c])
+        self.assertEqual(payloads["person-change-pr"]["pull_request"], 5)
+        self.assertEqual(payloads["person-learning-note"]["commits"], [])
+        self.assertNotIn("pull_request", payloads["person-learning-note"])
+
     def test_embed_ready_check_uses_the_configured_url(self):
         (self.home / ".config" / "agent-memory" / "database").write_text(
             "mode = shared\nqdrant_url = http://127.0.0.1:9\n",

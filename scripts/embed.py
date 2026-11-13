@@ -96,6 +96,7 @@ def ensure_collection(base):
         "kind",
         "domain",
         "commit",
+        "commits",
         "org",
         "team",
         "person",
@@ -114,6 +115,13 @@ def ensure_collection(base):
             "PUT",
             f"/collections/{COLLECTION}/index",
             {"field_name": field, "field_schema": "keyword"},
+        )
+    if "pull_request" not in existing:
+        api(
+            base,
+            "PUT",
+            f"/collections/{COLLECTION}/index",
+            {"field_name": "pull_request", "field_schema": "integer"},
         )
     if "occurred_at" not in existing:
         api(
@@ -137,6 +145,7 @@ def payload_for(document):
         "tool": document["tool"],
         "session_id": document["session_id"],
         "commit": document.get("commit") or "",
+        "commits": list(document.get("commits") or []),
         "text": document["text"],
         "org": document.get("org") or "",
         "team": document.get("team") or "",
@@ -144,6 +153,9 @@ def payload_for(document):
         "embedding_model": MODEL_NAME,
         "embedding_revision": REVISION,
     }
+    pull_request = document.get("pull_request")
+    if isinstance(pull_request, int):
+        payload["pull_request"] = pull_request
     occurred = document.get("occurred_at")
     if isinstance(occurred, str) and occurred.strip():
         payload["occurred_at"] = occurred.strip()

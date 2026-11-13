@@ -302,17 +302,56 @@ def remove_git_hooks(repo):
             user_path.rename(path)
 
 
-def draft_text_commit_only(repo, remote_id, commit_message, sha):
-    """Draft for git hook: commit message only (review-aligned)."""
-    lines = []
-    subj = commit_message.split("\n", 1)[0].strip() if commit_message else ""
-    lines.append(f"- {sha[:10]} {subj}")
-    body = (commit_message or "").strip()
-    if body:
-        lines.append(body)
-        lines.append("")
-    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
-    return "\n".join(lines).strip()
+# A trailer token has a hyphen (Co-Authored-By, Signed-off-by, Claude-Session).
+# One-word lines such as "Note: ..." are prose and stay.
+_TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+:\s*\S")
+_GENERATED_RE = re.compile(r"^\s*\W*\s*Generated with \[?Claude Code", re.IGNORECASE)
+_BARE_URL_RE = re.compile(r"^\s*<?https?://\S+>?\s*$")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_SQUASH_SUFFIX_RE = re.compile(r"\s*\(#\d+\)\s*$")
+
+
+def _paragraphs(text):
+    text = (text or "").replace("\x00", "").replace("\r\n", "\n")
+    return [part.strip() for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
+
+
+def _drop_generated_footer(paragraphs):
+    """Remove a "Generated with Claude Code" line and a bare link right after it."""
+    kept = []
+    skip_url = False
+    for part in paragraphs:
+        lines = []
+        for line in part.splitlines():
+            if _GENERATED_RE.match(line):
+                skip_url = True
+                continue
+            if skip_url and _BARE_URL_RE.match(line):
+                skip_url = False
+                continue
+            skip_url = skip_url and not line.strip()
+            lines.append(line)
+        if any(line.strip() for line in lines):
+            kept.append("\n".join(lines).strip())
+    return kept
+
+
+def clean_message(message):
+    """A commit message without NUL, trailers, or a generated-with footer."""
+    paragraphs = _drop_generated_footer(_paragraphs(message))
+    if len(paragraphs) > 1 and all(_TRAILER_RE.match(line) for line in paragraphs[-1].splitlines()):
+        paragraphs = paragraphs[:-1]
+    return "\n\n".join(paragraphs)
+
+
+def clean_pr_body(body):
+    """A PR description without template comments or a generated-with footer."""
+    return "\n\n".join(_drop_generated_footer(_paragraphs(_HTML_COMMENT_RE.sub("", body or ""))))
+
+
+def draft_text_commit_only(commit_message):
+    """Draft for git hook: the commit message only. The sha and repo are columns."""
+    return clean_message(commit_message)
 
 
 def single_commit_hook_group(repo, sha, message):
@@ -374,7 +413,7 @@ def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_app
     bundle_path = land_bundle_path("git", session_id)
     if bundle_path.is_file():
         return
-    draft_text = draft_text_commit_only(repo_s, remote_id, msg, sha)
+    draft_text = draft_text_commit_only(msg)
     bundle = {
         "tool": "git",
         "session_id": session_id,
@@ -573,7 +612,7 @@ def unusual_path_hint(repo, shas):
         diff = sorted((a ^ b))
         if diff:
             return f"Unusual vs the other commit: only {diff[0]}"
-    return "No single file stands out from the rest of this group."
+    return ""
 
 
 _GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+)", re.IGNORECASE)
@@ -773,32 +812,30 @@ def build_land_groups(repo, commits):
     return groups, merge_notes
 
 
-def draft_text_for_group(repo, remote_id, group):
-    lines = []
-    pr_number = group.get("pr")
-    members = group["commits"]
-    shas = [m["sha"] for m in members]
+def draft_text_for_group(repo, group):
+    """PR title and description, then each commit message, each said once.
 
+    The PR number, shas, repo id, and path hint are stored beside the text, so
+    they are not repeated in what gets embedded.
+    """
+    parts = []
+    title = ""
+    pr_number = group.get("pr")
     if pr_number is not None:
         title, body = gh_pr_description(repo, pr_number)
-        lines.append(f"Pull request #{pr_number}")
         if title:
-            lines.append(title)
+            parts.append(title)
+        body = clean_pr_body(body)
         if body:
-            lines.append(body)
-        lines.append("")
-    lines.append("Commits:")
-    for m in members:
-        subj = m["message"].split("\n", 1)[0].strip() if m["message"] else ""
-        lines.append(f"- {m['sha'][:10]} {subj}")
-        body = m["message"].strip()
-        if body:
-            lines.append(body)
-            lines.append("")
-    lines.append(unusual_path_hint(repo, shas))
-    lines.append("")
-    lines.append(f"Remote repo id: {remote_id}" if remote_id else "")
-    return "\n".join(line for line in lines if line is not None).strip()
+            parts.append(body)
+    for member in group["commits"]:
+        message = clean_message(member["message"])
+        subject, _, rest = message.partition("\n")
+        if title and _SQUASH_SUFFIX_RE.sub("", subject).strip() == title:
+            message = rest.strip()
+        if message:
+            parts.append(message)
+    return "\n\n".join(parts)
 
 
 def git_paths_for_group(repo, shas):
@@ -842,12 +879,14 @@ def land(args):
     tool = "git"
     wrote = 0
     for group in groups:
-        members = group["commits"]
-        shas = [m["sha"] for m in members]
-        # Approve stores the group's tip only, and the group is approved as a
-        # whole. A group with any commit already kept is already explained.
-        if any(memory_exists_for_commit(sha, remote_id) for sha in shas):
+        # Approve stores every commit of a group, so a commit already kept is
+        # explained. A PR that grew past an earlier window files only the rest,
+        # under a new session id, so the kept memory is not overwritten.
+        members = [m for m in group["commits"] if not memory_exists_for_commit(m["sha"], remote_id)]
+        if not members:
             continue
+        group = dict(group, commits=members)
+        shas = [m["sha"] for m in members]
 
         prn = group.get("pr")
         group_key = f"pr-{prn}" if prn is not None else shas[0]
@@ -857,7 +896,7 @@ def land(args):
             continue
 
         paths = git_paths_for_group(str(repo), shas)
-        draft_text = draft_text_for_group(str(repo), remote_id, group)
+        draft_text = draft_text_for_group(str(repo), group)
         ended = occurred_at_for_group(group)
         bundle = {
             "tool": tool,
@@ -886,6 +925,7 @@ def land(args):
             "land": {
                 "remote_repo": remote_id,
                 "pull_request": prn,
+                "hint": unusual_path_hint(str(repo), shas),
                 "commits": [
                     {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
                     for m in members
@@ -1020,7 +1060,7 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
         return
     remote_id = git_remote_repo_id(repo)
     body = run(["git", "log", "-1", "--format=%B", head], repo) or ""
-    text = draft_text_commit_only(repo, remote_id, body, head)
+    text = draft_text_commit_only(body)
     if not text.strip():
         log("capture session-end: empty commit message; inbox left for review")
         return
@@ -1296,6 +1336,26 @@ def drop(args):
     print(f"dropped {args.session_id}")
 
 
+def commits_for_change(bundle, commit):
+    """Commits and PR number a change stores: the pointer a later reader follows.
+
+    A land or git-hook bundle lists its commits. When the chosen commit is one of
+    them, the change explains all of them and the bundle's pull request. A
+    session bundle, or a commit picked from outside that list, stores just it.
+    """
+    land_meta = bundle.get("land") if isinstance(bundle.get("land"), dict) else {}
+    listed = [
+        str(item.get("sha") or "").strip()
+        for item in land_meta.get("commits") or []
+        if isinstance(item, dict) and str(item.get("sha") or "").strip()
+    ]
+    chosen = commit.lower()
+    if any(sha.lower() == chosen for sha in listed):
+        pull_request = land_meta.get("pull_request")
+        return listed, pull_request if isinstance(pull_request, int) else None
+    return [commit], None
+
+
 def approve(
     bundle,
     kind,
@@ -1352,10 +1412,13 @@ def approve(
     superseded_by = superseded_by.strip()
     updates = updates.strip()
 
+    commits = []
+    pull_request = None
     if kind == "change":
         commit = commit.strip()
         if len(commit) < 7 or any(char not in "0123456789abcdefABCDEF" for char in commit):
             raise ValueError("a change needs the commit it explains")
+        commits, pull_request = commits_for_change(bundle, commit)
 
     document = {
         "id": f"{person}-{kind}-{session_id}",
@@ -1372,6 +1435,9 @@ def approve(
     }
     if kind == "change":
         document["commit"] = commit
+        document["commits"] = commits
+        if pull_request is not None:
+            document["pull_request"] = pull_request
     if record:
         document["record"] = record
     if subject:
@@ -1414,6 +1480,8 @@ PAGE = """<!DOCTYPE html>
   select { font: inherit; }
   button { font: inherit; margin-right: 0.4rem; margin-top: 0.8rem; }
   a { color: #1d4ed8; }
+  code { font-family: ui-monospace, monospace; font-size: 0.88rem; overflow-wrap: anywhere; }
+  ul.commits { margin: 0.3rem 0; padding-left: 1.2rem; }
 </style>
 </head>
 <body>
@@ -1423,6 +1491,40 @@ __ITEMS__
 </body>
 </html>
 """
+
+
+# About 512 bge-small tokens of English prose.
+LONG_TEXT_CHARS = 1800
+
+
+def pointer_block(commits, draft, land_meta):
+    """The commits a land or hook bundle stores, and how to read them in git.
+
+    Approve stores all of them, so they are listed, not offered as a choice.
+    """
+    shas = [commit["sha"] for commit in commits]
+    tip = (draft.get("commit") or "").strip()
+    if tip not in shas:
+        tip = shas[-1]
+    items = "".join(
+        f'<li><code>{html.escape(commit["sha"][:10])}</code> {html.escape(commit.get("subject") or "")}</li>'
+        for commit in commits
+    )
+    pull_request = land_meta.get("pull_request")
+    legend = f"Pull request #{pull_request}" if isinstance(pull_request, int) else "Commits"
+    commands = ["git show --stat " + " ".join(sha[:12] for sha in shas)]
+    if isinstance(pull_request, int):
+        remote = (land_meta.get("remote_repo") or "").strip()
+        commands.append(f"gh pr view {pull_request}" + (f" -R {remote}" if remote else ""))
+    read = " · ".join(f"<code>{html.escape(command)}</code>" for command in commands)
+    hint = (land_meta.get("hint") or "").strip()
+    hint_block = f'<p class="meta">{html.escape(hint)}</p>' if hint else ""
+    return (
+        f'<fieldset><legend>{html.escape(legend)}</legend><ul class="commits">{items}</ul></fieldset>'
+        f'<input type="hidden" name="commit" value="{html.escape(tip)}">'
+        f'<p class="meta">The memory stores these commits, not their diff. Read them in git: {read}</p>'
+        f"{hint_block}"
+    )
 
 
 def select_options(choices, selected):
@@ -1463,7 +1565,9 @@ def render_page(items, include_all):
                 kind = "change"
             else:
                 kind = "learning"
-            if commits:
+            if commits and item.get("tool") == "git":
+                commit_block = pointer_block(commits, draft, land_meta)
+            elif commits:
                 radios = []
                 default_sha = (draft.get("commit") or "").strip()
                 if not any(commit["sha"] == default_sha for commit in commits):
@@ -1484,6 +1588,12 @@ def render_page(items, include_all):
             if message:
                 message_block = f"<pre>{html.escape(message[:4000])}</pre>"
             text_label = "Context of this commit" if kind == "change" else "Keep this text"
+            long_note = ""
+            if len(draft.get("text") or "") > LONG_TEXT_CHARS:
+                long_note = (
+                    '<p class="meta">This text is long. The embedding reads only about '
+                    "the first 512 tokens. Trim it, or keep what matters first.</p>"
+                )
             iden = read_identity()
             rr_default = (land_meta.get("remote_repo") or "").strip()
             org_d = html.escape(iden.get("org") or "")
@@ -1518,7 +1628,7 @@ def render_page(items, include_all):
                 f"""<article>
 <p><strong>{html.escape(item.get("repo") or "")}</strong></p>
 <p class="meta">{tool} · {sid} · {html.escape(item.get("ended_at") or "")}</p>
-<p class="meta">A change stores the context of the commit you pick. The diff stays in git.</p>
+<p class="meta">A change stores the context of its commits. The diff stays in git.</p>
 <form method="post" action="/approve">
 <input type="hidden" name="session_id" value="{sid}">
 <input type="hidden" name="tool" value="{tool}">
@@ -1528,6 +1638,7 @@ def render_page(items, include_all):
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
 {extra_fields}
 <label>{text_label} <textarea name="text">{draft_text}</textarea></label>
+{long_note}
 <button type="submit">Approve</button>
 </form>
 <form method="post" action="/reject">

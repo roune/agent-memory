@@ -134,7 +134,7 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(len(bundles), 1, "expected one inbox bundle")
         data = json.loads(bundles[0].read_text(encoding="utf-8"))
         self.assertEqual(data.get("tool"), "git")
-        self.assertTrue((data.get("draft") or {}).get("text"))
+        self.assertEqual((data.get("draft") or {}).get("text"), "add a file\n\nBody line.")
         memories = list((store / "memories").glob("*.json"))
         self.assertEqual(len(memories), 0)
 
@@ -162,7 +162,9 @@ class AgentMemoryTest(unittest.TestCase):
         subprocess.run(["git", "add", "b.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "second commit"], cwd=repo, env=env, check=True)
 
-        self.assertEqual(len(memory_rows(store)), 1)
+        rows = memory_rows(store)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self._commit_rows(store), [(rows[0]["id"], self._head(repo))])
         self.assertEqual(list((store / "memories").glob("*.json")), [])
         inbox = store / "inbox" / "git"
         bundles = list(inbox.glob("**/bundle.json"))
@@ -462,6 +464,105 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(self._land_bundles(store), [])
         self.assertEqual(len(memory_rows(store)), kept)
 
+    def _commit_rows(self, store):
+        import sqlite3
+
+        connection = sqlite3.connect(Path(store) / "data" / "memories.sqlite")
+        try:
+            return connection.execute(
+                "SELECT memory_id, sha FROM memory_commit ORDER BY memory_id, position"
+            ).fetchall()
+        finally:
+            connection.close()
+
+    def _head(self, repo):
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+    def test_approve_stores_every_commit_of_a_pr(self):
+        store = Path(self.tmp.name) / "store-pointer"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self._approve_bundles(env)
+        self._commit(repo, env, repo / "one.txt", "part one (#5)")
+        first = self._head(repo)
+        self._commit(repo, env, repo / "two.txt", "part two (#5)")
+        second = self._head(repo)
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self._approve_bundles(env)
+        rows = {row["commit_sha"]: row for row in memory_rows(store)}
+        self.assertEqual(rows[second]["pull_request"], 5)
+        pr_id = rows[second]["id"]
+        self.assertEqual(
+            [sha for memory_id, sha in self._commit_rows(store) if memory_id == pr_id],
+            [first, second],
+        )
+
+        # A third commit for the same PR files a bundle with only that commit.
+        self._commit(repo, env, repo / "three.txt", "part three (#5)")
+        third = self._head(repo)
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        bundles = self._land_bundles(store)
+        self.assertEqual(len(bundles), 1, bundles)
+        self.assertEqual([c["sha"] for c in bundles[0]["land"]["commits"]], [third])
+        self.assertNotEqual(bundles[0]["session_id"], rows[second]["session_id"])
+
+    def _gh_with_pr(self, env, title, body):
+        """A gh whose pr view prints one PR. Everything else fails, as before."""
+        folder = Path(self.tmp.name) / "gh-pr-bin"
+        folder.mkdir(exist_ok=True)
+        payload = json.dumps({"title": title, "body": body})
+        script = folder / "gh"
+        script.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = pr ] && [ "$2" = view ]; then\n'
+            f"  cat <<'JSON'\n{payload}\nJSON\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        env = dict(env)
+        env["PATH"] = str(folder) + os.pathsep + env["PATH"]
+        return env
+
+    def test_land_draft_says_each_thing_once(self):
+        store = Path(self.tmp.name) / "store-draft"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        trailer = "\n\nCo-Authored-By: Bot <bot@example.com>"
+        self._commit(repo, env, repo / "one.txt", "Add the parser (#5)\n\nIt reads the header first." + trailer)
+        self._commit(repo, env, repo / "two.txt", "Wire the parser in (#5)" + trailer)
+        env = self._gh_with_pr(
+            env,
+            "Add the parser",
+            "<!-- Describe the change -->\nThe old reader skipped headers.\n\n"
+            "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)\n\n"
+            "https://claude.ai/code/session_x",
+        )
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        [bundle] = [b for b in self._land_bundles(store) if b["land"]["pull_request"] == 5]
+        text = bundle["draft"]["text"]
+        self.assertEqual(
+            text,
+            "Add the parser\n\n"
+            "The old reader skipped headers.\n\n"
+            "It reads the header first.\n\n"
+            "Wire the parser in (#5)",
+        )
+        for sha in (c["sha"] for c in bundle["land"]["commits"]):
+            self.assertNotIn(sha[:10], text)
+        self.assertNotIn("Remote repo id", text)
+        self.assertIn("one.txt", bundle["land"]["hint"])
+        self.assertNotIn(bundle["land"]["hint"], text)
+
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_under_test",
@@ -490,6 +591,43 @@ class AgentMemoryTest(unittest.TestCase):
         approve = page.split('action="/approve"', 1)[1].split("</form>", 1)[0]
         self.assertIn('name="commit"', approve)
         self.assertIn(f'value="{sha}"', approve)
+
+    def test_review_page_shows_the_pointer_of_a_land_bundle(self):
+        spec = importlib.util.spec_from_file_location(
+            "agent_memory_pointer_test",
+            ROOT / "scripts" / "agent_memory.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        first, second = "1" * 40, "2" * 40
+        item = {
+            "session_id": "land-x",
+            "tool": "git",
+            "repo": "/tmp/repo",
+            "ended_at": "2026-11-06T00:00:00+00:00",
+            "draft": {"kind": "change", "domain": "code", "text": "short", "commit": second},
+            "land": {
+                "remote_repo": "github.com/example/proj",
+                "pull_request": 5,
+                "hint": "Unusual vs rest of group: touched one.txt",
+                "commits": [{"sha": first, "subject": "one"}, {"sha": second, "subject": "two"}],
+            },
+            "last_assistant_message": "",
+        }
+        page = module.render_page([item], False)
+        approve = page.split('action="/approve"', 1)[1].split("</form>", 1)[0]
+        self.assertIn(first[:10], approve)
+        self.assertIn(second[:10], approve)
+        self.assertIn("gh pr view 5 -R github.com/example/proj", approve)
+        self.assertIn(f"git show --stat {first[:12]} {second[:12]}", approve)
+        self.assertIn("touched one.txt", approve)
+        self.assertNotIn('type="radio"', approve)
+        self.assertEqual(approve.count('name="commit"'), 1)
+        self.assertIn(f'<input type="hidden" name="commit" value="{second}">', approve)
+        self.assertNotIn("This text is long", page)
+
+        item["draft"]["text"] = "x" * 2000
+        self.assertIn("This text is long", module.render_page([item], False))
 
     def test_review_form_checks_one_commit_without_a_draft_commit(self):
         spec = importlib.util.spec_from_file_location(
