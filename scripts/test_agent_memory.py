@@ -396,6 +396,18 @@ class AgentMemoryTest(unittest.TestCase):
             self.assertNotIn("\x00", text)
         self.assertTrue(any("mentions ---COMMIT--- once." in text for text in texts), texts)
 
+    def test_land_files_the_root_commit(self):
+        store = Path(self.tmp.name) / "store-root"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        bundles = self._land_bundles(store)
+        self.assertEqual(len(bundles), 1, bundles)
+        self.assertEqual(bundles[0]["land"]["commits"][0]["subject"], "init")
+        self.assertIn("README", bundles[0]["git"]["paths"])
+
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_under_test",

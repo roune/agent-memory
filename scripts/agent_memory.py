@@ -552,7 +552,7 @@ def parse_since(value, default_hours):
 
 
 def commit_files(repo, sha):
-    listing = run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha], repo)
+    listing = run(["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", sha], repo)
     return [line.strip() for line in listing.splitlines() if line.strip()]
 
 
@@ -704,12 +704,15 @@ def commits_on_branch_since(repo, branch, since_iso):
 
 
 def build_land_groups(repo, commits):
-    """Split commits into single-parent only; group by PR number when present."""
+    """Split off merge commits; group the rest by PR number when present.
+
+    A root commit has no parent. It is filed like any single-parent commit.
+    """
     merges = []
     singles = []
     for item in commits:
         parents = run(["git", "rev-parse", f"{item['sha']}^@"], repo).split()
-        if len(parents) != 1:
+        if len(parents) > 1:
             merges.append(item)
             continue
         singles.append(item)
