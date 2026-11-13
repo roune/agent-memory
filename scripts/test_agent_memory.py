@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -50,11 +51,37 @@ class AgentMemoryTest(unittest.TestCase):
             "org = TestOrg\nteam = TestTeam\nperson = tester\n", encoding="utf-8"
         )
 
+        # A gh that always fails, first on PATH, so no test reaches GitHub.
+        self.stub_bin = Path(self.tmp.name) / "stub-bin"
+        self.stub_bin.mkdir()
+        gh = self.stub_bin / "gh"
+        gh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        gh.chmod(0o755)
+
     def _env(self, store):
         e = os.environ.copy()
         e["HOME"] = str(self.home)
         e["AGENT_MEMORY_DIR"] = str(store)
+        e["PATH"] = str(self.stub_bin) + os.pathsep + e.get("PATH", "")
         return e
+
+    def _env_without_gh(self, store):
+        """PATH with only git and python3, so gh is not found at all."""
+        bare = Path(self.tmp.name) / "bare-bin"
+        bare.mkdir(exist_ok=True)
+        for name in ("git", "python3"):
+            target = bare / name
+            if not target.exists():
+                target.symlink_to(shutil.which(name))
+        e = self._env(store)
+        e["PATH"] = str(bare)
+        return e
+
+    def _land_bundles(self, store):
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((store / "inbox" / "git").glob("**/bundle.json"))
+        ]
 
     def _init_repo(self, store):
         r = Path(self.tmp.name) / "repo"
@@ -344,6 +371,97 @@ class AgentMemoryTest(unittest.TestCase):
         ]
         self.assertTrue(any("local only" in text for text in texts), texts)
 
+    def test_land_works_without_gh(self):
+        store = Path(self.tmp.name) / "store-nogh"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env_without_gh(store)
+        self._commit(repo, self._env(store), repo / "one.txt", "one")
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        texts = [bundle["draft"]["text"] for bundle in self._land_bundles(store)]
+        self.assertTrue(any("one" in text for text in texts), texts)
+
+    def test_land_messages_keep_no_nul(self):
+        store = Path(self.tmp.name) / "store-nul"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        self._commit(repo, env, repo / "one.txt", "one\n\nA body that mentions ---COMMIT--- once.")
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        texts = [bundle["draft"]["text"] for bundle in self._land_bundles(store)]
+        self.assertTrue(texts)
+        for text in texts:
+            self.assertNotIn("\x00", text)
+        self.assertTrue(any("mentions ---COMMIT--- once." in text for text in texts), texts)
+
+    def test_land_files_the_root_commit(self):
+        store = Path(self.tmp.name) / "store-root"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        bundles = self._land_bundles(store)
+        self.assertEqual(len(bundles), 1, bundles)
+        self.assertEqual(bundles[0]["land"]["commits"][0]["subject"], "init")
+        self.assertIn("README", bundles[0]["git"]["paths"])
+
+    def test_land_groups_commits_of_a_merge_commit_pr(self):
+        store = Path(self.tmp.name) / "store-mergepr"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=repo, check=True)
+        self._commit(repo, env, repo / "one.txt", "feature one")
+        self._commit(repo, env, repo / "two.txt", "feature two")
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+        self._commit(repo, env, repo / "main.txt", "on main meanwhile")
+        subprocess.run(
+            ["git", "merge", "-q", "--no-ff", "-m", "Merge pull request #7 from x/feature", "feature"],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        grouped = [b for b in self._land_bundles(store) if b["land"]["pull_request"] == 7]
+        self.assertEqual(len(grouped), 1, self._land_bundles(store))
+        subjects = [c["subject"] for c in grouped[0]["land"]["commits"]]
+        self.assertEqual(subjects, ["feature one", "feature two"])
+
+    def _approve_bundles(self, env):
+        """Approve every land bundle in a separate process, as the review page would."""
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import agent_memory as a\n"
+            "for bundle in a.bundles():\n"
+            "    draft = bundle['draft']\n"
+            "    a.approve(bundle, 'change', 'code', draft['text'], commit=draft['commit'])\n"
+        )
+        result = subprocess.run(["python3", "-c", script], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_land_does_not_refile_an_approved_pr(self):
+        store = Path(self.tmp.name) / "store-refile"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        self._commit(repo, env, repo / "one.txt", "part one (#5)")
+        self._commit(repo, env, repo / "two.txt", "part two (#5)")
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(len([b for b in self._land_bundles(store) if b["land"]["pull_request"] == 5]), 1)
+        self._approve_bundles(env)
+        kept = len(memory_rows(store))
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("no new bundles", result.stdout)
+        self.assertEqual(self._land_bundles(store), [])
+        self.assertEqual(len(memory_rows(store)), kept)
+
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_under_test",
@@ -372,6 +490,36 @@ class AgentMemoryTest(unittest.TestCase):
         approve = page.split('action="/approve"', 1)[1].split("</form>", 1)[0]
         self.assertIn('name="commit"', approve)
         self.assertIn(f'value="{sha}"', approve)
+
+    def test_review_form_checks_one_commit_without_a_draft_commit(self):
+        spec = importlib.util.spec_from_file_location(
+            "agent_memory_radio_test",
+            ROOT / "scripts" / "agent_memory.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        first, second = "a" * 40, "b" * 40
+        page = module.render_page(
+            [
+                {
+                    "session_id": "abc",
+                    "tool": "claude-code",
+                    "repo": "/tmp/repo",
+                    "ended_at": "2026-11-06T00:00:00+00:00",
+                    "draft": {"kind": "change", "domain": "code", "text": "hello"},
+                    "land": {
+                        "remote_repo": "github.com/example/proj",
+                        "commits": [{"sha": first, "subject": "one"}, {"sha": second, "subject": "two"}],
+                    },
+                    "last_assistant_message": "",
+                }
+            ],
+            False,
+        )
+        self.assertNotIn("True>", page)
+        self.assertNotIn("False>", page)
+        self.assertIn(f'value="{first}" checked>', page)
+        self.assertIn(f'value="{second}">', page)
 
     def test_embed_loads_memories_without_new_stamps(self):
         store = Path(self.tmp.name) / "embed-store"

@@ -74,7 +74,11 @@ def write_json(path, value):
 
 
 def git(command, cwd):
-    return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    """Run a command and never raise for a missing program (gh is optional)."""
+    try:
+        return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    except FileNotFoundError as error:
+        return subprocess.CompletedProcess(command, 127, "", str(error))
 
 
 def run(command, cwd=None):
@@ -548,7 +552,7 @@ def parse_since(value, default_hours):
 
 
 def commit_files(repo, sha):
-    listing = run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha], repo)
+    listing = run(["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", sha], repo)
     return [line.strip() for line in listing.splitlines() if line.strip()]
 
 
@@ -676,16 +680,18 @@ def commits_on_branch_since(repo, branch, since_iso):
             branch,
             f"--since={since_iso}",
             "--reverse",
-            "--pretty=format:%H%x00%ct%x00%B%x00---COMMIT---",
+            # Unit separator between fields, record separator after each commit.
+            # A commit message cannot end up holding either one.
+            "--pretty=format:%H%x1f%ct%x1f%B%x1e",
         ],
         repo,
     )
     commits = []
-    for block in listing.split("---COMMIT---"):
+    for block in listing.split("\x1e"):
         block = block.strip()
         if not block:
             continue
-        parts = block.split("\x00", 2)
+        parts = block.split("\x1f", 2)
         if len(parts) < 3:
             continue
         sha, ct_s, message = parts[0], parts[1], parts[2]
@@ -697,23 +703,50 @@ def commits_on_branch_since(repo, branch, since_iso):
     return commits
 
 
+def pr_numbers_from_merges(repo, merges):
+    """Map each commit a "Merge pull request #N" commit brought in to N.
+
+    The PR number is only on the merge commit, which land skips. The commits it
+    merged are the ones reachable from its second parent and not from its first.
+    """
+    found = {}
+    for item in merges:
+        prn = pr_from_commit_message(item["message"])
+        if prn is None:
+            continue
+        sha = item["sha"]
+        listing = run(["git", "rev-list", f"{sha}^1..{sha}^2"], repo)
+        for line in listing.splitlines():
+            member = line.strip()
+            if member:
+                found.setdefault(member, prn)
+    return found
+
+
 def build_land_groups(repo, commits):
-    """Split commits into single-parent only; group by PR number when present."""
+    """Split off merge commits; group the rest by PR number when present.
+
+    A root commit has no parent. It is filed like any single-parent commit.
+    """
     merges = []
     singles = []
     for item in commits:
         parents = run(["git", "rev-parse", f"{item['sha']}^@"], repo).split()
-        if len(parents) != 1:
+        if len(parents) > 1:
             merges.append(item)
             continue
         singles.append(item)
+
+    merged_by_pr = pr_numbers_from_merges(repo, merges)
 
     groups = []
     by_pr = {}
     orphan_singles = []
 
     for item in singles:
-        prn = pr_from_commit_message(item["message"])
+        prn = merged_by_pr.get(item["sha"])
+        if prn is None:
+            prn = pr_from_commit_message(item["message"])
         if prn is None:
             prn = gh_pr_for_sha(repo, item["sha"])
         if prn is not None:
@@ -811,12 +844,9 @@ def land(args):
     for group in groups:
         members = group["commits"]
         shas = [m["sha"] for m in members]
-        any_kept = False
-        for sha in shas:
-            if not memory_exists_for_commit(sha, remote_id):
-                any_kept = True
-                break
-        if not any_kept:
+        # Approve stores the group's tip only, and the group is approved as a
+        # whole. A group with any commit already kept is already explained.
+        if any(memory_exists_for_commit(sha, remote_id) for sha in shas):
             continue
 
         prn = group.get("pr")
@@ -1436,12 +1466,10 @@ def render_page(items, include_all):
             if commits:
                 radios = []
                 default_sha = (draft.get("commit") or "").strip()
-                for index, commit in enumerate(commits):
-                    checked = (
-                        " checked"
-                        if (default_sha and commit["sha"] == default_sha)
-                        else (not default_sha and index == 0)
-                    )
+                if not any(commit["sha"] == default_sha for commit in commits):
+                    default_sha = commits[0]["sha"]
+                for commit in commits:
+                    checked = " checked" if commit["sha"] == default_sha else ""
                     short = html.escape(commit["sha"][:10])
                     subj = html.escape(commit.get("subject") or "")
                     sha = html.escape(commit["sha"])
