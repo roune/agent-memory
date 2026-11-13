@@ -844,12 +844,9 @@ def land(args):
     for group in groups:
         members = group["commits"]
         shas = [m["sha"] for m in members]
-        any_kept = False
-        for sha in shas:
-            if not memory_exists_for_commit(sha, remote_id):
-                any_kept = True
-                break
-        if not any_kept:
+        # Approve stores the group's tip only, and the group is approved as a
+        # whole. A group with any commit already kept is already explained.
+        if any(memory_exists_for_commit(sha, remote_id) for sha in shas):
             continue
 
         prn = group.get("pr")

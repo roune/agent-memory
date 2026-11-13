@@ -431,6 +431,37 @@ class AgentMemoryTest(unittest.TestCase):
         subjects = [c["subject"] for c in grouped[0]["land"]["commits"]]
         self.assertEqual(subjects, ["feature one", "feature two"])
 
+    def _approve_bundles(self, env):
+        """Approve every land bundle in a separate process, as the review page would."""
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import agent_memory as a\n"
+            "for bundle in a.bundles():\n"
+            "    draft = bundle['draft']\n"
+            "    a.approve(bundle, 'change', 'code', draft['text'], commit=draft['commit'])\n"
+        )
+        result = subprocess.run(["python3", "-c", script], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_land_does_not_refile_an_approved_pr(self):
+        store = Path(self.tmp.name) / "store-refile"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        self._commit(repo, env, repo / "one.txt", "part one (#5)")
+        self._commit(repo, env, repo / "two.txt", "part two (#5)")
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(len([b for b in self._land_bundles(store) if b["land"]["pull_request"] == 5]), 1)
+        self._approve_bundles(env)
+        kept = len(memory_rows(store))
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("no new bundles", result.stdout)
+        self.assertEqual(self._land_bundles(store), [])
+        self.assertEqual(len(memory_rows(store)), kept)
+
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_under_test",
