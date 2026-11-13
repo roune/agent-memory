@@ -407,6 +407,17 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual(self.db.import_json(), 0)
         self.assertTrue(self.db.memory_exists_for_commit("f" * 40))
 
+    def test_embed_payload_carries_the_pointer(self):
+        a, b, c = "a" * 40, "b" * 40, "c" * 40
+        self.db.save_approved(self._change("pr", [a, b, c], pull_request=5))
+        self.db.save_approved(self._doc("note", "Platform", "Acme", "github.com/example/one", None))
+        embed = load_embed()
+        payloads = {doc["id"]: embed.payload_for(doc) for doc in self.db.pending_documents()}
+        self.assertEqual(payloads["person-change-pr"]["commits"], [a, b, c])
+        self.assertEqual(payloads["person-change-pr"]["pull_request"], 5)
+        self.assertEqual(payloads["person-learning-note"]["commits"], [])
+        self.assertNotIn("pull_request", payloads["person-learning-note"])
+
     def test_embed_ready_check_uses_the_configured_url(self):
         (self.home / ".config" / "agent-memory" / "database").write_text(
             "mode = shared\nqdrant_url = http://127.0.0.1:9\n",
