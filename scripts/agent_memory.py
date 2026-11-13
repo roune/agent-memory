@@ -1466,12 +1466,10 @@ def render_page(items, include_all):
             if commits:
                 radios = []
                 default_sha = (draft.get("commit") or "").strip()
-                for index, commit in enumerate(commits):
-                    checked = (
-                        " checked"
-                        if (default_sha and commit["sha"] == default_sha)
-                        else (not default_sha and index == 0)
-                    )
+                if not any(commit["sha"] == default_sha for commit in commits):
+                    default_sha = commits[0]["sha"]
+                for commit in commits:
+                    checked = " checked" if commit["sha"] == default_sha else ""
                     short = html.escape(commit["sha"][:10])
                     subj = html.escape(commit.get("subject") or "")
                     sha = html.escape(commit["sha"])

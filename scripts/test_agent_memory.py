@@ -491,6 +491,36 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertIn('name="commit"', approve)
         self.assertIn(f'value="{sha}"', approve)
 
+    def test_review_form_checks_one_commit_without_a_draft_commit(self):
+        spec = importlib.util.spec_from_file_location(
+            "agent_memory_radio_test",
+            ROOT / "scripts" / "agent_memory.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        first, second = "a" * 40, "b" * 40
+        page = module.render_page(
+            [
+                {
+                    "session_id": "abc",
+                    "tool": "claude-code",
+                    "repo": "/tmp/repo",
+                    "ended_at": "2026-11-06T00:00:00+00:00",
+                    "draft": {"kind": "change", "domain": "code", "text": "hello"},
+                    "land": {
+                        "remote_repo": "github.com/example/proj",
+                        "commits": [{"sha": first, "subject": "one"}, {"sha": second, "subject": "two"}],
+                    },
+                    "last_assistant_message": "",
+                }
+            ],
+            False,
+        )
+        self.assertNotIn("True>", page)
+        self.assertNotIn("False>", page)
+        self.assertIn(f'value="{first}" checked>', page)
+        self.assertIn(f'value="{second}">', page)
+
     def test_embed_loads_memories_without_new_stamps(self):
         store = Path(self.tmp.name) / "embed-store"
         memories = store / "memories"
