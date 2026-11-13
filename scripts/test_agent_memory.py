@@ -162,7 +162,9 @@ class AgentMemoryTest(unittest.TestCase):
         subprocess.run(["git", "add", "b.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "second commit"], cwd=repo, env=env, check=True)
 
-        self.assertEqual(len(memory_rows(store)), 1)
+        rows = memory_rows(store)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self._commit_rows(store), [(rows[0]["id"], self._head(repo))])
         self.assertEqual(list((store / "memories").glob("*.json")), [])
         inbox = store / "inbox" / "git"
         bundles = list(inbox.glob("**/bundle.json"))
@@ -461,6 +463,53 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertIn("no new bundles", result.stdout)
         self.assertEqual(self._land_bundles(store), [])
         self.assertEqual(len(memory_rows(store)), kept)
+
+    def _commit_rows(self, store):
+        import sqlite3
+
+        connection = sqlite3.connect(Path(store) / "data" / "memories.sqlite")
+        try:
+            return connection.execute(
+                "SELECT memory_id, sha FROM memory_commit ORDER BY memory_id, position"
+            ).fetchall()
+        finally:
+            connection.close()
+
+    def _head(self, repo):
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+    def test_approve_stores_every_commit_of_a_pr(self):
+        store = Path(self.tmp.name) / "store-pointer"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self._approve_bundles(env)
+        self._commit(repo, env, repo / "one.txt", "part one (#5)")
+        first = self._head(repo)
+        self._commit(repo, env, repo / "two.txt", "part two (#5)")
+        second = self._head(repo)
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self._approve_bundles(env)
+        rows = {row["commit_sha"]: row for row in memory_rows(store)}
+        self.assertEqual(rows[second]["pull_request"], 5)
+        pr_id = rows[second]["id"]
+        self.assertEqual(
+            [sha for memory_id, sha in self._commit_rows(store) if memory_id == pr_id],
+            [first, second],
+        )
+
+        # A third commit for the same PR files a bundle with only that commit.
+        self._commit(repo, env, repo / "three.txt", "part three (#5)")
+        third = self._head(repo)
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        bundles = self._land_bundles(store)
+        self.assertEqual(len(bundles), 1, bundles)
+        self.assertEqual([c["sha"] for c in bundles[0]["land"]["commits"]], [third])
+        self.assertNotEqual(bundles[0]["session_id"], rows[second]["session_id"])
 
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(

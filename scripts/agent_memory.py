@@ -842,12 +842,14 @@ def land(args):
     tool = "git"
     wrote = 0
     for group in groups:
-        members = group["commits"]
-        shas = [m["sha"] for m in members]
-        # Approve stores the group's tip only, and the group is approved as a
-        # whole. A group with any commit already kept is already explained.
-        if any(memory_exists_for_commit(sha, remote_id) for sha in shas):
+        # Approve stores every commit of a group, so a commit already kept is
+        # explained. A PR that grew past an earlier window files only the rest,
+        # under a new session id, so the kept memory is not overwritten.
+        members = [m for m in group["commits"] if not memory_exists_for_commit(m["sha"], remote_id)]
+        if not members:
             continue
+        group = dict(group, commits=members)
+        shas = [m["sha"] for m in members]
 
         prn = group.get("pr")
         group_key = f"pr-{prn}" if prn is not None else shas[0]
@@ -1296,6 +1298,26 @@ def drop(args):
     print(f"dropped {args.session_id}")
 
 
+def commits_for_change(bundle, commit):
+    """Commits and PR number a change stores: the pointer a later reader follows.
+
+    A land or git-hook bundle lists its commits. When the chosen commit is one of
+    them, the change explains all of them and the bundle's pull request. A
+    session bundle, or a commit picked from outside that list, stores just it.
+    """
+    land_meta = bundle.get("land") if isinstance(bundle.get("land"), dict) else {}
+    listed = [
+        str(item.get("sha") or "").strip()
+        for item in land_meta.get("commits") or []
+        if isinstance(item, dict) and str(item.get("sha") or "").strip()
+    ]
+    chosen = commit.lower()
+    if any(sha.lower() == chosen for sha in listed):
+        pull_request = land_meta.get("pull_request")
+        return listed, pull_request if isinstance(pull_request, int) else None
+    return [commit], None
+
+
 def approve(
     bundle,
     kind,
@@ -1352,10 +1374,13 @@ def approve(
     superseded_by = superseded_by.strip()
     updates = updates.strip()
 
+    commits = []
+    pull_request = None
     if kind == "change":
         commit = commit.strip()
         if len(commit) < 7 or any(char not in "0123456789abcdefABCDEF" for char in commit):
             raise ValueError("a change needs the commit it explains")
+        commits, pull_request = commits_for_change(bundle, commit)
 
     document = {
         "id": f"{person}-{kind}-{session_id}",
@@ -1372,6 +1397,9 @@ def approve(
     }
     if kind == "change":
         document["commit"] = commit
+        document["commits"] = commits
+        if pull_request is not None:
+            document["pull_request"] = pull_request
     if record:
         document["record"] = record
     if subject:
