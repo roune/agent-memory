@@ -21,6 +21,7 @@ COPY_COLUMNS = (
     "session_id",
     "text",
     "commit_sha",
+    "pull_request",
     "org",
     "team",
     "person",
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS memory (
   session_id TEXT NOT NULL,
   text TEXT NOT NULL,
   commit_sha TEXT NOT NULL DEFAULT '',
+  pull_request INTEGER,
   org TEXT NOT NULL,
   team TEXT NOT NULL,
   person TEXT NOT NULL,
@@ -76,7 +78,16 @@ CREATE INDEX IF NOT EXISTS memory_team_occurred ON memory (team, occurred_at);
 CREATE INDEX IF NOT EXISTS memory_org_occurred ON memory (org, occurred_at);
 CREATE INDEX IF NOT EXISTS memory_repo_occurred ON memory (repo, occurred_at);
 CREATE INDEX IF NOT EXISTS memory_commit_sha ON memory (commit_sha);
+CREATE TABLE IF NOT EXISTS memory_commit (
+  memory_id TEXT NOT NULL,
+  sha TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (memory_id, sha)
+);
+CREATE INDEX IF NOT EXISTS memory_commit_by_sha ON memory_commit (sha);
 """
+
+SCHEMA_VERSION = 2
 
 
 class StoreError(Exception):
@@ -199,8 +210,101 @@ def connect(path, create=True):
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.executescript(SCHEMA)
-    connection.execute("PRAGMA user_version=1")
+    _migrate(connection)
     return connection
+
+
+def _migrate(connection):
+    """Bring a file from before version 2 up to date. Safe to run every time.
+
+    Version 2 adds memory.pull_request and the memory_commit table, filled from
+    each row's commit_sha.
+    """
+    if connection.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if connection.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(memory)")}
+            if "pull_request" not in columns:
+                connection.execute("ALTER TABLE memory ADD COLUMN pull_request INTEGER")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_commit (memory_id, sha, position)
+                SELECT id, lower(trim(commit_sha)), 0 FROM memory
+                WHERE length(trim(commit_sha)) >= 7
+                """
+            )
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        connection.execute("COMMIT")
+    except sqlite3.Error:
+        connection.execute("ROLLBACK")
+        raise
+
+
+_HEX = frozenset("0123456789abcdef")
+
+
+def _sha(value):
+    text = _text(value).lower()
+    if len(text) < 7 or any(char not in _HEX for char in text):
+        return ""
+    return text
+
+
+def commit_list(document):
+    """Every commit a document explains, oldest first, tip last.
+
+    `commits` wins. A document with only `commit` (or `commit_sha`) has that one.
+    """
+    raw = document.get("commits")
+    items = list(raw) if isinstance(raw, (list, tuple)) else []
+    if not items:
+        items = [document.get("commit") if "commit" in document else document.get("commit_sha")]
+    found = []
+    for item in items:
+        sha = _sha(item)
+        if sha and sha not in found:
+            found.append(sha)
+    return found
+
+
+def _pull_request(value):
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _write_commits(connection, memory_id, commits):
+    connection.execute("DELETE FROM memory_commit WHERE memory_id = ?", (memory_id,))
+    connection.executemany(
+        "INSERT INTO memory_commit (memory_id, sha, position) VALUES (?, ?, ?)",
+        [(memory_id, sha, position) for position, sha in enumerate(commits)],
+    )
+
+
+def _commits_by_id(connection, ids):
+    found = {memory_id: [] for memory_id in ids}
+    if not found:
+        return found
+    for start in range(0, len(ids), 500):
+        chunk = list(ids[start:start + 500])
+        marks = ", ".join("?" for _ in chunk)
+        rows = connection.execute(
+            f"""
+            SELECT memory_id, sha FROM memory_commit
+            WHERE memory_id IN ({marks})
+            ORDER BY memory_id, position
+            """,
+            chunk,
+        ).fetchall()
+        for row in rows:
+            found[row["memory_id"]].append(row["sha"])
+    return found
 
 
 def _text(value):
@@ -226,6 +330,7 @@ def normalize_document(document, updated_at):
         "session_id": _text(document.get("session_id")),
         "text": _text(document.get("text")),
         "commit_sha": _text(document.get("commit") if "commit" in document else document.get("commit_sha")),
+        "pull_request": _pull_request(document.get("pull_request")),
         "org": _text(document.get("org")),
         "team": _text(document.get("team")),
         "person": _text(document.get("person")),
@@ -234,6 +339,9 @@ def normalize_document(document, updated_at):
     }
     for name in OPTIONAL_FIELDS:
         row[name] = _text(document.get(name))
+    row["commits"] = commit_list(document)
+    if not row["commit_sha"] and row["commits"]:
+        row["commit_sha"] = row["commits"][-1]
     return row
 
 
@@ -264,6 +372,7 @@ def save_approved(document):
     try:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(sql, values)
+        _write_commits(connection, row["id"], row["commits"])
         if row["supersedes"]:
             connection.execute(
                 "UPDATE memory SET superseded_by = ?, updated_at = ? WHERE id = ?",
@@ -279,8 +388,13 @@ def save_approved(document):
 
 
 def memory_exists_for_commit(sha, remote_id=None):
-    needle = (sha or "").strip().lower()
-    if len(needle) < 7:
+    """True when a kept row explains this commit.
+
+    A stored abbreviated hash matches the full id, and the other way around.
+    Both lookups use the memory_commit index.
+    """
+    needle = _sha(sha)
+    if not needle:
         return False
     try:
         path = local_db_path(remote_id if database_config()["mode"] == "per-repo" else None)
@@ -288,20 +402,23 @@ def memory_exists_for_commit(sha, remote_id=None):
         return False
     if not path.is_file():
         return False
+    prefixes = [needle[:size] for size in range(7, len(needle) + 1)]
+    marks = ", ".join("?" for _ in prefixes)
     connection = connect(path, create=False)
     try:
-        rows = connection.execute(
-            "SELECT commit_sha FROM memory WHERE length(commit_sha) >= 7"
-        ).fetchall()
+        # Every hex string that starts with needle sorts between needle and
+        # needle + "g", because "g" is above every hex digit.
+        found = connection.execute(
+            f"""
+            SELECT 1 FROM memory_commit
+            WHERE sha IN ({marks}) OR (sha > ? AND sha < ?)
+            LIMIT 1
+            """,
+            [*prefixes, needle, needle + "g"],
+        ).fetchone()
     finally:
         connection.close()
-    for stored_row in rows:
-        stored = (stored_row["commit_sha"] or "").strip().lower()
-        if len(stored) < 7:
-            continue
-        if needle.startswith(stored) or stored.startswith(needle):
-            return True
-    return False
+    return found is not None
 
 
 def _reject_blank(name, value):
@@ -367,9 +484,9 @@ def query_memories(
         return []
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
-        SELECT id, kind, domain, repo, tool, session_id, commit_sha, text,
-               org, team, person, occurred_at, record, subject, alarm, look_at,
-               supersedes, superseded_by, updates
+        SELECT id, kind, domain, repo, tool, session_id, commit_sha, pull_request,
+               text, org, team, person, occurred_at, record, subject, alarm,
+               look_at, supersedes, superseded_by, updates
         FROM memory
         {where}
         ORDER BY occurred_at DESC
@@ -378,12 +495,13 @@ def query_memories(
     connection = connect(path, create=False)
     try:
         rows = connection.execute(sql, [*params, limit, offset]).fetchall()
+        commits = _commits_by_id(connection, [row["id"] for row in rows])
     finally:
         connection.close()
-    return [hit_from_row(row) for row in rows]
+    return [hit_from_row(row, commits[row["id"]]) for row in rows]
 
 
-def hit_from_row(row):
+def hit_from_row(row, commits=None):
     hit = {
         "document_id": row["id"],
         "kind": row["kind"],
@@ -392,6 +510,8 @@ def hit_from_row(row):
         "tool": row["tool"],
         "session_id": row["session_id"],
         "commit": row["commit_sha"] or "",
+        "commits": list(commits or []),
+        "pull_request": row["pull_request"],
         "text": row["text"],
         "org": row["org"] or "",
         "team": row["team"] or "",
@@ -405,7 +525,7 @@ def hit_from_row(row):
     return hit
 
 
-def document_from_row(row):
+def document_from_row(row, commits=None):
     """Shape scripts/embed.py already upserts, plus updated_at for the bookkeeping."""
     document = {
         "id": row["id"],
@@ -416,11 +536,14 @@ def document_from_row(row):
         "session_id": row["session_id"],
         "text": row["text"],
         "commit": row["commit_sha"] or "",
+        "commits": list(commits or []),
         "org": row["org"] or "",
         "team": row["team"] or "",
         "person": row["person"] or "",
         "updated_at": row["updated_at"],
     }
+    if row["pull_request"] is not None:
+        document["pull_request"] = row["pull_request"]
     if row["occurred_at"]:
         document["occurred_at"] = row["occurred_at"]
     for name in OPTIONAL_FIELDS:
@@ -445,9 +568,10 @@ def pending_documents(remote_id=None, repo_filter=None, rebuild=False):
     connection = connect(path, create=False)
     try:
         rows = connection.execute(f"SELECT * FROM memory{where}", params).fetchall()
+        commits = _commits_by_id(connection, [row["id"] for row in rows])
     finally:
         connection.close()
-    return [document_from_row(row) for row in rows]
+    return [document_from_row(row, commits[row["id"]]) for row in rows]
 
 
 def mark_embedded(pairs, remote_id=None):
@@ -538,7 +662,7 @@ def flush(remote_id=None):
                     (row["id"],),
                 ).fetchone()
                 if current is None or current["updated_at"] < row["updated_at"]:
-                    _upsert_shared(shared, row)
+                    _upsert_shared(shared, row, _commits_by_id(local, [row["id"]])[row["id"]])
                     applied.append(row)
                 elif _content(current) == _content(row):
                     applied.append(row)
@@ -571,7 +695,7 @@ def flush(remote_id=None):
     return 0
 
 
-def _upsert_shared(connection, row):
+def _upsert_shared(connection, row, commits):
     columns = ", ".join(COPY_COLUMNS)
     placeholders = ", ".join("?" for _ in COPY_COLUMNS)
     assignments = ", ".join(f"{name}=excluded.{name}" for name in COPY_COLUMNS if name != "id")
@@ -583,6 +707,7 @@ def _upsert_shared(connection, row):
         """,
         [row[name] for name in COPY_COLUMNS],
     )
+    _write_commits(connection, row["id"], commits)
 
 
 def memories_json_dir():
@@ -675,6 +800,7 @@ def import_json():
                     f"INSERT INTO memory ({columns}) VALUES ({placeholders})",
                     [row[name] for name in COPY_COLUMNS],
                 )
+                _write_commits(connection, row["id"], row["commits"])
                 inserted += 1
             connection.execute("COMMIT")
         except sqlite3.Error as error:
