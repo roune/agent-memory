@@ -592,6 +592,43 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertIn('name="commit"', approve)
         self.assertIn(f'value="{sha}"', approve)
 
+    def test_review_page_shows_the_pointer_of_a_land_bundle(self):
+        spec = importlib.util.spec_from_file_location(
+            "agent_memory_pointer_test",
+            ROOT / "scripts" / "agent_memory.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        first, second = "1" * 40, "2" * 40
+        item = {
+            "session_id": "land-x",
+            "tool": "git",
+            "repo": "/tmp/repo",
+            "ended_at": "2026-11-06T00:00:00+00:00",
+            "draft": {"kind": "change", "domain": "code", "text": "short", "commit": second},
+            "land": {
+                "remote_repo": "github.com/example/proj",
+                "pull_request": 5,
+                "hint": "Unusual vs rest of group: touched one.txt",
+                "commits": [{"sha": first, "subject": "one"}, {"sha": second, "subject": "two"}],
+            },
+            "last_assistant_message": "",
+        }
+        page = module.render_page([item], False)
+        approve = page.split('action="/approve"', 1)[1].split("</form>", 1)[0]
+        self.assertIn(first[:10], approve)
+        self.assertIn(second[:10], approve)
+        self.assertIn("gh pr view 5 -R github.com/example/proj", approve)
+        self.assertIn(f"git show --stat {first[:12]} {second[:12]}", approve)
+        self.assertIn("touched one.txt", approve)
+        self.assertNotIn('type="radio"', approve)
+        self.assertEqual(approve.count('name="commit"'), 1)
+        self.assertIn(f'<input type="hidden" name="commit" value="{second}">', approve)
+        self.assertNotIn("This text is long", page)
+
+        item["draft"]["text"] = "x" * 2000
+        self.assertIn("This text is long", module.render_page([item], False))
+
     def test_review_form_checks_one_commit_without_a_draft_commit(self):
         spec = importlib.util.spec_from_file_location(
             "agent_memory_radio_test",

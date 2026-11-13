@@ -1480,6 +1480,8 @@ PAGE = """<!DOCTYPE html>
   select { font: inherit; }
   button { font: inherit; margin-right: 0.4rem; margin-top: 0.8rem; }
   a { color: #1d4ed8; }
+  code { font-family: ui-monospace, monospace; font-size: 0.88rem; overflow-wrap: anywhere; }
+  ul.commits { margin: 0.3rem 0; padding-left: 1.2rem; }
 </style>
 </head>
 <body>
@@ -1489,6 +1491,40 @@ __ITEMS__
 </body>
 </html>
 """
+
+
+# About 512 bge-small tokens of English prose.
+LONG_TEXT_CHARS = 1800
+
+
+def pointer_block(commits, draft, land_meta):
+    """The commits a land or hook bundle stores, and how to read them in git.
+
+    Approve stores all of them, so they are listed, not offered as a choice.
+    """
+    shas = [commit["sha"] for commit in commits]
+    tip = (draft.get("commit") or "").strip()
+    if tip not in shas:
+        tip = shas[-1]
+    items = "".join(
+        f'<li><code>{html.escape(commit["sha"][:10])}</code> {html.escape(commit.get("subject") or "")}</li>'
+        for commit in commits
+    )
+    pull_request = land_meta.get("pull_request")
+    legend = f"Pull request #{pull_request}" if isinstance(pull_request, int) else "Commits"
+    commands = ["git show --stat " + " ".join(sha[:12] for sha in shas)]
+    if isinstance(pull_request, int):
+        remote = (land_meta.get("remote_repo") or "").strip()
+        commands.append(f"gh pr view {pull_request}" + (f" -R {remote}" if remote else ""))
+    read = " · ".join(f"<code>{html.escape(command)}</code>" for command in commands)
+    hint = (land_meta.get("hint") or "").strip()
+    hint_block = f'<p class="meta">{html.escape(hint)}</p>' if hint else ""
+    return (
+        f'<fieldset><legend>{html.escape(legend)}</legend><ul class="commits">{items}</ul></fieldset>'
+        f'<input type="hidden" name="commit" value="{html.escape(tip)}">'
+        f'<p class="meta">The memory stores these commits, not their diff. Read them in git: {read}</p>'
+        f"{hint_block}"
+    )
 
 
 def select_options(choices, selected):
@@ -1529,7 +1565,9 @@ def render_page(items, include_all):
                 kind = "change"
             else:
                 kind = "learning"
-            if commits:
+            if commits and item.get("tool") == "git":
+                commit_block = pointer_block(commits, draft, land_meta)
+            elif commits:
                 radios = []
                 default_sha = (draft.get("commit") or "").strip()
                 if not any(commit["sha"] == default_sha for commit in commits):
@@ -1550,6 +1588,12 @@ def render_page(items, include_all):
             if message:
                 message_block = f"<pre>{html.escape(message[:4000])}</pre>"
             text_label = "Context of this commit" if kind == "change" else "Keep this text"
+            long_note = ""
+            if len(draft.get("text") or "") > LONG_TEXT_CHARS:
+                long_note = (
+                    '<p class="meta">This text is long. The embedding reads only about '
+                    "the first 512 tokens. Trim it, or keep what matters first.</p>"
+                )
             iden = read_identity()
             rr_default = (land_meta.get("remote_repo") or "").strip()
             org_d = html.escape(iden.get("org") or "")
@@ -1584,7 +1628,7 @@ def render_page(items, include_all):
                 f"""<article>
 <p><strong>{html.escape(item.get("repo") or "")}</strong></p>
 <p class="meta">{tool} · {sid} · {html.escape(item.get("ended_at") or "")}</p>
-<p class="meta">A change stores the context of the commit you pick. The diff stays in git.</p>
+<p class="meta">A change stores the context of its commits. The diff stays in git.</p>
 <form method="post" action="/approve">
 <input type="hidden" name="session_id" value="{sid}">
 <input type="hidden" name="tool" value="{tool}">
@@ -1594,6 +1638,7 @@ def render_page(items, include_all):
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
 {extra_fields}
 <label>{text_label} <textarea name="text">{draft_text}</textarea></label>
+{long_note}
 <button type="submit">Approve</button>
 </form>
 <form method="post" action="/reject">
