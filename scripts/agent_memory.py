@@ -74,7 +74,11 @@ def write_json(path, value):
 
 
 def git(command, cwd):
-    return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    """Run a command and never raise for a missing program (gh is optional)."""
+    try:
+        return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    except FileNotFoundError as error:
+        return subprocess.CompletedProcess(command, 127, "", str(error))
 
 
 def run(command, cwd=None):

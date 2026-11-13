@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -50,11 +51,37 @@ class AgentMemoryTest(unittest.TestCase):
             "org = TestOrg\nteam = TestTeam\nperson = tester\n", encoding="utf-8"
         )
 
+        # A gh that always fails, first on PATH, so no test reaches GitHub.
+        self.stub_bin = Path(self.tmp.name) / "stub-bin"
+        self.stub_bin.mkdir()
+        gh = self.stub_bin / "gh"
+        gh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        gh.chmod(0o755)
+
     def _env(self, store):
         e = os.environ.copy()
         e["HOME"] = str(self.home)
         e["AGENT_MEMORY_DIR"] = str(store)
+        e["PATH"] = str(self.stub_bin) + os.pathsep + e.get("PATH", "")
         return e
+
+    def _env_without_gh(self, store):
+        """PATH with only git and python3, so gh is not found at all."""
+        bare = Path(self.tmp.name) / "bare-bin"
+        bare.mkdir(exist_ok=True)
+        for name in ("git", "python3"):
+            target = bare / name
+            if not target.exists():
+                target.symlink_to(shutil.which(name))
+        e = self._env(store)
+        e["PATH"] = str(bare)
+        return e
+
+    def _land_bundles(self, store):
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((store / "inbox" / "git").glob("**/bundle.json"))
+        ]
 
     def _init_repo(self, store):
         r = Path(self.tmp.name) / "repo"
@@ -343,6 +370,17 @@ class AgentMemoryTest(unittest.TestCase):
             for path in (store / "inbox" / "git").glob("**/bundle.json")
         ]
         self.assertTrue(any("local only" in text for text in texts), texts)
+
+    def test_land_works_without_gh(self):
+        store = Path(self.tmp.name) / "store-nogh"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env_without_gh(store)
+        self._commit(repo, self._env(store), repo / "one.txt", "one")
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        texts = [bundle["draft"]["text"] for bundle in self._land_bundles(store)]
+        self.assertTrue(any("one" in text for text in texts), texts)
 
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
