@@ -171,41 +171,10 @@ class MemoryStoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.query_memories(team="  ")
 
-    def test_import_moves_json_once_and_does_not_overwrite(self):
-        folder = self.store / "memories"
-        folder.mkdir()
-        document = self._doc("old", "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00")
-        (folder / "person-learning-old.json").write_text(json.dumps(document), encoding="utf-8")
-        (folder / "bad.json").write_text("{", encoding="utf-8")
-        self.assertEqual(self.db.import_json(), 0)
-        self.assertTrue(folder.is_dir())
-        self.assertTrue((folder / "bad.json").is_file())
-        rows = self._rows(self.store / "data" / "memories.sqlite")
-        self.assertEqual(len(rows), 1)
-        (folder / "bad.json").unlink()
-        self.assertEqual(self.db.import_json(), 0)
-        self.assertFalse(folder.exists())
-        self.assertTrue((self.store / "memories.imported").is_dir())
-        connection = sqlite3.connect(self.store / "data" / "memories.sqlite")
-        connection.execute("UPDATE memory SET text = 'kept' WHERE id = 'person-learning-old'")
-        connection.commit()
-        connection.close()
-        again = self.store / "memories"
-        again.mkdir()
-        document["text"] = "replaced"
-        (again / "person-learning-old.json").write_text(json.dumps(document), encoding="utf-8")
-        self.assertEqual(self.db.import_json(), 0)
-        rows = self._rows(self.store / "data" / "memories.sqlite")
-        self.assertEqual(rows[0]["text"], "kept")
-        self.assertEqual(self.db.import_json(), 0)
-
     def test_missing_occurred_at_does_not_match_since(self):
-        folder = self.store / "memories"
-        folder.mkdir()
         document = self._doc("bare", "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00")
         del document["occurred_at"]
-        (folder / "person-learning-bare.json").write_text(json.dumps(document), encoding="utf-8")
-        self.db.import_json()
+        self.db.save_approved(document)
         hits = self.db.query_memories(team="Platform", since="2020-01-01T00:00:00+00:00")
         self.assertEqual(hits, [])
 
@@ -397,15 +366,6 @@ class MemoryStoreTest(unittest.TestCase):
             [("person-change-pr", a, 0), ("person-change-pr", b, 1)],
         )
         self.assertEqual(self._rows(shared)[0]["pull_request"], 9)
-
-    def test_import_writes_commit_rows(self):
-        folder = self.store / "memories"
-        folder.mkdir()
-        document = self._change("imported", ["f" * 40])
-        del document["commits"]
-        (folder / f"{document['id']}.json").write_text(json.dumps(document), encoding="utf-8")
-        self.assertEqual(self.db.import_json(), 0)
-        self.assertTrue(self.db.memory_exists_for_commit("f" * 40))
 
     def test_embed_payload_carries_the_pointer(self):
         a, b, c = "a" * 40, "b" * 40, "c" * 40

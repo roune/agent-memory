@@ -309,6 +309,8 @@ _GENERATED_RE = re.compile(r"^\s*\W*\s*Generated with \[?Claude Code", re.IGNORE
 _BARE_URL_RE = re.compile(r"^\s*<?https?://\S+>?\s*$")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _SQUASH_SUFFIX_RE = re.compile(r"\s*\(#\d+\)\s*$")
+# A paragraph that is only a rule, like the "---------" GitHub puts before squash trailers.
+_RULE_RE = re.compile(r"^(?:[-=*_]{3,}\s*)+$")
 
 
 def _paragraphs(text):
@@ -337,8 +339,8 @@ def _drop_generated_footer(paragraphs):
 
 
 def clean_message(message):
-    """A commit message without NUL, trailers, or a generated-with footer."""
-    paragraphs = _drop_generated_footer(_paragraphs(message))
+    """A commit message without NUL, trailers, rule lines, or a generated-with footer."""
+    paragraphs = [p for p in _drop_generated_footer(_paragraphs(message)) if not _RULE_RE.match(p)]
     if len(paragraphs) > 1 and all(_TRAILER_RE.match(line) for line in paragraphs[-1].splitlines()):
         paragraphs = paragraphs[:-1]
     return "\n\n".join(paragraphs)
@@ -405,7 +407,7 @@ def hook_commit_shas(repo, event, head):
 
 
 def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve):
-    if memory_exists_for_commit(sha, remote_id):
+    if commit_settled(sha, remote_id):
         return
     msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
     group = single_commit_hook_group(repo_s, sha, msg)
@@ -595,26 +597,6 @@ def commit_files(repo, sha):
     return [line.strip() for line in listing.splitlines() if line.strip()]
 
 
-def unusual_path_hint(repo, shas):
-    if len(shas) < 2:
-        return ""
-    path_sets = []
-    for sha in shas:
-        path_sets.append(set(commit_files(repo, sha)))
-    union = set().union(*path_sets)
-    common = set.intersection(*path_sets) if path_sets else set()
-    unusual = union - common
-    if unusual:
-        sample = sorted(unusual)[0]
-        return f"Unusual vs rest of group: touched {sample}"
-    if len(shas) == 2:
-        a, b = path_sets[0], path_sets[1]
-        diff = sorted((a ^ b))
-        if diff:
-            return f"Unusual vs the other commit: only {diff[0]}"
-    return ""
-
-
 _GITHUB_MERGE_RE = re.compile(r"^Merge pull request #(\d+)", re.IGNORECASE)
 _SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
 
@@ -703,6 +685,21 @@ def memory_exists_for_commit(sha, remote_id=None):
     Sharing the first 7 hex digits is not enough: that skipped unrelated commits.
     """
     return memory_store.memory_exists_for_commit(sha, remote_id)
+
+
+def commit_settled(sha, remote_id=None):
+    """True when review already decided this commit: kept in a row, or rejected."""
+    return memory_exists_for_commit(sha, remote_id) or memory_store.commit_rejected(sha, remote_id)
+
+
+def reject_bundle(bundle):
+    """Remember a git bundle's commits as rejected, then delete the bundle."""
+    land = bundle.get("land") or {}
+    shas = [str(c.get("sha") or "") for c in land.get("commits") or [] if isinstance(c, dict)]
+    if bundle.get("tool") == "git" and shas:
+        remote_id = (land.get("remote_repo") or "").strip() or git_remote_repo_id(str(bundle.get("repo") or ""))
+        memory_store.reject_commits(remote_id, shas)
+    shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
 
 
 def default_branch_tip(repo):
@@ -815,7 +812,7 @@ def build_land_groups(repo, commits):
 def draft_text_for_group(repo, group):
     """PR title and description, then each commit message, each said once.
 
-    The PR number, shas, repo id, and path hint are stored beside the text, so
+    The PR number, shas, and repo id are stored beside the text, so
     they are not repeated in what gets embedded.
     """
     parts = []
@@ -880,9 +877,10 @@ def land(args):
     wrote = 0
     for group in groups:
         # Approve stores every commit of a group, so a commit already kept is
-        # explained. A PR that grew past an earlier window files only the rest,
-        # under a new session id, so the kept memory is not overwritten.
-        members = [m for m in group["commits"] if not memory_exists_for_commit(m["sha"], remote_id)]
+        # explained, and Reject remembers its commits. A PR that grew past an
+        # earlier window files only the rest, under a new session id, so the
+        # kept memory is not overwritten.
+        members = [m for m in group["commits"] if not commit_settled(m["sha"], remote_id)]
         if not members:
             continue
         group = dict(group, commits=members)
@@ -925,7 +923,6 @@ def land(args):
             "land": {
                 "remote_repo": remote_id,
                 "pull_request": prn,
-                "hint": unusual_path_hint(str(repo), shas),
                 "commits": [
                     {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
                     for m in members
@@ -940,7 +937,7 @@ def land(args):
     if wrote:
         print(f"land: wrote {wrote} bundle(s) under {inbox_root() / tool}")
     else:
-        print("land: no new bundles (nothing to file or all commits already kept)")
+        print("land: no new bundles (nothing to file or all commits already kept or rejected)")
     return 0
 
 
@@ -1375,7 +1372,8 @@ def approve(
     superseded_by="",
     updates="",
 ):
-    text = text.strip()
+    # A browser submits a textarea's line breaks as CRLF. Store LF.
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if kind not in KINDS or domain not in DOMAINS or not text:
         raise ValueError("kind, domain, and text are required")
     repo_path = str(bundle.get("repo") or "").strip()
@@ -1517,13 +1515,10 @@ def pointer_block(commits, draft, land_meta):
         remote = (land_meta.get("remote_repo") or "").strip()
         commands.append(f"gh pr view {pull_request}" + (f" -R {remote}" if remote else ""))
     read = " · ".join(f"<code>{html.escape(command)}</code>" for command in commands)
-    hint = (land_meta.get("hint") or "").strip()
-    hint_block = f'<p class="meta">{html.escape(hint)}</p>' if hint else ""
     return (
         f'<fieldset><legend>{html.escape(legend)}</legend><ul class="commits">{items}</ul></fieldset>'
         f'<input type="hidden" name="commit" value="{html.escape(tip)}">'
         f'<p class="meta">The memory stores these commits, not their diff. Read them in git: {read}</p>'
-        f"{hint_block}"
     )
 
 
@@ -1712,7 +1707,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     updates=form.get("updates", ""),
                 )
             elif path == "/reject":
-                shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
+                reject_bundle(bundle)
             else:
                 self._send(404, "not found")
                 return
@@ -2151,13 +2146,6 @@ def flush_cmd(args):
         raise SystemExit(str(error)) from error
 
 
-def import_json(args):
-    try:
-        return memory_store.import_json()
-    except memory_store.StoreError as error:
-        raise SystemExit(str(error)) from error
-
-
 def build_parser():
     parser = argparse.ArgumentParser(prog="agent-memory")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2280,9 +2268,6 @@ def build_parser():
         help="per-repo remote id or checkout; ignored in shared mode",
     )
     flush_parser.set_defaults(func=flush_cmd)
-
-    import_parser = sub.add_parser("import-json", help="load memories/*.json into SQLite once")
-    import_parser.set_defaults(func=import_json)
     return parser
 
 
