@@ -4,7 +4,7 @@ How someone installs capture into Cursor, Claude Code, Codex, and Pi, and how th
 
 ## The seam
 
-The hook never opens the database. A later embed script reads approved documents and writes `data/`. Those documents are the source of truth, so the engine chosen in the other session can change without a new hook.
+The hook never opens the database. Approve writes a row in `data/memories.sqlite`, and the embed script reads those rows into Qdrant. The rows are the source of truth, so the engine chosen in the other session can change without a new hook.
 
 ```
 user-level hook or Pi extension
@@ -67,7 +67,7 @@ The hook does not ask. Cursor `sessionEnd` ignores the response. Claude Code `Se
 
 Review opens in the browser. `agent-memory review` starts a process bound to `127.0.0.1` and a chosen port, then opens `http://127.0.0.1:<port>`. If that process is already running, the command only opens the URL. Cursor, Claude Code, Codex, and Pi do the same: a command or a link to that address. They do not each draw their own form.
 
-The page lists each offered session. A `change` asks for the context of one commit and stores that commit. The diff stays in git. A `learning` or `decision` asks for the note itself. The text can be edited before approval, which is the redaction step. Approve writes that document. Reject drops the bundle. The transcript stays out of the index either way.
+The page lists each offered session. A `change` asks for the context of one commit and stores that commit. The diff stays in git. A `learning` or `decision` asks for the note itself. The text can be edited before approval, which is the redaction step. Approve writes that document. Reject drops the bundle, and for a git bundle it remembers the commits so `land` and the git hooks do not offer them again. The transcript stays out of the index either way.
 
 The end hook does not start this process and does not open the browser. Capture still writes the inbox and returns.
 
@@ -105,8 +105,7 @@ agent-memory          capture, review, install, uninstall
 adapters/             cursor, claude-code, codex shell snippets
 adapters/pi/          extension that shells out to capture
 inbox/                gitignored bundles
-memories/             approved documents, the source of truth
-data/                 gitignored vector index, created by the embed script
+data/                 gitignored: memories.sqlite (approved documents, the source of truth) and the vector index
 ```
 
 `capture` and `review` can land on their own. `scripts/embed` writes vectors for approved documents to the Qdrant server `scripts/setup` starts. Hooks stay pointed at `capture` either way.

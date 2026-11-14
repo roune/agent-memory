@@ -1,16 +1,11 @@
-# Derived index and local captures. Approved memory documents are the
-# source of truth; the vector database is rebuilt from them.
+# Approved memories (data/memories.sqlite, the source of truth), the
+# vector index rebuilt from them, and local captures. They stay on this machine.
 data/
 
 # Session captures and transcripts. These can contain secrets and
 # unredacted conversation. Review happens before anything is kept.
 inbox/
 transcripts/
-
-# Approved memories. They stay on this machine and are not published.
-# The source of truth is data/memories.sqlite. memories/ is only the old JSON folder.
-memories/
-memories.imported/
 
 # Bytecode from local runs of the CLI.
 __pycache__/

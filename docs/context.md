@@ -77,7 +77,7 @@ setup and embed script
 
 ```
 post-commit / post-merge
-  -> inbox bundle (tool: git), draft = commit message only; or auto-approve into memories/ when configured
+  -> inbox bundle (tool: git), draft = commit message only; or auto-approve into data/memories.sqlite when configured
 ```
 
 **Default-branch commits in another repo:**
@@ -86,10 +86,10 @@ post-commit / post-merge
 agent-memory land <path-to-repo> [--since …]
   -> inbox bundles under inbox/git/ (one per PR group or orphan commit), draft prefilled
 agent-memory review
-  -> same approve/reject flow; nothing is written to memories/ until Approve
+  -> same approve/reject flow; nothing is written to data/memories.sqlite until Approve
 ```
 
-`land` lists commits on that clone’s local default branch since `--since` (default: 24 hours before now). The branch name comes from `origin/HEAD` when that local branch exists; otherwise `main` or `master`. It does not read the remote-tracking ref, so unpushed local commits are included. It skips merge commits and groups single-parent commits by pull request when it can tell the PR (merge/squash message lines, or `gh pr list` when `gh` is available and authenticated). It uses file names across the group to add a short “unusual vs the rest” hint — it does not store diffs. PR title/body and each commit message seed `draft.text`. Bundles use `tool` `git` and a stable `session_id` derived from the group.
+`land` lists commits on that clone’s local default branch since `--since` (default: 24 hours before now). The branch name comes from `origin/HEAD` when that local branch exists; otherwise `main` or `master`. It does not read the remote-tracking ref, so unpushed local commits are included. It skips merge commits and groups single-parent commits by pull request when it can tell the PR (merge/squash message lines, or `gh pr list` when `gh` is available and authenticated). It does not store diffs. PR title/body and each commit message seed `draft.text`. Bundles use `tool` `git` and a stable `session_id` derived from the group.
 
 The hook writes the inbox bundle and returns. It does not prompt. End hooks cannot reliably stop the session and wait for a choice:
 
@@ -97,7 +97,7 @@ The hook writes the inbox bundle and returns. It does not prompt. End hooks cann
 - Codex `SessionEnd` is advisory and capped at about 3 seconds.
 - Transcript files are sometimes missing or stale by the time `SessionEnd` runs.
 
-The review command is where the person decides to keep nothing, the change summary, the learnings, or specific slices. Approve stamps `org`, `team`, `person`, `occurred_at`, and the remote `repo` id, then writes `memories/<person>-<kind>-<session_id>.json` and deletes the inbox folder. If you set `supersedes` to an existing document id, the old file gets `superseded_by` set to this document’s id.
+The review command is where the person decides to keep nothing, the change summary, the learnings, or specific slices. Approve stamps `org`, `team`, `person`, `occurred_at`, and the remote `repo` id, then writes the row `<person>-<kind>-<session_id>` in `data/memories.sqlite` and deletes the inbox folder. Reject deletes the bundle and, for git bundles, remembers its commits so they are not offered again. If you set `supersedes` to an existing document id, the old row gets `superseded_by` set to this document’s id.
 
 ## Hooks, once they exist
 

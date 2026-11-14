@@ -1,7 +1,7 @@
 """Embed approved memories from the local SQLite store into Qdrant.
 
 Reads the memory table. Talks to the configured Qdrant URL over HTTP.
-Does not open data/qdrant and does not read memories/*.json.
+Does not open data/qdrant.
 """
 
 import argparse
