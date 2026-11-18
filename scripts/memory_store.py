@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS memory_commit (
   PRIMARY KEY (memory_id, sha)
 );
 CREATE INDEX IF NOT EXISTS memory_commit_by_sha ON memory_commit (sha);
+CREATE TABLE IF NOT EXISTS rejected_commit (
+  repo TEXT NOT NULL,
+  sha TEXT NOT NULL,
+  rejected_at TEXT NOT NULL,
+  PRIMARY KEY (repo, sha)
+);
 """
 
 SCHEMA_VERSION = 2
@@ -96,10 +102,6 @@ class StoreError(Exception):
 
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def iso_from_timestamp(stamp):
-    return datetime.fromtimestamp(stamp, tz=timezone.utc).replace(microsecond=0).isoformat()
 
 
 def repo_root():
@@ -393,6 +395,11 @@ def memory_exists_for_commit(sha, remote_id=None):
     A stored abbreviated hash matches the full id, and the other way around.
     Both lookups use the memory_commit index.
     """
+    return _commit_in("memory_commit", sha, remote_id)
+
+
+def _commit_in(table, sha, remote_id, repo=None):
+    """True when `table` has this commit, matching abbreviated hashes either way."""
     needle = _sha(sha)
     if not needle:
         return False
@@ -404,21 +411,52 @@ def memory_exists_for_commit(sha, remote_id=None):
         return False
     prefixes = [needle[:size] for size in range(7, len(needle) + 1)]
     marks = ", ".join("?" for _ in prefixes)
+    where_repo = "" if repo is None else "repo = ? AND "
+    params = ([] if repo is None else [repo]) + [*prefixes, needle, needle + "g"]
     connection = connect(path, create=False)
     try:
         # Every hex string that starts with needle sorts between needle and
         # needle + "g", because "g" is above every hex digit.
         found = connection.execute(
             f"""
-            SELECT 1 FROM memory_commit
-            WHERE sha IN ({marks}) OR (sha > ? AND sha < ?)
+            SELECT 1 FROM {table}
+            WHERE {where_repo}(sha IN ({marks}) OR (sha > ? AND sha < ?))
             LIMIT 1
             """,
-            [*prefixes, needle, needle + "g"],
+            params,
         ).fetchone()
     finally:
         connection.close()
     return found is not None
+
+
+def reject_commits(remote_id, shas):
+    """Remember commits a person rejected in review, so land and hooks skip them."""
+    repo = _text(remote_id)
+    found = [sha for sha in (_sha(item) for item in shas) if sha]
+    if not found:
+        return 0
+    path = local_db_path(repo if database_config()["mode"] == "per-repo" else None)
+    stamp = utc_now()
+    connection = connect(path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.executemany(
+            "INSERT OR REPLACE INTO rejected_commit (repo, sha, rejected_at) VALUES (?, ?, ?)",
+            [(repo, sha, stamp) for sha in found],
+        )
+        connection.execute("COMMIT")
+    except sqlite3.Error as error:
+        connection.execute("ROLLBACK")
+        raise StoreError(f"could not record rejection: {error}") from error
+    finally:
+        connection.close()
+    return len(found)
+
+
+def commit_rejected(sha, remote_id=None):
+    """True when this commit of this remote was rejected in review."""
+    return _commit_in("rejected_commit", sha, remote_id, repo=_text(remote_id))
 
 
 def _reject_blank(name, value):
@@ -708,114 +746,3 @@ def _upsert_shared(connection, row, commits):
         [row[name] for name in COPY_COLUMNS],
     )
     _write_commits(connection, row["id"], commits)
-
-
-def memories_json_dir():
-    return store_root() / "memories"
-
-
-def import_json():
-    """Load memories/*.json once. Existing ids stay as the SQL row."""
-    source = memories_json_dir()
-    if not source.is_dir():
-        print("no memories directory")
-        return 0
-    files = sorted(source.glob("*.json"))
-    if not files:
-        print("no json files")
-        return 0
-    mode = database_config()["mode"]
-    grouped = {}
-    skipped = []
-    notes = []
-    for path in files:
-        try:
-            import json
-
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            skipped.append(path.name)
-            continue
-        if not isinstance(document, dict):
-            skipped.append(path.name)
-            continue
-        missing = [
-            field
-            for field in ("id", "kind", "domain", "repo", "tool", "session_id", "text")
-            if document.get(field) is None or (
-                isinstance(document.get(field), str) and not document.get(field).strip()
-            )
-        ]
-        if missing:
-            skipped.append(path.name)
-            continue
-        if document["kind"] not in {"change", "learning", "decision"}:
-            skipped.append(path.name)
-            continue
-        if document["domain"] not in {"code", "architecture", "operations"}:
-            skipped.append(path.name)
-            continue
-        remote_id = str(document["repo"]).strip()
-        if mode == "per-repo" and remote_id not in remote_urls():
-            skipped.append(path.name)
-            notes.append(f"{path.name}: no database configured for {remote_id}")
-            continue
-        if path.stem != str(document["id"]).strip():
-            notes.append(f"{path.name}: id is {document['id']}")
-        occurred = document.get("occurred_at")
-        if isinstance(occurred, str) and occurred.strip():
-            updated_at = occurred.strip()
-        else:
-            updated_at = iso_from_timestamp(path.stat().st_mtime)
-            document["occurred_at"] = None
-        row = normalize_document(document, updated_at)
-        key = remote_id if mode == "per-repo" else ""
-        grouped.setdefault(key, []).append((path.name, row))
-
-    for note in notes:
-        print(note)
-    for name in skipped:
-        if not any(note.startswith(name + ":") for note in notes):
-            print(f"skipped {name}")
-
-    for key, items in grouped.items():
-        remote_id = key if mode == "per-repo" else None
-        path = local_db_path(remote_id)
-        connection = connect(path)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            inserted = 0
-            kept = 0
-            for _name, row in items:
-                existing = connection.execute(
-                    "SELECT id FROM memory WHERE id = ?",
-                    (row["id"],),
-                ).fetchone()
-                if existing is not None:
-                    kept += 1
-                    continue
-                columns = ", ".join(COPY_COLUMNS)
-                placeholders = ", ".join("?" for _ in COPY_COLUMNS)
-                connection.execute(
-                    f"INSERT INTO memory ({columns}) VALUES ({placeholders})",
-                    [row[name] for name in COPY_COLUMNS],
-                )
-                _write_commits(connection, row["id"], row["commits"])
-                inserted += 1
-            connection.execute("COMMIT")
-        except sqlite3.Error as error:
-            connection.execute("ROLLBACK")
-            raise StoreError(f"could not import: {error}") from error
-        finally:
-            connection.close()
-        print(f"imported {inserted}, kept {kept}")
-
-    if skipped:
-        return 0
-    imported = store_root() / "memories.imported"
-    if imported.exists():
-        print(f"{imported} already exists; left {source}")
-        return 0
-    source.rename(imported)
-    print(f"renamed {source.name} to {imported.name}")
-    return 0

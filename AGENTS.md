@@ -11,7 +11,7 @@ Research first. Read [docs/context.md](docs/context.md), [docs/harnesses.md](doc
 - Swap the vector engine or the embedding model. They are Qdrant server and `BAAI/bge-small-en-v1.5`. A different model means deleting the collection and embedding again.
 - Add a dependency for capture or review until section 1 of [docs/research.md](docs/research.md) is answered.
 - Install hooks into `~/.cursor`, `~/.claude`, `~/.codex`, or Pi.
-- Commit transcripts, inbox dumps, anything under `memories/`, or anything under `data/`.
+- Commit transcripts, inbox dumps, or anything under `data/`.
 - Reopen the decisions in [docs/context.md](docs/context.md). Those are locked.
 - Build retrieval. The first build stops at capture, review, and embed.
 

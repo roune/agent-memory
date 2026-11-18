@@ -27,12 +27,12 @@ With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. 
 ## Features
 
 - **Session capture.** Hooks for Cursor, Claude Code, Codex, and Pi write an inbox bundle (which tool, which repo, the session id, and a pointer at the transcript) and return. The choice happens later, in review.
-- **Review.** `agent-memory review` opens an approve/reject page on `127.0.0.1`, starting at port 4173. You keep one note per bundle: a `change`, a `learning`, or a `decision`, in the domain `code`, `architecture`, or `operations`. Edit the text before you approve. Reject drops the bundle.
+- **Review.** `agent-memory review` opens an approve/reject page on `127.0.0.1`, starting at port 4173. You keep one note per bundle: a `change`, a `learning`, or a `decision`, in the domain `code`, `architecture`, or `operations`. Edit the text before you approve. Reject drops the bundle. For a git bundle it also remembers the commits, so `land` and the git hooks do not offer them again.
 - **Land.** `agent-memory land` files recent commits on a clone’s local default branch, grouped by pull request when it can tell the PR: from a `Merge pull request #N` commit, a subject ending in `(#N)`, or `gh` when it is installed. It skips the merge commits themselves. The draft is the PR title and description, then each commit message, with trailers and template comments removed. These bundles always wait for review.
 - **Pointers, not diffs.** An approved change stores every commit it explains and its PR number next to the text. The diff stays in git, and a reader gets it with `git show --stat <sha>…` or `gh pr view <number>`. The review page shows those commands. A hook memory made on a feature branch can point at commits that a squash merge later removed, so check with `git cat-file -e <sha>` before reading one.
 - **Git hooks.** With `git_hooks` on, post-commit and post-merge run `agent-memory git-hook`. Each new commit becomes an inbox bundle whose draft is the commit message without its trailers. A merge or fast-forward files every new single-parent commit, not only the tip. `auto_approve` keeps that draft when `~/.config/agent-memory/identity` has org, team, and person.
 - **Repo policy.** `.agent-memory.toml` holds `capture`, `repo`, `git_hooks`, and `auto_approve`. `agent-memory config` shows them and can turn the git hooks and auto-approve on or off without reinstalling editor hooks. `capture = false` skips capture, `land`, and the git hooks for that clone.
-- **Index.** Approved memories live in a local SQLite file, `data/memories.sqlite`. `scripts/setup` starts Qdrant, which is only the vector index. `scripts/embed` reads that SQLite file and embeds with `BAAI/bge-small-en-v1.5`. Raw transcripts are never embedded. An older SQLite file is upgraded in place the first time it is opened. Run `./scripts/embed --rebuild` once after that upgrade so existing points carry `commits` and `pull_request`.
+- **Index.** Approved memories live in a local SQLite file, `data/memories.sqlite`. `scripts/setup` starts Qdrant, which is only the vector index. `scripts/embed` reads that SQLite file and embeds with `BAAI/bge-small-en-v1.5`. Raw transcripts are never embedded. An older SQLite file is upgraded in place the first time it is opened. Run `./scripts/embed --rebuild` once after that upgrade so existing points carry `commits`, and `pull_request` when the change has one.
 
 ## Use
 
@@ -53,10 +53,9 @@ agent-memory list --team platform --since 2026-11-01T00:00:00+00:00
 agent-memory list --org acme --since 2026-11-01T00:00:00+00:00
 agent-memory list --repo github.com/owner/name
 agent-memory flush
-agent-memory import-json
 ```
 
-`import-json` loads an existing `memories/*.json` folder once. `flush` copies pending rows into the SQLite file mounted in the container when that URL answers `/readyz`, and leaves the laptop file unchanged when it does not.
+`flush` copies pending rows into the SQLite file mounted in the container when that URL answers `/readyz`, and leaves the laptop file unchanged when it does not.
 
 File commits that are already on the local default branch. The window defaults to the last 24 hours. `--since` takes an ISO-8601 time or a number of hours ago. The branch name comes from `origin/HEAD` when that local branch exists, otherwise `main` or `master`, and unpushed local commits are included:
 

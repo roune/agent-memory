@@ -135,8 +135,7 @@ class AgentMemoryTest(unittest.TestCase):
         data = json.loads(bundles[0].read_text(encoding="utf-8"))
         self.assertEqual(data.get("tool"), "git")
         self.assertEqual((data.get("draft") or {}).get("text"), "add a file\n\nBody line.")
-        memories = list((store / "memories").glob("*.json"))
-        self.assertEqual(len(memories), 0)
+        self.assertEqual(memory_rows(store), [])
 
     def test_git_hook_auto_approve_writes_memory(self):
         store = Path(self.tmp.name) / "store2"
@@ -165,7 +164,6 @@ class AgentMemoryTest(unittest.TestCase):
         rows = memory_rows(store)
         self.assertEqual(len(rows), 1)
         self.assertEqual(self._commit_rows(store), [(rows[0]["id"], self._head(repo))])
-        self.assertEqual(list((store / "memories").glob("*.json")), [])
         inbox = store / "inbox" / "git"
         bundles = list(inbox.glob("**/bundle.json"))
         self.assertEqual(len(bundles), 0)
@@ -194,7 +192,6 @@ class AgentMemoryTest(unittest.TestCase):
         subprocess.run(["git", "add", "c.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "third"], cwd=repo, env=env, check=True)
         self.assertEqual(len(memory_rows(store)), 1)
-        self.assertEqual(list((store / "memories").glob("*.json")), [])
 
     def _install(self, env, repo, hooks="true", auto="false"):
         result = run_agent_memory(
@@ -305,7 +302,6 @@ class AgentMemoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(memory_rows(store), [])
-        self.assertEqual(list((store / "memories").glob("*.json")), [])
         bundles = list((store / "inbox").glob("**/bundle.json"))
         self.assertEqual(len(bundles), 1)
 
@@ -340,7 +336,6 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(ended.returncode, 0, ended.stderr)
         rows = memory_rows(store)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(list((store / "memories").glob("*.json")), [])
         document = rows[0]
         self.assertIn("session commit", document["text"])
         self.assertNotIn("Done, the tests pass", document["text"])
@@ -446,6 +441,70 @@ class AgentMemoryTest(unittest.TestCase):
         result = subprocess.run(["python3", "-c", script], env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_approve_stores_textarea_line_breaks_as_lf(self):
+        store = Path(self.tmp.name) / "store-crlf"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import agent_memory as a\n"
+            "for bundle in a.bundles():\n"
+            "    a.approve(bundle, 'change', 'code', 'line one\\r\\n\\r\\nline two\\rthree\\r\\n',\n"
+            "              commit=bundle['draft']['commit'])\n"
+        )
+        result = subprocess.run(["python3", "-c", script], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        texts = [row["text"] for row in memory_rows(store)]
+        self.assertEqual(texts, ["line one\n\nline two\nthree"])
+
+    def _reject_bundles(self, env):
+        """Reject every git bundle in a separate process, as the review page would."""
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import agent_memory as a\n"
+            "for bundle in a.bundles():\n"
+            "    a.reject_bundle(bundle)\n"
+        )
+        result = subprocess.run(["python3", "-c", script], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_reject_is_remembered_by_land_and_hooks(self):
+        store = Path(self.tmp.name) / "store-reject"
+        store.mkdir()
+        repo = self._init_repo(store)
+        env = self._env(store)
+        self._commit(repo, env, repo / "one.txt", "part one (#5)")
+        self._commit(repo, env, repo / "two.txt", "part two (#5)")
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(len(self._land_bundles(store)), 2)
+        self._reject_bundles(env)
+        self.assertEqual(self._land_bundles(store), [])
+        self.assertEqual(memory_rows(store), [])
+
+        result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("no new bundles", result.stdout)
+        self.assertEqual(self._land_bundles(store), [])
+
+        # The post-commit hook skips a rejected HEAD too.
+        self._install(env, repo, hooks="true", auto="false")
+        hook = run_agent_memory(env, ["git-hook", "--repo", str(repo), "--event", "post-commit"], cwd=repo)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(self._land_bundles(store), [])
+
+        # A rejection belongs to one remote: a fork with the same commits still files them.
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", "https://github.com/example/fork.git"],
+            cwd=repo,
+            check=True,
+        )
+        run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
+        self.assertEqual(len(self._land_bundles(store)), 2)
+
     def test_land_does_not_refile_an_approved_pr(self):
         store = Path(self.tmp.name) / "store-refile"
         store.mkdir()
@@ -531,6 +590,20 @@ class AgentMemoryTest(unittest.TestCase):
         env["PATH"] = str(folder) + os.pathsep + env["PATH"]
         return env
 
+    def test_clean_message_drops_a_squash_rule_and_its_trailers(self):
+        spec = importlib.util.spec_from_file_location(
+            "agent_memory_rule_test",
+            ROOT / "scripts" / "agent_memory.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        message = (
+            "Fix the note (#9)\n\n* Fix the note\n\n* Address review\n\n---------\n\n"
+            "Co-authored-by: Other <o@example.com>\nSigned-off-by: Me <m@example.com>\n"
+        )
+        self.assertEqual(module.clean_message(message), "Fix the note (#9)\n\n* Fix the note\n\n* Address review")
+        self.assertEqual(module.clean_message("Subject\n\nA - B --- C"), "Subject\n\nA - B --- C")
+
     def test_land_draft_says_each_thing_once(self):
         store = Path(self.tmp.name) / "store-draft"
         store.mkdir()
@@ -560,8 +633,7 @@ class AgentMemoryTest(unittest.TestCase):
         for sha in (c["sha"] for c in bundle["land"]["commits"]):
             self.assertNotIn(sha[:10], text)
         self.assertNotIn("Remote repo id", text)
-        self.assertIn("one.txt", bundle["land"]["hint"])
-        self.assertNotIn(bundle["land"]["hint"], text)
+        self.assertNotIn("hint", bundle["land"])
 
     def test_review_form_submits_commit(self):
         spec = importlib.util.spec_from_file_location(
@@ -609,7 +681,6 @@ class AgentMemoryTest(unittest.TestCase):
             "land": {
                 "remote_repo": "github.com/example/proj",
                 "pull_request": 5,
-                "hint": "Unusual vs rest of group: touched one.txt",
                 "commits": [{"sha": first, "subject": "one"}, {"sha": second, "subject": "two"}],
             },
             "last_assistant_message": "",
@@ -620,7 +691,7 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertIn(second[:10], approve)
         self.assertIn("gh pr view 5 -R github.com/example/proj", approve)
         self.assertIn(f"git show --stat {first[:12]} {second[:12]}", approve)
-        self.assertIn("touched one.txt", approve)
+        self.assertNotIn("Unusual", approve)
         self.assertNotIn('type="radio"', approve)
         self.assertEqual(approve.count('name="commit"'), 1)
         self.assertIn(f'<input type="hidden" name="commit" value="{second}">', approve)
@@ -661,8 +732,7 @@ class AgentMemoryTest(unittest.TestCase):
 
     def test_embed_loads_memories_without_new_stamps(self):
         store = Path(self.tmp.name) / "embed-store"
-        memories = store / "memories"
-        memories.mkdir(parents=True)
+        store.mkdir(parents=True)
         old = {
             "id": "old-change-1",
             "kind": "change",
@@ -673,7 +743,6 @@ class AgentMemoryTest(unittest.TestCase):
             "text": "older note",
             "commit": "abc1234def",
         }
-        (memories / "old.json").write_text(json.dumps(old), encoding="utf-8")
         previous = os.environ.get("AGENT_MEMORY_DIR")
         previous_home = os.environ.get("HOME")
         os.environ["AGENT_MEMORY_DIR"] = str(store)
@@ -685,8 +754,7 @@ class AgentMemoryTest(unittest.TestCase):
             )
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            imported = module.memory_store.import_json()
-            self.assertEqual(imported, 0)
+            module.memory_store.save_approved(old)
             loaded = module.load_memories()
         finally:
             if previous is None:
@@ -704,8 +772,6 @@ class AgentMemoryTest(unittest.TestCase):
             "person": loaded[0].get("person") or "",
         }
         self.assertEqual(payload, {"org": "", "team": "", "person": ""})
-        self.assertFalse(memories.exists())
-        self.assertTrue((store / "memories.imported").is_dir())
 
 
 if __name__ == "__main__":

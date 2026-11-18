@@ -2,7 +2,7 @@
 
 Checked 5 November 2026. This answers section 3 of [research.md](research.md).
 
-Chosen model: **BAAI/bge-small-en-v1.5**, embedded from the quantized ONNX checkpoint `Qdrant/bge-small-en-v1.5-onnx-Q` at revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55`. The upstream weights are `BAAI/bge-small-en-v1.5` at `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. FastEmbed 0.9.1 runs that ONNX file. `scripts/embed` downloads the pinned revision into `data/models/bge-small-en-v1.5-onnx-q/` and upserts `memories/*.json`.
+Chosen model: **BAAI/bge-small-en-v1.5**, embedded from the quantized ONNX checkpoint `Qdrant/bge-small-en-v1.5-onnx-Q` at revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55`. The upstream weights are `BAAI/bge-small-en-v1.5` at `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. FastEmbed 0.9.1 runs that ONNX file. `scripts/embed` downloads the pinned revision into `data/models/bge-small-en-v1.5-onnx-q/` and upserts the approved rows of `data/memories.sqlite`.
 
 | | |
 | --- | --- |
