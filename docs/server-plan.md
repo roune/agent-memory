@@ -173,9 +173,13 @@ For 86 rows this takes seconds.
 
 The legacy collection `memories` is retired at the cutover. This is the "a second collection is for a different embedding model only" rule from [context.md](context.md). [embedding-model.md](embedding-model.md) gets a new section, "Adding a provider", and its line "A hosted embeddings API is a different vector space. It is not a second run mode for this index." is reworded to "A hosted model is a different vector space, so it gets its own collection and a full reindex."
 
-The `AGENTS.md` wording change ships in PR 1.
+The `AGENTS.md` wording changes in steps, so it never describes code that isn't there yet:
 
-The opening paragraph becomes:
+- **PR 1:** the model sentence and the two model bullets, with `scripts/embed --rebuild` as the way to switch.
+- **PR 3:** the MCP write-tool bullet and the retrieval bullet.
+- **PR 5:** the server sentence, and `reindex` in place of `scripts/embed --rebuild`.
+
+The final opening paragraph:
 
 > This repo is a brief, not a product yet. The vector engine is Qdrant server, which only the agent-memory server container in `compose.yaml` can reach. The default embedding model is `BAAI/bge-small-en-v1.5` through fastembed at a pinned revision, run inside that server. Other models plug in through `scripts/embedder.py`. See [docs/vector-engine.md](docs/vector-engine.md), [docs/embedding-model.md](docs/embedding-model.md), and [docs/server-plan.md](docs/server-plan.md).
 
@@ -355,7 +359,7 @@ Test doubles:
   - `scripts/embedder.py`: the `Embedder` protocol, the `FastEmbedBge` adapter, and `load_embedder()`, which rejects unknown providers.
   - `embed.py` uses the interface.
   - The `load_model` refactor from `16a1f2c`.
-  - The `AGENTS.md` wording above.
+  - The model parts of the `AGENTS.md` wording above.
   - `embedding-model.md`: the new "Adding a provider" section and the reworded hosted-API line.
 - **Tests:**
   - unknown provider → a clear error
