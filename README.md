@@ -101,3 +101,4 @@ Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agen
 - [docs/vector-engine.md](docs/vector-engine.md) — why the engine is Qdrant server, and how `scripts/setup` starts it.
 - [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
 - [docs/research.md](docs/research.md) — the “what already does this” question, still open.
+- [docs/server-plan.md](docs/server-plan.md) — the approved plan for moving to one server in Docker, in ordered PRs.
