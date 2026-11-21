@@ -15,6 +15,10 @@ Research first. Read [docs/context.md](docs/context.md), [docs/harnesses.md](doc
 - Reopen the decisions in [docs/context.md](docs/context.md). Those are locked.
 - Build retrieval. The first build stops at capture, review, and embed.
 
+## Server work
+
+The move to a server in Docker follows [docs/server-plan.md](docs/server-plan.md), one PR at a time and in its order.
+
 ## When research is done
 
 Propose one vector engine and one embedding model that a setup script can create locally and that can later run as a container. Then implement capture, review, and embed. Leave session-start retrieval for a later phase.
