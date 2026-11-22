@@ -1,5 +1,7 @@
 # Agent memory
 
+![Captured sessions and commits flow into a review screen, where a person approves a few notes and deletes the rest. The approved notes join a brain whose regions are colored by domain.](docs/images/agent-memory-hero.png)
+
 Agent memory files a coding-agent session, or a slice of git history, and lets you choose what to keep. Only the notes you approve are saved, and only those notes are embedded for search.
 
 ## How it works
