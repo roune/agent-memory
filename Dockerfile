@@ -1,4 +1,4 @@
-# agent-memory-server: the write API (and, from PR 3, MCP) next to Qdrant.
+# agent-memory-server: the write API and MCP (/mcp) next to Qdrant.
 # docs/server-plan.md, "Packaging". compose.yaml builds it as the `server` service.
 FROM python:3.12-slim
 

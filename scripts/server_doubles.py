@@ -41,6 +41,31 @@ class HashEmbedder:
         return self._vector("query: " + text)
 
 
+def _cosine(left, right):
+    dot = sum(a * b for a, b in zip(left, right))
+    norm = (sum(a * a for a in left) * sum(b * b for b in right)) ** 0.5
+    return dot / norm if norm else 0.0
+
+
+def _matches(payload, query_filter):
+    """Qdrant's `must` of keyword matches: a list payload matches when it holds the value."""
+    for condition in (query_filter or {}).get("must", []):
+        value = payload.get(condition["key"])
+        wanted = condition["match"]["value"]
+        if value != wanted and not (isinstance(value, list) and wanted in value):
+            return False
+    return True
+
+
+def _pick(payload, query):
+    chosen = query.get("with_payload", False)
+    if chosen is True:
+        return payload
+    if isinstance(chosen, list):
+        return {key: payload[key] for key in chosen if key in payload}
+    return {}
+
+
 class FakeQdrant:
     """The Qdrant endpoints the server calls, in memory. Set down=True to make it unreachable."""
 
@@ -105,6 +130,16 @@ class FakeQdrant:
                 return self._ok({"status": "completed"})
             if rest == ["points", "count"] and method == "POST":
                 return self._ok({"count": len(found["points"])})
+            if rest == ["points", "query"] and method == "POST":
+                if len(data["query"]) != found["vectors"]["size"]:
+                    return 400, b'{"status":{"error":"Wrong input: Vector dimension error"}}'
+                hits = [
+                    {"id": point["id"], "score": _cosine(data["query"], point["vector"]), "payload": _pick(point["payload"], data)}
+                    for point in found["points"].values()
+                    if _matches(point["payload"], data.get("filter"))
+                ]
+                hits.sort(key=lambda hit: hit["score"], reverse=True)
+                return self._ok({"points": hits[: data.get("limit", 10)]})
         return 404, b'{"status":{"error":"no such endpoint in FakeQdrant"}}'
 
     @staticmethod

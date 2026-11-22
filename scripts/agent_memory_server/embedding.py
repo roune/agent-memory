@@ -113,6 +113,8 @@ class Embedding:
         self.state = "pending"
         self.error = ""
         self._lock = threading.Lock()
+        # One caller at a time uses the model: embed-on-write and search share it.
+        self._model_lock = threading.Lock()
 
     def check_state(self):
         """Raise EmbeddingMismatch when memories.sqlite's active embedder is another one."""
@@ -151,10 +153,19 @@ class Embedding:
             if not documents or seen.issuperset(pairs):
                 return done
             seen.update(pairs)
-            vectors = self.embedder.embed_documents([document["text"] for document in documents])
+            with self._model_lock:
+                vectors = self.embedder.embed_documents([document["text"] for document in documents])
             self.qdrant.upsert(self.collection, points_for(documents, vectors, self.description))
             self.store.mark_embedded_in(self.collection, pairs)
             done += len(documents)
+
+    def embed_query(self, text):
+        """One query vector from the configured embedder, checked against its dimension."""
+        with self._model_lock:
+            vector = list(self.embedder.embed_query(text))
+        if len(vector) != self.description["dimension"]:
+            raise EmbedderError(f"the query vector has length {len(vector)}, expected {self.description['dimension']}")
+        return vector
 
     def embed_pending(self):
         """Prepare if needed, then embed what is pending. True when nothing is left. Never raises.

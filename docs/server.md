@@ -1,6 +1,6 @@
 # The agent-memory server
 
-Status: a preview, built in PR 2b and PR 2c of [server-plan.md](server-plan.md). Nothing on the laptop talks to it yet. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 4 adds the client, and PR 5 is the cutover.
+Status: a preview, built in PR 2b, 2c and 3 of [server-plan.md](server-plan.md). Editors can query it through MCP. Nothing else on the laptop talks to it yet. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 4 adds the client, and PR 5 is the cutover.
 
 ## The shape
 
@@ -21,6 +21,7 @@ flowchart LR
   end
   embed -- "legacy collection: memories" --> qdrant
   curl["curl / the CLI from PR 4"] -- "/v1/..." --> server
+  editor["Claude Code, Cursor, Codex"] -. "/mcp: search · get · list" .-> server
 ```
 
 The server and the laptop never open the same SQLite file. Data moves between them only through `/v1/admin/import`, which `agent-memory migrate` uses in PR 4.
@@ -43,15 +44,48 @@ The local `compose.yaml` turns auth off (`AGENT_MEMORY_AUTH=off`). That is safe 
 | --- | --- | --- |
 | `GET /v1/health` | none | Liveness, Qdrant readiness, auth on or off, the embedder and its collection, and the counts of memories and pending rows. |
 | `GET /v1/whoami` | any token | The token's id, label, person, org, team, the orgs and teams it may write as, and its scopes. With auth off, it says identity comes from the request body. |
-| `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | read | Metadata query. |
+| `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | read | Metadata query. `since` and `until` are ISO-8601 times with a zone, or a date; they are compared in UTC, and anything else is a 400. |
 | `GET /v1/memories/{id}` | read | One memory with its commits. 404 when missing. |
 | `POST /v1/memories` | write | Approve. The body has the fields of the document `approve()` builds, and nothing else: an unknown key, `transcript_path` included, gets a 400. With auth on, `person` comes from the token (see below). Returns `{id, updated_at, embedded}`: 201 when new, 200 for an identical resend, 409 with the stored text for different content under an existing id. |
 | `POST /v1/rejections` `{repo, shas}` | write | Remembers rejected commits. |
 | `POST /v1/commits/status` `{repo, shas}` | read | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
 | `POST /v1/tokens` `{label}` | read and write | Mints a read-only child of the caller's token, for an editor. Returns the secret once. The same label again replaces the earlier child. A label is at most 64 characters, one line. 400 with auth off. |
+| `POST /mcp` | read | MCP over streamable HTTP, with the read-only tools `search`, `get` and `list`. See [MCP](#mcp). |
 | `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. |
 
 With auth off, every caller has every scope.
+
+## MCP
+
+`/mcp` is the MCP SDK's streamable HTTP transport. It has three tools, and none of them writes. There is no write tool: a memory is kept only through `POST /v1/memories`, which the review flow calls.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `search` | `query`, and optional `repo`, `domain`, `kind`, `org`, `team`, `person`, `limit` (10, at most 50) | `results`, best match first: each memory in `get`'s shape plus `score`. `not_yet_searchable` counts the rows still waiting to be embedded. |
+| `get` | `document_id` | One memory with its commits, as `GET /v1/memories/{id}` returns it. |
+| `list` | optional `repo`, `domain`, `kind`, `org`, `team`, `person`, `since`, `until`, `limit` (20, at most 100) | `memories`, newest `occurred_at` first. No ranking. `since` and `until` are ISO-8601 times with a zone, or a date (midnight UTC); anything else is a tool error. |
+
+```mermaid
+flowchart LR
+  ask["search(query, repo?)"] --> embed["embed the query<br/>(the server's embedder)"]
+  embed --> qdrant[("active collection<br/>filtered on the payload indexes")]
+  qdrant -- "document_ids + scores" --> sqlite[("memories.sqlite")]
+  sqlite -- "the rows, as get returns them" --> hits["results"]
+```
+
+- **Superseded memories are returned.** A memory with `superseded_by` has a newer one, and that one has `supersedes`. Nothing is hidden, because a supersede may come from another org: the reader sees both notes and decides. Ranking by the caller's org is a later option.
+- **The rows come from SQLite.** Qdrant only finds the ids. So `text` and `superseded_by` are current even when a point is still waiting for the retry loop.
+- **Failures are tool errors.** Qdrant down, the collection missing, or an embedder mismatch makes `search` answer with `isError` and a message. The server keeps running, and `get` and `list` still work.
+- **Auth.** With auth on, every request to `/mcp` needs a token with the `read` scope, checked before the SDK sees it. A session belongs to the token that opened it: another token gets a 404 for it, as if it didn't exist, and can't end it. A session doesn't outlive its token either: a revoked token gets a 401 on its next request.
+- **Sessions** are the SDK's, kept in memory. After a restart a client's old session gets a 404, and the client starts a new one.
+
+This repo's `.mcp.json` registers the local server for Claude Code as `agent-memory-dev`:
+
+```json
+{"mcpServers": {"agent-memory-dev": {"type": "http", "url": "http://127.0.0.1:8765/mcp"}}}
+```
+
+The local compose file has auth off, so it needs no token. The name keeps this project's entry from hiding a team server you register as `agent-memory`. For a server with auth on, add `"headers": {"Authorization": "Bearer am_…"}` with a read token, for example one from `POST /v1/tokens`. `agent-memory connect --editor` writes that for you in PR 6.
 
 ## Auth and tokens
 
@@ -138,7 +172,7 @@ flowchart TD
   host -- no --> r421["421<br/>(DNS rebinding)"]
   host -- yes --> origin{"Origin header?"}
   origin -- "yes, not listed" --> r403["403<br/>(a web page)"]
-  origin -- "none, or listed" --> write{"POST, PUT,<br/>PATCH or DELETE?"}
+  origin -- "none, or listed" --> write{"POST, PUT<br/>or PATCH?"}
   write -- no --> route["the route"]
   write -- yes --> json{"Content-Type:<br/>application/json?"}
   json -- no --> r415["415<br/>(form or text/plain POST)"]
@@ -147,7 +181,7 @@ flowchart TD
 
 - A `Host` that isn't in `AGENT_MEMORY_ALLOWED_HOSTS` gets a 421. The default is `127.0.0.1:8765,localhost:8765`.
 - A request with an `Origin` that isn't in `AGENT_MEMORY_ALLOWED_ORIGINS` gets a 403. The default allows none. The CLI sends no `Origin`.
-- A `POST`, `PUT`, `PATCH` or `DELETE` without `Content-Type: application/json` gets a 415.
+- A `POST`, `PUT` or `PATCH` without `Content-Type: application/json` gets a 415. `DELETE` has no body: an MCP client ends its session with one, often without a `Content-Type`, and a browser can't send it cross-site without a preflight, which the server never answers.
 
 ## Embedding
 
@@ -208,4 +242,4 @@ docker compose --profile server start server
 
 ## Tests
 
-`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests. CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` needs a token, and that a token made with `token create` works.
+`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests and `/mcp` through the SDK's session manager (`test_server_mcp.py`). CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` and `/mcp` need a token, and that a read token made with `token create` works for both.

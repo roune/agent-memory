@@ -5,7 +5,7 @@ only the fields of an approved document: any other key, transcript_path
 included, is refused, so nothing but reviewed text reaches the server.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import memory_rules
 
@@ -76,6 +76,26 @@ def utc_timestamp(value, name):
     if parsed.tzinfo is None:
         raise ValueError(f"{name} needs a time zone, e.g. +00:00")
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def time_filter(value, name):
+    """A since or until bound as UTC text, or None when blank. Refuses anything else.
+
+    The store compares occurred_at as text, so a bound must be written the way
+    the review flow writes it: UTC, 2026-11-01T00:00:00+00:00. A bare date means
+    its midnight in UTC. Without this, "yesterday" matched nothing and an offset
+    such as +01:00 compared wrongly, both with no error.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str) and len(value.strip()) == 10:
+        try:
+            day = date.fromisoformat(value.strip())
+        except ValueError:
+            pass
+        else:
+            return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).isoformat()
+    return utc_timestamp(value, name)
 
 
 def _shas(value):
@@ -162,6 +182,10 @@ def query_from_params(params):
     if unknown:
         raise ValueError(f"unknown parameter: {', '.join(unknown)}")
     filters = {key: params[key] for key in QUERY_KEYS - {"limit", "offset"} if key in params}
+    for key in ("since", "until"):
+        # A blank one stays as it is: the store answers it with "filter is blank".
+        if key in filters and filters[key].strip():
+            filters[key] = time_filter(filters[key], key)
     for key in ("limit", "offset"):
         if key in params:
             try:
