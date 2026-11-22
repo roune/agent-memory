@@ -61,7 +61,20 @@ class RulesTest(unittest.TestCase):
 
     def test_occurred_at_and_record(self):
         self.rejects("occurred_at is required", occurred_at="")
+        self.rejects("occurred_at needs a time zone, e.g. +00:00", occurred_at="2026-11-20T10:00:00")
+        self.rejects("occurred_at must be an ISO-8601 time, e.g. 2026-11-01T00:00:00+00:00", occurred_at="last tuesday")
         self.rejects("record must be empty, explanation, history, or runbook", record="diary")
+
+    def test_occurred_at_is_stored_as_utc(self):
+        # The store compares and sorts occurred_at as text, so every one is written the same way.
+        for given, stored in (
+            ("2026-11-20T11:00:00+01:00", "2026-11-20T10:00:00+00:00"),
+            ("2026-11-20T10:00:00Z", "2026-11-20T10:00:00+00:00"),
+            (" 2026-11-20T10:00:00.250000+00:00 ", "2026-11-20T10:00:00.250000+00:00"),
+            ("2026-11-20", "2026-11-20T00:00:00+00:00"),
+        ):
+            with self.subTest(given=given):
+                self.assertEqual(memory_rules.build_document(**fields(occurred_at=given))["occurred_at"], stored)
 
     def test_a_change_needs_its_commit(self):
         self.rejects("a change needs the commit it explains", kind="change", commit="abc12")

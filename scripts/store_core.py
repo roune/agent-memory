@@ -627,3 +627,39 @@ class Store:
             raise StoreError(f"could not mark embedded: {error}") from error
         finally:
             connection.close()
+
+
+def snapshot(path):
+    """Every row and rejection of a memories.sqlite file, without writing to it.
+
+    Returns (documents in document_from_row's shape, rejections as {repo, sha,
+    rejected_at}). The file is opened read-only and copied into memory, and
+    the schema is brought up to date on the copy, so an older file reads the
+    same as a current one and is left as it was. migrate reads the laptop's
+    store this way.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    copy = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        source = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            source.backup(copy)
+        except sqlite3.Error as error:
+            raise StoreError(f"could not read {path}: {error}") from error
+        finally:
+            source.close()
+        copy.row_factory = sqlite3.Row
+        copy.executescript(SCHEMA)
+        _migrate(copy)
+        rows = copy.execute("SELECT * FROM memory ORDER BY updated_at, id").fetchall()
+        commits = _commits_by_id(copy, [row["id"] for row in rows])
+        documents = [document_from_row(row, commits[row["id"]]) for row in rows]
+        rejections = [
+            {"repo": row["repo"], "sha": row["sha"], "rejected_at": row["rejected_at"]}
+            for row in copy.execute("SELECT repo, sha, rejected_at FROM rejected_commit ORDER BY repo, sha")
+        ]
+    finally:
+        copy.close()
+    return documents, rejections

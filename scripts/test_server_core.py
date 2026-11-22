@@ -182,6 +182,17 @@ class RulesTest(unittest.TestCase):
         )
         self.assertEqual(memories[0]["updated_at"], "2026-11-01T01:30:00+00:00")
         self.assertEqual(rejections[0]["rejected_at"], "2026-11-01T01:00:00+00:00")
+        offsets = rules.import_from_body(
+            {
+                "memories": [
+                    {**row, "updated_at": "2026-11-01T01:30:00Z", "occurred_at": "2026-11-01T02:00:00+01:00"},
+                    {**row, "id": "tester-learning-s2", "session_id": "s2", "updated_at": "2026-11-01T01:30:00Z", "occurred_at": None},
+                ]
+            }
+        )[0]
+        self.assertEqual([item["occurred_at"] for item in offsets], ["2026-11-01T01:00:00+00:00", None])
+        with self.assertRaisesRegex(ValueError, "tester-learning-s1: occurred_at needs a time zone"):
+            rules.import_from_body({"memories": [{**row, "updated_at": "2026-11-01T01:30:00Z", "occurred_at": "2026-11-01T02:00:00"}]})
         for bad, message in (
             ("not-a-time", "tester-learning-s1: updated_at must be an ISO-8601 time"),
             ("2026-11-01T00:00:00", "tester-learning-s1: updated_at needs a time zone"),

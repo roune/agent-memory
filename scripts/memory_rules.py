@@ -6,6 +6,8 @@ ValueError with a message a person can act on. Nothing here reads git, the
 inbox, or ~/.config: the caller fills in defaults first.
 """
 
+from datetime import date, datetime, timezone
+
 KINDS = ("change", "learning", "decision")
 DOMAINS = ("code", "architecture", "operations")
 RECORDS = ("", "explanation", "history", "runbook")
@@ -106,6 +108,32 @@ def check_commits(commit, commits=(), pull_request=None):
     return commit, listed, pull_request
 
 
+def utc_time(value, name, allow_date=False):
+    """An ISO-8601 time with a zone, as UTC text: 2026-11-01T00:00:00+00:00.
+
+    The store compares and sorts timestamps as text, so every one must be
+    written the same way. A Z suffix or another offset is converted, keeping
+    microseconds when there are any. With allow_date, a bare date such as
+    2026-11-01 means its midnight in UTC. A time without a zone is refused:
+    it could be any zone.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    if allow_date and len(text) == 10:
+        try:
+            day = date.fromisoformat(text)
+        except ValueError:
+            pass
+        else:
+            return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).isoformat()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"{name} must be an ISO-8601 time, e.g. 2026-11-01T00:00:00+00:00") from None
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} needs a time zone, e.g. +00:00")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def document_id(person, kind, session_id):
     return f"{person}-{kind}-{session_id}"
 
@@ -150,6 +178,7 @@ def build_document(
     occurred_at = _strip(occurred_at)
     if not occurred_at:
         raise ValueError("occurred_at is required")
+    occurred_at = utc_time(occurred_at, "occurred_at", allow_date=True)
     record = _strip(record)
     check_record(record)
 

@@ -34,9 +34,11 @@ py-modules = [
     "agent_memory",
     "embed",
     "embedder",
+    "memory_migrate",
     "memory_points",
     "memory_rules",
     "memory_store",
+    "server_client",
     "store_core",
 ]
 # The server. Its HTTP parts import Starlette from the server extra; the rest

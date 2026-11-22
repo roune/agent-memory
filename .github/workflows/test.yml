@@ -64,7 +64,7 @@ jobs:
   image:
     # The image builds and answers /v1/health with auth on and off. With auth
     # on, /v1/whoami and /mcp need a token, and one made with `token create`
-    # works for both.
+    # works for both. The CLI on the runner connects to it and migrates a store.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -132,3 +132,43 @@ jobs:
           done
           docker logs local
           exit 1
+      - name: The CLI connects and migrates a store, auth on
+        env:
+          HOME: ${{ runner.temp }}/home
+          AGENT_MEMORY_DIR: ${{ runner.temp }}/state
+        run: |
+          mkdir -p "$HOME"
+          docker run -d --name published -p 127.0.0.1:8765:8765 agent-memory-server:ci
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8765/v1/health > /dev/null; then break; fi
+            sleep 1
+          done
+          python3 -c "
+          import sys
+          sys.path.insert(0, 'scripts')
+          import memory_store
+          for number in range(3):
+              memory_store.save_approved({'id': f'ci-learning-s{number}', 'kind': 'learning', 'domain': 'code', 'text': f'note {number}',
+                  'repo': 'github.com/example/ci', 'tool': 'git', 'session_id': f's{number}', 'org': 'CI', 'team': 'CI', 'person': 'ci',
+                  'occurred_at': '2026-11-20T11:00:00+01:00', 'commits': []})
+          "
+          python3 scripts/agent_memory.py migrate --dry-run | tee dry.txt
+          grep -q "memories: 3" dry.txt
+          if python3 scripts/agent_memory.py connect --url http://127.0.0.1:8765; then
+            echo "connect without a token should fail"; exit 1
+          fi
+          test ! -e "$HOME/.config/agent-memory/server"
+          docker exec published agent-memory-server token create --person ci --org CI --team CI --scopes read,write,admin | sed -n 2p \
+            | python3 scripts/agent_memory.py connect --url http://127.0.0.1:8765 --token-stdin
+          test "$(stat -c %a "$HOME/.config/agent-memory/server")" = 600
+          python3 scripts/agent_memory.py migrate | tee first.txt
+          grep -q "verified: all 3 memories" first.txt
+          python3 scripts/agent_memory.py migrate | tee second.txt
+          grep -q "sent: 0 written, 3 already there or newer" second.txt
+          python3 scripts/agent_memory.py list --repo github.com/example/ci | python3 -c "
+          import json, sys
+          hits = json.load(sys.stdin)
+          assert len(hits) == 3, hits
+          assert {hit['occurred_at'] for hit in hits} == {'2026-11-20T10:00:00+00:00'}, 'the import converts occurred_at to UTC'
+          print('list through the server:', len(hits))
+          "

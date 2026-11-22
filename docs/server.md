@@ -1,6 +1,6 @@
 # The agent-memory server
 
-Status: a preview, built in PR 2b, 2c and 3 of [server-plan.md](server-plan.md). Editors can query it through MCP. Nothing else on the laptop talks to it yet. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 4 adds the client, and PR 5 is the cutover.
+Status: a preview, built in PR 2b, 2c, 3 and 4 of [server-plan.md](server-plan.md). Editors can query it through MCP. On the laptop, `agent-memory connect` points the CLI at it, `migrate` copies the local store into it, and `list` reads from it. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 5 is the cutover.
 
 ## The shape
 
@@ -20,11 +20,12 @@ flowchart LR
     server -- "memories-fastembed-384-2d705fdd" --> qdrant
   end
   embed -- "legacy collection: memories" --> qdrant
-  curl["curl / the CLI from PR 4"] -- "/v1/..." --> server
+  cli["agent-memory connect · migrate · list"] -- "/v1/..." --> server
+  localdb -. "read-only, by migrate" .-> cli
   editor["Claude Code, Cursor, Codex"] -. "/mcp: search · get · list" .-> server
 ```
 
-The server and the laptop never open the same SQLite file. Data moves between them only through `/v1/admin/import`, which `agent-memory migrate` uses in PR 4.
+The server and the laptop never open the same SQLite file. Data moves between them only through `/v1/admin/import`, which `agent-memory migrate` uses. See [Connecting the CLI](#connecting-the-cli).
 
 ## Try it
 
@@ -37,6 +38,37 @@ curl -s http://127.0.0.1:8765/v1/health
 The server keeps its own `data/server/memories.sqlite`, separate from the laptop's file. It starts empty. `docker compose --profile server stop server` stops it.
 
 The local `compose.yaml` turns auth off (`AGENT_MEMORY_AUTH=off`). That is safe only because it publishes the port on `127.0.0.1`, and because of the browser rules below. Anywhere else auth is on, which is the default: see [Auth and tokens](#auth-and-tokens).
+
+## Connecting the CLI
+
+```
+agent-memory connect --url http://127.0.0.1:8765               # local, auth off
+agent-memory connect --url https://memory.acme.internal --token-stdin < token.txt
+agent-memory migrate --dry-run
+agent-memory migrate
+```
+
+`connect` calls `/v1/whoami` first, and writes nothing if that fails: a server that doesn't answer, a missing token (401), or an unknown one. It then writes `~/.config/agent-memory/server` with mode 0600 and prints who you are connected as. The token is read from stdin, so it never shows up in your shell history or `ps`. `--mode` sets `shared` or `per-repo`; without it, connect keeps the current mode, or takes it from the legacy `database` file.
+
+| File in `~/.config/agent-memory/` | Contents |
+| --- | --- |
+| `server` | `url`, `mode`, and `token` when auth is on. Mode 0600. |
+| `servers` | Per-repo mode: `<remote id> = <server url>`. `connect --url … --repo <remote id>` adds a line. A remote not listed goes to the `server` file's url. |
+| `tokens` | Per-repo mode: `<server url> = <token>`, written by `connect --repo`. Mode 0600. The `server` file's token is used only for its own url. |
+| `database`, `databases` | Legacy. `connect` and `migrate` read the mode from `database`. |
+
+**`migrate`** copies the laptop's `memories.sqlite` into the server. It needs the admin scope, which auth off implies.
+
+- It opens the laptop file read-only and never changes it.
+- Rows go to `/v1/admin/import` in batches of 50, each keeping its `id`, `person` and `updated_at`, and the rejected commits go with them.
+- It then reads every id back and compares it with what it sent. It checks every rejection with `/v1/commits/status`, prints the server's own count, and exits 1 if anything is missing or different.
+- A rerun is safe. The server keeps a row only when its `updated_at` is newer, so a second run writes nothing.
+- `--dry-run` prints the counts for each server (memories, rejected commits, repos, people) and sends nothing.
+- In per-repo mode it reads every file under `~/.local/share/agent-memory/databases/` and sends each row to the server its repo maps to.
+
+Until the cutover, Approve still writes the laptop file, while `list` reads the server once `server` exists. So run `migrate` again to copy what you approved since the last run. PR 5 makes Approve send to the server.
+
+**Times** are stored in UTC. Approve and the import convert an `occurred_at` with another offset, such as `+01:00` or `Z`. A bare date means midnight UTC, and a time without a zone is refused. The store compares and sorts these times as text, so every stored time has to be in the same form.
 
 ## Routes
 
@@ -242,4 +274,4 @@ docker compose --profile server start server
 
 ## Tests
 
-`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests and `/mcp` through the SDK's session manager (`test_server_mcp.py`). CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` and `/mcp` need a token, and that a read token made with `token create` works for both.
+`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `test_server_client.py` checks the CLI's config files, `connect`, `migrate` and `list` against a stub server on `127.0.0.1`, using real urllib requests. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests and `/mcp` through the SDK's session manager (`test_server_mcp.py`), and one `migrate` run against the real app. CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` and `/mcp` need a token, and that a read token made with `token create` works for both. Last, the CLI on the runner runs `connect`, `migrate` (twice) and `list` against the image.
