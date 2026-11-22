@@ -1350,7 +1350,8 @@ def commits_for_change(bundle, commit):
     chosen = commit.lower()
     if any(sha.lower() == chosen for sha in listed):
         pull_request = land_meta.get("pull_request")
-        return listed, pull_request if isinstance(pull_request, int) else None
+        numbered = isinstance(pull_request, int) and not isinstance(pull_request, bool) and pull_request > 0
+        return listed, pull_request if numbered else None
     return [commit], None
 
 

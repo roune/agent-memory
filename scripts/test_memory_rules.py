@@ -89,6 +89,30 @@ class RulesTest(unittest.TestCase):
         change = memory_rules.build_document(**fields(kind="change", commit=f" {B} ", commits=[A, B], pull_request=3))
         self.assertEqual((change["commit"], change["commits"], change["pull_request"]), (B, [A, B], 3))
 
+    def test_a_change_without_commits_stores_its_commit(self):
+        change = memory_rules.build_document(**fields(kind="change", commit=A))
+        self.assertEqual(change["commits"], [A])
+
+    def test_commits_are_checked_and_deduplicated(self):
+        change = memory_rules.build_document(**fields(kind="change", commit=B, commits=[f" {A} ", A.upper(), B]))
+        self.assertEqual(change["commits"], [A, B])
+        message = "commits must be a list of commit hashes"
+        self.rejects(message, kind="change", commit=B, commits=["nothex!!", B])
+        self.rejects(message, kind="change", commit=B, commits=B)
+        self.rejects(message, kind="change", commit=B, commits=[7, B])
+        self.rejects("commits must include the commit the change explains", kind="change", commit=A, commits=[B])
+
+    def test_pull_request_is_a_positive_number(self):
+        for value in ("seven", "7", 0, -1, True, 7.0):
+            self.rejects("pull_request must be a positive number", kind="change", commit=A, pull_request=value)
+
+    def test_text_fields_must_be_strings(self):
+        self.rejects("text must be text", text=["x"])
+        self.rejects("occurred_at must be text", occurred_at=5)
+        self.rejects("session id must be text", session_id=1)
+        self.rejects("look_at must be text", look_at={"path": "x"})
+        self.rejects("commit must be text", kind="change", commit=12345678)
+
 
 class ApproveUsesTheRulesTest(unittest.TestCase):
     """approve() fills defaults from the bundle and identity, then builds with the shared rules."""

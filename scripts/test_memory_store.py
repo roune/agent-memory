@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -274,6 +275,48 @@ class MemoryStoreTest(unittest.TestCase):
         local.close()
         self.assertEqual(self.db.flush(), 0)
         self.assertEqual(self._rows(shared)[0]["text"], "clash")
+        self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
+
+    def _flush_setup(self):
+        server, url = start_ready()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        (self.home / ".config" / "agent-memory" / "database").write_text(
+            f"mode = shared\nqdrant_url = {url}\n",
+            encoding="utf-8",
+        )
+        self.db.save_approved(
+            self._doc("a", "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00", "local")
+        )
+        return self.store / "data" / "shared" / "memories.sqlite"
+
+    def test_flush_reports_a_failed_shared_write_and_keeps_the_laptop_rows_pending(self):
+        shared = self._flush_setup()
+        failure = sqlite3.OperationalError("disk I/O error")
+        with mock.patch.object(self.db, "_upsert_shared", side_effect=failure):
+            with self.assertRaises(self.db.StoreError) as raised:
+                self.db.flush()
+        self.assertEqual(str(raised.exception), "could not flush: disk I/O error")
+        self.assertEqual(self._rows(shared), [])
+        self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
+
+    def test_flush_reports_a_locked_shared_file(self):
+        shared = self._flush_setup()
+        real_connect = self.db.connect
+
+        def connect_without_waiting(path, create=True):
+            connection = real_connect(path, create)
+            connection.execute("PRAGMA busy_timeout = 0")
+            return connection
+
+        holder = real_connect(shared)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN EXCLUSIVE")
+        self.addCleanup(holder.execute, "ROLLBACK")
+        with mock.patch.object(self.db, "connect", connect_without_waiting):
+            with self.assertRaises(self.db.StoreError) as raised:
+                self.db.flush()
+        self.assertIn("could not flush: database is locked", str(raised.exception))
         self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
 
     def _change(self, suffix, commits, pull_request=None):

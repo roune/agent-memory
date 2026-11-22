@@ -14,8 +14,32 @@ LINK_FIELDS = ("subject", "alarm", "look_at", "supersedes", "superseded_by", "up
 _HEX = frozenset("0123456789abcdefABCDEF")
 
 
+TEXT_FIELDS = (
+    ("kind", "kind"),
+    ("domain", "domain"),
+    ("text", "text"),
+    ("repo", "repo"),
+    ("tool", "tool"),
+    ("session_id", "session id"),
+    ("org", "org"),
+    ("team", "team"),
+    ("person", "person"),
+    ("occurred_at", "occurred_at"),
+    ("commit", "commit"),
+    ("record", "record"),
+) + tuple((name, name) for name in LINK_FIELDS)
+
+
 def _strip(value):
-    return "" if value is None else str(value).strip()
+    return "" if value is None else value.strip()
+
+
+def check_types(values):
+    """Every text field is a string or missing. A list or a number is a caller bug."""
+    for key, label in TEXT_FIELDS:
+        value = values.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
 
 
 def clean_text(text):
@@ -48,6 +72,36 @@ def check_commit(commit):
     return commit
 
 
+def _is_sha(value):
+    return isinstance(value, str) and len(value.strip()) >= 7 and all(char in _HEX for char in value.strip())
+
+
+def check_commits(commit, commits=(), pull_request=None):
+    """What a change stores: the commit it explains, every commit it covers, its PR.
+
+    commits lists each commit once, oldest first, and includes commit. An empty
+    list means just commit. pull_request is a positive number or None. Returns
+    (commit, commits, pull_request).
+    """
+    commit = check_commit(commit)
+    if not isinstance(commits, (list, tuple)) or not all(_is_sha(item) for item in commits):
+        raise ValueError("commits must be a list of commit hashes")
+    listed = []
+    for item in commits:
+        item = item.strip()
+        if item.lower() not in (seen.lower() for seen in listed):
+            listed.append(item)
+    if not listed:
+        listed = [commit]
+    elif commit.lower() not in (item.lower() for item in listed):
+        raise ValueError("commits must include the commit the change explains")
+    if pull_request is not None and (
+        isinstance(pull_request, bool) or not isinstance(pull_request, int) or pull_request < 1
+    ):
+        raise ValueError("pull_request must be a positive number")
+    return commit, listed, pull_request
+
+
 def document_id(person, kind, session_id):
     return f"{person}-{kind}-{session_id}"
 
@@ -77,9 +131,10 @@ def build_document(
 ):
     """Check every rule and return the document memory_store saves.
 
-    commit, commits and pull_request count only for a change. An empty commits
-    list is stored as just the commit the change names.
+    commit, commits and pull_request count only for a change, and follow
+    check_commits. Every text field must be a string or None.
     """
+    check_types(locals())
     text = clean_text(text)
     check_shape(kind, domain, text)
     repo, tool, session_id = _strip(repo), _strip(tool), _strip(session_id)
@@ -108,9 +163,9 @@ def build_document(
         "occurred_at": occurred_at,
     }
     if kind == "change":
-        commit = check_commit(commit)
+        commit, commits, pull_request = check_commits(commit, commits, pull_request)
         document["commit"] = commit
-        document["commits"] = list(commits)
+        document["commits"] = commits
         if pull_request is not None:
             document["pull_request"] = pull_request
     if record:

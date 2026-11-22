@@ -8,6 +8,7 @@ AGENT_MEMORY_DIR, and hands it to store_core.Store. The schema and the queries
 live in store_core.py.
 """
 
+import sqlite3
 import sys
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -258,7 +259,8 @@ def flush(remote_id=None):
                     conflicts.append(row["id"])
             shared.execute("COMMIT")
         except sqlite3.Error as error:
-            shared.execute("ROLLBACK")
+            if shared.in_transaction:
+                shared.execute("ROLLBACK")
             raise StoreError(f"could not flush: {error}") from error
         finally:
             shared.close()
