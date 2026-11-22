@@ -53,7 +53,7 @@ def _parser():
     create.add_argument("--scopes", default="read", help="comma-separated: read, write, admin (default read)")
     create.add_argument("--allow-org", action="append", default=[], help="another org this token may write as")
     create.add_argument("--allow-team", action="append", default=[], help="another team this token may write as")
-    create.add_argument("--label", default="", help="what the token is for, e.g. laptop")
+    create.add_argument("--label", default="", help="what the token is for, e.g. laptop (at most 64 characters)")
     create.add_argument("--same-person", action="store_true", help="a second token for a person who has one")
     actions.add_parser("list", help="every token, without secrets")
     revoke = actions.add_parser("revoke", help="revoke a token and the tokens minted from it")
@@ -168,7 +168,7 @@ def run_token(store, args, out=print, err=sys.stderr):
                 scopes,
                 allowed_orgs=allowed_orgs,
                 allowed_teams=allowed_teams,
-                label=args.label.strip(),
+                label=auth.clean_label(args.label),
                 same_person=args.same_person,
             )
             out(f"token {token_id} for {person} ({org}/{team}), scopes {','.join(scopes)}")

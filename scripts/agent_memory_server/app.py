@@ -34,7 +34,6 @@ from agent_memory_server import auth, rules
 log = logging.getLogger("agent_memory_server")
 
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-MAX_LABEL = 64
 
 
 def transport_security(settings):
@@ -219,16 +218,19 @@ def create_app(settings, store, embedding, retry_seconds=None):
         return JSONResponse(counts)
 
     async def post_tokens(request):
-        """A read-only child of the caller's token, for an editor. The same label replaces the earlier one."""
+        """A read-only child of the caller's token, for an editor. The same label replaces the earlier one.
+
+        It needs read as well as write: the child reads, and scopes don't imply
+        each other, so a write-only token must not be able to mint read access.
+        """
         who = await caller(request, "write")
         if not who.auth:
             raise BadRequest("auth is off, so editors need no token")
+        who.require("read")
         body = await _body(request)
         if not isinstance(body, dict) or set(body) - {"label"}:
             raise BadRequest("send {\"label\": \"<what the token is for>\"}")
-        label = body.get("label")
-        if not isinstance(label, str) or not label.strip() or len(label.strip()) > MAX_LABEL:
-            raise BadRequest(f"label must be 1 to {MAX_LABEL} characters")
+        label = auth.clean_label(body.get("label"), required=True)
         token_id, secret = await run_in_threadpool(
             lambda: store.create_token(
                 who.person,
@@ -237,12 +239,12 @@ def create_app(settings, store, embedding, retry_seconds=None):
                 ("read",),
                 allowed_orgs=who.allowed_orgs,
                 allowed_teams=who.allowed_teams,
-                label=label.strip(),
+                label=label,
                 parent_id=who.token_id,
             )
         )
         return JSONResponse(
-            {"id": token_id, "token": secret, "label": label.strip(), "person": who.person, "scopes": ["read"]},
+            {"id": token_id, "token": secret, "label": label, "person": who.person, "scopes": ["read"]},
             status_code=201,
         )
 

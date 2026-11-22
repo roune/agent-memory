@@ -3,12 +3,20 @@
 A token is a random secret, `am_…`, shown once when it is minted. The server
 keeps only its sha256. Each token has scopes:
 
-  read   GET /v1/whoami, /v1/memories, POST /v1/commits/status, and /mcp (PR 3)
-  write  POST /v1/memories, /v1/rejections, /v1/tokens
+  read   GET /v1/memories, POST /v1/commits/status, and /mcp (PR 3)
+  write  POST /v1/memories, /v1/rejections
   admin  POST /v1/admin/import
+  POST /v1/tokens needs read and write, since the child it mints reads.
+  GET /v1/whoami takes any valid token.
 
-Scopes don't imply each other: a laptop's token is usually read,write, and
-`migrate` needs admin too.
+Scopes don't imply each other. A laptop's token is read,write. Give admin to
+a separate token for `migrate` (PR 4) and revoke it afterwards: import keeps
+each row's own person, so admin can write as anyone.
+
+A write may supersede a memory in any org. The stamp only links the old row
+to the new one; its text never changes, and both stay readable. That is a
+decision (2026-11-22): each person answers for what they write, and controls
+can come later.
 
 With auth on, a token pins `person`, and `org` and `team` default to the
 token's own and may only be overridden with values the token allows. With
@@ -19,11 +27,13 @@ comes from the request body, as it does on the laptop today.
 import hashlib
 import json
 import secrets
+import unicodedata
 from dataclasses import dataclass
 
 SCOPES = ("read", "write", "admin")
 PREFIX = "am_"
 LOCAL = "local"
+MAX_LABEL = 64
 
 
 class AuthError(Exception):
@@ -56,6 +66,26 @@ def parse_scopes(value):
     if not found:
         raise ValueError("a token needs at least one scope")
     return tuple(scope for scope in SCOPES if scope in found)
+
+
+def clean_label(value, required=False):
+    """A token label: trimmed, at most MAX_LABEL characters, no control characters.
+
+    `token list` prints one token per line, so a newline or tab in a label
+    would break it. Empty is allowed unless required.
+    """
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ValueError("label must be text")
+    label = value.strip()
+    if required and not label:
+        raise ValueError(f"label must be 1 to {MAX_LABEL} characters")
+    if len(label) > MAX_LABEL:
+        raise ValueError(f"label must be at most {MAX_LABEL} characters")
+    if any(unicodedata.category(char) in ("Cc", "Cf", "Zl", "Zp") for char in label):
+        raise ValueError("label can't contain control characters or line breaks")
+    return label
 
 
 def bearer(header):

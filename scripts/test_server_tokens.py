@@ -62,6 +62,16 @@ class SecretsTest(TokenCase):
         self.assertEqual(self.store.token_for_secret(secret)["id"], token_id)
         self.assertIsNone(self.store.token_for_secret(secret + "x"))
 
+    def test_labels_are_one_line_and_short(self):
+        self.assertEqual(auth.clean_label("  laptop  "), "laptop")
+        self.assertEqual(auth.clean_label(""), "")
+        self.assertEqual(auth.clean_label("x" * 64), "x" * 64)
+        for bad in ("a\nb", "a\tb", "a\rb", "a\u2028b", "x" * 65, 7):
+            with self.assertRaises(ValueError):
+                auth.clean_label(bad)
+        with self.assertRaises(ValueError):
+            auth.clean_label("  ", required=True)
+
     def test_scopes_and_bearer_parsing(self):
         self.assertEqual(auth.parse_scopes("write, READ"), ("read", "write"))
         for bad in ("", "root", "read,owner"):
@@ -188,6 +198,8 @@ class TokenCommandTest(TokenCase):
         self.assertEqual(self.run_cli(*base, "--same-person")[0], 0)
         self.assertIn("unknown scope", self.run_cli(*base, "--scopes", "root")[2])
         self.assertIn("single path segment", self.run_cli("create", "--person", "a/b", "--org", "A", "--team", "T")[2])
+        self.assertIn("line breaks", self.run_cli(*base, "--same-person", "--label", "a\nb")[2])
+        self.assertIn("at most 64", self.run_cli(*base, "--same-person", "--label", "x" * 65)[2])
 
     def test_revoke(self):
         _, out, _ = self.run_cli("create", "--person", "miguel", "--org", "Acme", "--team", "Platform")

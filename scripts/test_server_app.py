@@ -334,9 +334,16 @@ class AuthOnTest(AppCase):
         again = self.client.post("/v1/tokens", json={"label": "claude-code"}, headers=self.as_(self.writer)).json()
         self.assertEqual(self.client.get("/v1/memories", headers=self.as_(child["token"])).status_code, 401)
         self.assertEqual(self.client.get("/v1/memories", headers=self.as_(again["token"])).status_code, 200)
-        for bad in ({}, {"label": ""}, {"label": "x" * 65}, {"label": "x", "scopes": ["write"]}):
+        for bad in ({}, {"label": ""}, {"label": "x" * 65}, {"label": "a\nb"}, {"label": "a\tb"}, {"label": "x", "scopes": ["write"]}):
             with self.subTest(body=bad):
                 self.assertEqual(self.client.post("/v1/tokens", json=bad, headers=self.as_(self.writer)).status_code, 400)
+
+    def test_a_write_only_token_cant_mint_read_access(self):
+        _, write_only = self.store.create_token("bot", "Acme", "Platform", ("write",))
+        refused = self.client.post("/v1/tokens", json={"label": "sneaky"}, headers=self.as_(write_only))
+        self.assertEqual(refused.status_code, 403)
+        self.assertIn("read scope", refused.json()["error"])
+        self.assertEqual(len([row for row in self.store.list_tokens() if row["parent_id"]]), 0)
 
     def test_revoking_the_parent_revokes_its_children(self):
         child = self.client.post("/v1/tokens", json={"label": "cursor"}, headers=self.as_(self.writer)).json()

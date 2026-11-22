@@ -48,7 +48,7 @@ The local `compose.yaml` turns auth off (`AGENT_MEMORY_AUTH=off`). That is safe 
 | `POST /v1/memories` | write | Approve. The body has the fields of the document `approve()` builds, and nothing else: an unknown key, `transcript_path` included, gets a 400. With auth on, `person` comes from the token (see below). Returns `{id, updated_at, embedded}`: 201 when new, 200 for an identical resend, 409 with the stored text for different content under an existing id. |
 | `POST /v1/rejections` `{repo, shas}` | write | Remembers rejected commits. |
 | `POST /v1/commits/status` `{repo, shas}` | read | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
-| `POST /v1/tokens` `{label}` | write | Mints a read-only child of the caller's token, for an editor. Returns the secret once. The same label again replaces the earlier child. 400 with auth off. |
+| `POST /v1/tokens` `{label}` | read and write | Mints a read-only child of the caller's token, for an editor. Returns the secret once. The same label again replaces the earlier child. A label is at most 64 characters, one line. 400 with auth off. |
 | `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. |
 
 With auth off, every caller has every scope.
@@ -76,16 +76,20 @@ flowchart TD
   lists -- yes --> stored["stored as the token's person<br/>written_by = token id"]
 ```
 
-- **Scopes don't imply each other.** A laptop's token is usually `read,write`. `agent-memory migrate` (PR 4) needs `admin` as well. An editor gets a read-only child from `POST /v1/tokens`.
+- **Scopes don't imply each other.** A laptop's token is `read,write`. An editor gets a read-only child from `POST /v1/tokens`, which needs both `read` and `write`, so a write-only token can't mint read access.
+- **Admin is for `migrate` only.** `agent-memory migrate` (PR 4) needs `admin`. Mint a separate token for it, and revoke it when the move is done: import keeps each row's own `person`, so an admin token can write as anyone.
 - **Identity:** `person` always comes from the token. `org` and `team` default to the token's own, and a write may name another only if the token lists it (`--allow-org`, `--allow-team`).
 - **Children:** a child token belongs to the same person, with `read` only. Revoking a token revokes every token minted from it.
 - **Import keeps people:** `/v1/admin/import` keeps each row's own `person`, because it moves memories that are already kept. That is why it needs `admin`.
+- **Supersede crosses orgs.** A write may supersede a memory in any org, not only the token's own. The stamp links the old row to the new one (`superseded_by`); the old text never changes, and every read token still sees both. This is intended: each person answers for what they write. Controls on it can come later.
 
 Mint and manage tokens next to the running server:
 
 ```
 docker compose exec server agent-memory-server token create --person miguel --org acme --team platform \
   --scopes read,write [--allow-team infra] [--label laptop] [--same-person]
+docker compose exec server agent-memory-server token create --person miguel --org acme --team platform \
+  --scopes admin --label migrate --same-person       # for agent-memory migrate; revoke it afterwards
 docker compose exec server agent-memory-server token list
 docker compose exec server agent-memory-server token revoke t_1a2b3c4d5e6f
 ```
