@@ -72,8 +72,15 @@ def check_commit(commit):
     return commit
 
 
-def _is_sha(value):
+def is_sha(value):
     return isinstance(value, str) and len(value.strip()) >= 7 and all(char in _HEX for char in value.strip())
+
+
+def check_pull_request(pull_request):
+    if pull_request is not None and (
+        isinstance(pull_request, bool) or not isinstance(pull_request, int) or pull_request < 1
+    ):
+        raise ValueError("pull_request must be a positive number")
 
 
 def check_commits(commit, commits=(), pull_request=None):
@@ -84,7 +91,7 @@ def check_commits(commit, commits=(), pull_request=None):
     (commit, commits, pull_request).
     """
     commit = check_commit(commit)
-    if not isinstance(commits, (list, tuple)) or not all(_is_sha(item) for item in commits):
+    if not isinstance(commits, (list, tuple)) or not all(is_sha(item) for item in commits):
         raise ValueError("commits must be a list of commit hashes")
     listed = []
     for item in commits:
@@ -95,10 +102,7 @@ def check_commits(commit, commits=(), pull_request=None):
         listed = [commit]
     elif commit.lower() not in (item.lower() for item in listed):
         raise ValueError("commits must include the commit the change explains")
-    if pull_request is not None and (
-        isinstance(pull_request, bool) or not isinstance(pull_request, int) or pull_request < 1
-    ):
-        raise ValueError("pull_request must be a positive number")
+    check_pull_request(pull_request)
     return commit, listed, pull_request
 
 

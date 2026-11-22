@@ -1,6 +1,10 @@
 #!/bin/sh
-# Create data/qdrant and start the Qdrant server. No account, no client library.
+# Create data/qdrant and data/server, and start the Qdrant server. No account, no client library.
 # The embed step talks to http://127.0.0.1:6333. It does not open this directory.
+#
+# The agent-memory server is behind the compose profile `server` until the
+# cutover, so this doesn't start it. Try it with:
+#   docker compose --profile server up -d --build
 
 set -eu
 
@@ -11,7 +15,14 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p data/qdrant
+# data/server must exist before Docker starts: on Linux a missing bind
+# directory is created owned by root, and the server couldn't write to it.
+mkdir -p data/qdrant data/server
+
+# The server runs as you, so the files it writes in data/server are yours.
+touch .env
+grep -q '^AGENT_MEMORY_UID=' .env || echo "AGENT_MEMORY_UID=$(id -u)" >> .env
+grep -q '^AGENT_MEMORY_GID=' .env || echo "AGENT_MEMORY_GID=$(id -g)" >> .env
 
 docker compose up -d
 

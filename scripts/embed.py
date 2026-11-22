@@ -8,7 +8,6 @@ import argparse
 import json
 import sys
 import time
-import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -17,7 +16,9 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import embedder
+import memory_points
 import memory_store
+from memory_points import point_id  # noqa: F401  callers use embed.point_id
 
 COLLECTION = "memories"
 
@@ -86,51 +87,15 @@ def ensure_collection(base, model):
                 f"{model.model} has {model.dimension}. Run scripts/embed --rebuild"
             )
     existing = (info.get("result") or {}).get("payload_schema") or {}
-    for field in (
-        "repo",
-        "tool",
-        "session_id",
-        "kind",
-        "domain",
-        "commit",
-        "commits",
-        "org",
-        "team",
-        "person",
-        "record",
-        "subject",
-        "alarm",
-        "look_at",
-        "supersedes",
-        "superseded_by",
-        "updates",
-    ):
+    for field, schema in memory_points.PAYLOAD_INDEXES.items():
         if field in existing:
             continue
         api(
             base,
             "PUT",
             f"/collections/{COLLECTION}/index",
-            {"field_name": field, "field_schema": "keyword"},
+            {"field_name": field, "field_schema": schema},
         )
-    if "pull_request" not in existing:
-        api(
-            base,
-            "PUT",
-            f"/collections/{COLLECTION}/index",
-            {"field_name": "pull_request", "field_schema": "integer"},
-        )
-    if "occurred_at" not in existing:
-        api(
-            base,
-            "PUT",
-            f"/collections/{COLLECTION}/index",
-            {"field_name": "occurred_at", "field_schema": "datetime"},
-        )
-
-
-def point_id(document_id):
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agent-memory:{document_id}"))
 
 
 def payload_for(
@@ -138,41 +103,7 @@ def payload_for(
     model_name=embedder.FastEmbedBge.model,
     revision=embedder.FastEmbedBge.revision,
 ):
-    payload = {
-        "document_id": document["id"],
-        "kind": document["kind"],
-        "domain": document["domain"],
-        "repo": document["repo"],
-        "tool": document["tool"],
-        "session_id": document["session_id"],
-        "commit": document.get("commit") or "",
-        "commits": list(document.get("commits") or []),
-        "text": document["text"],
-        "org": document.get("org") or "",
-        "team": document.get("team") or "",
-        "person": document.get("person") or "",
-        "embedding_model": model_name,
-        "embedding_revision": revision,
-    }
-    pull_request = document.get("pull_request")
-    if isinstance(pull_request, int):
-        payload["pull_request"] = pull_request
-    occurred = document.get("occurred_at")
-    if isinstance(occurred, str) and occurred.strip():
-        payload["occurred_at"] = occurred.strip()
-    for optional in (
-        "record",
-        "subject",
-        "alarm",
-        "look_at",
-        "supersedes",
-        "superseded_by",
-        "updates",
-    ):
-        val = document.get(optional)
-        if val:
-            payload[optional] = val
-    return payload
+    return memory_points.payload_for(document, model_name, revision)
 
 
 def points_for(documents, vectors, model):

@@ -392,7 +392,9 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertIsNone(hits[0]["pull_request"])
         connection = sqlite3.connect(path)
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(memory)")}
+            self.assertIn("written_by", columns)
         finally:
             connection.close()
 

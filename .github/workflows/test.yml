@@ -47,3 +47,43 @@ jobs:
           cat /tmp/server.err
           test "$code" -eq 2
           grep -q "needs the server extra" /tmp/server.err
+
+  server:
+    # The whole suite with the server extra, so nothing is skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Git identity for the throwaway repos the tests create
+        run: |
+          git config --global user.name "agent-memory CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - run: ./scripts/test-server
+
+  image:
+    # The image builds, refuses to start with auth on, and answers /v1/health.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t agent-memory-server:ci .
+      - name: Auth on is refused until tokens exist
+        run: |
+          set +e
+          docker run --rm agent-memory-server:ci 2> /tmp/refused.err
+          code=$?
+          set -e
+          cat /tmp/refused.err
+          test "$code" -eq 2
+          grep -q "PR 2c" /tmp/refused.err
+      - name: /v1/health answers with Qdrant absent
+        run: |
+          docker run -d --name server -e AGENT_MEMORY_AUTH=off agent-memory-server:ci
+          for i in $(seq 1 90); do
+            if docker exec server python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=4).read().decode())"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs server
+          exit 1

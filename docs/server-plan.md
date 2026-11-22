@@ -439,7 +439,7 @@ Test doubles:
 ### PR 2b: Server and write API, auth off
 
 - **Scope:**
-  - `scripts/server/`: the Starlette app with `/v1/health`, `/v1/whoami` (which reports auth off), the `/v1/memories` GET and POST routes, `/v1/rejections`, `/v1/commits/status` and `/v1/admin/import`.
+  - `scripts/agent_memory_server/` (a package, so the installed top-level name can't collide with another `server`): the Starlette app with `/v1/health`, `/v1/whoami` (which reports auth off), the `/v1/memories` GET and POST routes, `/v1/rejections`, `/v1/commits/status` and `/v1/admin/import`.
   - [The browser rules](#requests-from-browsers): JSON only, `Origin` and `Host` allowlists, and explicit `TransportSecuritySettings` ready for `/mcp`.
   - The write semantics: insert, identical no-op, or 409.
   - Embed-on-write and the retry loop.

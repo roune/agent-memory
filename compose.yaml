@@ -1,11 +1,17 @@
-# Local Qdrant server. The same image is the later container.
-# Storage is the server's own directory, mounted from data/qdrant.
-# Bind to loopback: this process has no API key.
+# Local Qdrant, and the agent-memory server next to it.
+#
+# `docker compose up -d` (what scripts/setup runs) starts Qdrant only. The
+# server is behind the `server` profile until the cutover (docs/server-plan.md,
+# PR 5): `docker compose --profile server up -d --build`.
 
 services:
   qdrant:
     image: qdrant/qdrant:v1.20.0
     restart: unless-stopped
+    # Temporary: the laptop's scripts/embed still talks to Qdrant on loopback.
+    # The cutover removes these ports and the shared mount, and the server
+    # reaches Qdrant as http://qdrant:6333 on the compose network only.
+    # Bind to loopback: this process has no API key.
     ports:
       - "127.0.0.1:6333:6333"
       - "127.0.0.1:6334:6334"
@@ -14,3 +20,23 @@ services:
     volumes:
       - ./data/qdrant:/qdrant/storage
       - ./data/shared:/agent-memory
+
+  server:
+    profiles: ["server"]
+    build: .
+    image: agent-memory-server:dev
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    # The host user's ids, from .env (scripts/setup writes them), so the files
+    # in data/server are yours.
+    user: "${AGENT_MEMORY_UID:-1000}:${AGENT_MEMORY_GID:-1000}"
+    environment:
+      # Auth off is safe only because the port below is published on loopback.
+      # The server's browser rules keep web pages on this machine out.
+      AGENT_MEMORY_AUTH: "off"
+      AGENT_MEMORY_QDRANT_URL: http://qdrant:6333
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data/server:/data

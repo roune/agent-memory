@@ -102,3 +102,4 @@ Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agen
 - [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
 - [docs/research.md](docs/research.md) — the “what already does this” question, still open.
 - [docs/server-plan.md](docs/server-plan.md) — the approved plan for moving to one server in Docker, in ordered PRs.
+- [docs/server.md](docs/server.md) — the server preview: routes, browser rules, `reindex`, and how to try it before the cutover.
