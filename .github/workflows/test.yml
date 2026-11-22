@@ -62,28 +62,48 @@ jobs:
       - run: ./scripts/test-server
 
   image:
-    # The image builds, refuses to start with auth on, and answers /v1/health.
+    # The image builds and answers /v1/health with auth on and off. With auth
+    # on, /v1/whoami needs a token, and one made with `token create` works.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t agent-memory-server:ci .
-      - name: Auth on is refused until tokens exist
+      - name: Auth on (the default), with Qdrant absent
         run: |
-          set +e
-          docker run --rm agent-memory-server:ci 2> /tmp/refused.err
-          code=$?
-          set -e
-          cat /tmp/refused.err
-          test "$code" -eq 2
-          grep -q "PR 2c" /tmp/refused.err
-      - name: /v1/health answers with Qdrant absent
-        run: |
-          docker run -d --name server -e AGENT_MEMORY_AUTH=off agent-memory-server:ci
+          docker run -d --name server agent-memory-server:ci
+          ready=""
           for i in $(seq 1 90); do
             if docker exec server python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=4).read().decode())"; then
+              ready=yes
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then docker logs server; exit 1; fi
+          docker exec server python -c "
+          import urllib.error, urllib.request
+          try:
+              urllib.request.urlopen('http://127.0.0.1:8765/v1/whoami', timeout=4)
+          except urllib.error.HTTPError as error:
+              raise SystemExit(0 if error.code == 401 else f'expected 401, got {error.code}')
+          raise SystemExit('whoami answered without a token')
+          "
+          secret=$(docker exec server agent-memory-server token create --person ci --org CI --team CI --scopes read | sed -n 2p)
+          docker exec -e TOKEN="$secret" server python -c "
+          import json, os, urllib.request
+          request = urllib.request.Request('http://127.0.0.1:8765/v1/whoami', headers={'Authorization': 'Bearer ' + os.environ['TOKEN']})
+          who = json.load(urllib.request.urlopen(request, timeout=4))
+          assert who['person'] == 'ci' and who['scopes'] == ['read'], who
+          print('whoami:', who['person'], who['scopes'])
+          "
+      - name: Auth off, with Qdrant absent
+        run: |
+          docker run -d --name local -e AGENT_MEMORY_AUTH=off agent-memory-server:ci
+          for i in $(seq 1 90); do
+            if docker exec local python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=4).read().decode())"; then
               exit 0
             fi
             sleep 1
           done
-          docker logs server
+          docker logs local
           exit 1

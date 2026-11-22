@@ -34,6 +34,8 @@ services:
     environment:
       # Auth off is safe only because the port below is published on loopback.
       # The server's browser rules keep web pages on this machine out.
+      # Anywhere else, leave auth on (the default) and mint tokens with
+      # `agent-memory-server token create` (docs/server.md, "Auth and tokens").
       AGENT_MEMORY_AUTH: "off"
       AGENT_MEMORY_QDRANT_URL: http://qdrant:6333
       # Set these in .env. Switching the embedder also needs a reindex

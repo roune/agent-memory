@@ -1,8 +1,10 @@
 """The HTTP app: /v1 routes for the CLI, behind the browser rules. Needs the server extra.
 
-Auth is off in this version (docs/server-plan.md, PR 2c adds tokens), so every
-caller has every scope and identity comes from the request body. The browser
-rules are what keep web pages on this machine out:
+With auth on (the default), every route but /v1/health needs a bearer token
+with the route's scope, and a write takes its person from the token (auth.py).
+With AGENT_MEMORY_AUTH=off (local compose only), every caller has every scope
+and identity comes from the request body. Either way, the browser rules keep
+web pages on this machine out:
 
 - a Host not in AGENT_MEMORY_ALLOWED_HOSTS gets 421 (DNS rebinding)
 - an Origin not in AGENT_MEMORY_ALLOWED_ORIGINS gets 403 (any web page)
@@ -27,13 +29,11 @@ from starlette.routing import Route
 
 from store_core import StoreError
 
-from agent_memory_server import rules
+from agent_memory_server import auth, rules
 
 log = logging.getLogger("agent_memory_server")
 
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-SCOPES_WITH_AUTH_OFF = ["read", "write", "admin"]
-WRITTEN_BY_WITH_AUTH_OFF = "local"
 
 
 def transport_security(settings):
@@ -103,6 +103,19 @@ def create_app(settings, store, embedding, retry_seconds=None):
     """The ASGI app. retry_seconds=None uses settings.retry_seconds; 0 turns the retry loop off."""
     retry = settings.retry_seconds if retry_seconds is None else retry_seconds
 
+    async def caller(request, scope):
+        """Who is calling. Raises AuthError: 401 without a valid token, 403 without the scope."""
+        if settings.auth_off:
+            return auth.Caller.local()
+        secret = auth.bearer(request.headers.get("authorization"))
+        if secret is None:
+            raise auth.AuthError(401, "send Authorization: Bearer <token>")
+        row = await run_in_threadpool(store.token_for_secret, secret)
+        if row is None:
+            raise auth.AuthError(401, "unknown or revoked token")
+        found = auth.Caller.from_row(row)
+        return found.require(scope) if scope else found
+
     async def embed_now():
         return await run_in_threadpool(embedding.embed_pending)
 
@@ -141,34 +154,26 @@ def create_app(settings, store, embedding, retry_seconds=None):
         )
 
     async def whoami(request):
-        return JSONResponse(
-            {
-                "auth": "off",
-                "person": None,
-                "org": None,
-                "team": None,
-                "allowed_orgs": [],
-                "allowed_teams": [],
-                "scopes": SCOPES_WITH_AUTH_OFF,
-                "identity": "from the request body",
-                "embedder": embedding.status(),
-            }
-        )
+        who = await caller(request, None)
+        return JSONResponse({**who.describe(), "embedder": embedding.status()})
 
     async def list_memories(request):
+        await caller(request, "read")
         filters = rules.query_from_params(dict(request.query_params))
         hits = await run_in_threadpool(lambda: store.query_memories(**filters))
         return JSONResponse({"memories": hits})
 
     async def get_memory(request):
+        await caller(request, "read")
         found = await run_in_threadpool(store.get_memory, request.path_params["memory_id"])
         if found is None:
             return JSONResponse({"error": "no memory with that id"}, status_code=404)
         return JSONResponse(found)
 
     async def post_memory(request):
-        document = rules.memory_from_body(await _body(request))
-        outcome, stored = await run_in_threadpool(store.write_memory, document, WRITTEN_BY_WITH_AUTH_OFF)
+        who = await caller(request, "write")
+        document = rules.memory_from_body(auth.pin_identity(who, await _body(request)))
+        outcome, stored = await run_in_threadpool(store.write_memory, document, who.token_id)
         if outcome == "conflict":
             return JSONResponse(
                 {
@@ -188,11 +193,13 @@ def create_app(settings, store, embedding, retry_seconds=None):
         )
 
     async def post_rejections(request):
+        await caller(request, "write")
         repo, shas = rules.commits_from_body(await _body(request))
         count = await run_in_threadpool(store.reject_commits, repo, shas)
         return JSONResponse({"rejected": count})
 
     async def commits_status(request):
+        await caller(request, "read")
         repo, shas = rules.commits_from_body(await _body(request))
 
         def look():
@@ -204,10 +211,46 @@ def create_app(settings, store, embedding, retry_seconds=None):
         return JSONResponse({"commits": await run_in_threadpool(look)})
 
     async def admin_import(request):
+        who = await caller(request, "admin")
         memories, rejections = rules.import_from_body(await _body(request))
-        counts = await run_in_threadpool(store.import_rows, memories, rejections, WRITTEN_BY_WITH_AUTH_OFF)
+        counts = await run_in_threadpool(store.import_rows, memories, rejections, who.token_id)
         counts["embedded"] = await embed_now()
         return JSONResponse(counts)
+
+    async def post_tokens(request):
+        """A read-only child of the caller's token, for an editor. The same label replaces the earlier one.
+
+        It needs read as well as write: the child reads, and scopes don't imply
+        each other, so a write-only token must not be able to mint read access.
+        """
+        who = await caller(request, "write")
+        if not who.auth:
+            raise BadRequest("auth is off, so editors need no token")
+        who.require("read")
+        body = await _body(request)
+        if not isinstance(body, dict) or set(body) - {"label"}:
+            raise BadRequest("send {\"label\": \"<what the token is for>\"}")
+        label = auth.clean_label(body.get("label"), required=True)
+        token_id, secret = await run_in_threadpool(
+            lambda: store.create_token(
+                who.person,
+                who.org,
+                who.team,
+                ("read",),
+                allowed_orgs=who.allowed_orgs,
+                allowed_teams=who.allowed_teams,
+                label=label,
+                parent_id=who.token_id,
+            )
+        )
+        return JSONResponse(
+            {"id": token_id, "token": secret, "label": label, "person": who.person, "scopes": ["read"]},
+            status_code=201,
+        )
+
+    async def refused(request, error):
+        headers = {"WWW-Authenticate": "Bearer"} if error.status == 401 else None
+        return JSONResponse({"error": str(error)}, status_code=error.status, headers=headers)
 
     async def bad_request(request, error):
         return JSONResponse({"error": str(error)}, status_code=400)
@@ -229,8 +272,10 @@ def create_app(settings, store, embedding, retry_seconds=None):
             Route("/v1/rejections", post_rejections, methods=["POST"]),
             Route("/v1/commits/status", commits_status, methods=["POST"]),
             Route("/v1/admin/import", admin_import, methods=["POST"]),
+            Route("/v1/tokens", post_tokens, methods=["POST"]),
         ],
         exception_handlers={
+            auth.AuthError: refused,
             BadRequest: bad_request,
             ValueError: bad_request,
             StoreError: store_failed,

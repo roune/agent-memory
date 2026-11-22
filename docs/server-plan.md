@@ -97,14 +97,14 @@ At about 10 ms per text with bge-small, embedding inside the request costs nothi
 | Route | Scope | Purpose |
 | --- | --- | --- |
 | `GET /v1/health` | none | Liveness, Qdrant readiness, and the embedder state. Compose and `setup` wait on it. |
-| `GET /v1/whoami` | read | The token's person, org, team, allowed orgs and teams, and scopes, plus whether auth is on and the active embedder. The review form fills its defaults from this. |
+| `GET /v1/whoami` | any token | The token's person, org, team, allowed orgs and teams, and scopes, plus whether auth is on and the active embedder. The review form fills its defaults from this. |
 | `POST /mcp` (and `GET` for the stream) | read | MCP tools `search`, `get`, `list`. |
 | `GET /v1/memories?org&team&repo&since&limit` | read | Backs `agent-memory list`. |
 | `GET /v1/memories/{id}` | read | One row with its commits. |
 | `POST /v1/memories` | write | Approve. Returns `{id, updated_at, embedded}`: 201 when new, 200 for an identical resend, 409 for different content under an existing id. |
 | `POST /v1/rejections` `{repo, shas}` | write | Reject remembers commits, as it does today. |
 | `POST /v1/commits/status` `{repo, shas}` | read | For each sha: `{kept, rejected}`. It matches abbreviated hashes both ways, as `_commit_in` does today. `land` sends a batch in one call. |
-| `POST /v1/tokens` `{label}` | write | Mints a read-scope token for the caller's own person, as a child of the caller's token. A second call with the same label revokes the earlier child. Revoking a parent revokes its children. `connect --editor` uses it. |
+| `POST /v1/tokens` `{label}` | read and write | Mints a read-scope token for the caller's own person, as a child of the caller's token. A second call with the same label revokes the earlier child. Revoking a parent revokes its children. `connect --editor` uses it. |
 | `POST /v1/admin/import` | admin | Bulk upsert of full rows that keep their original `id`, `person`, and `updated_at`, plus `rejected_commit` rows. A newer `updated_at` wins. Used by `agent-memory migrate`. |
 
 The server also has commands:
@@ -483,6 +483,7 @@ Test doubles:
   - `search`, `get`, and `list` at `/mcp`, reshaped from `16a1f2c`.
   - They read the server's SQLite and the active collection, and embed the query with `embed_query`.
   - Read scope is required when auth is on.
+  - Superseded memories are returned too, with `superseded_by` as metadata. Nothing is hidden: a supersede may come from another org (PR 2c), so the reader sees both notes. Ranking by the caller's org is a later option.
   - Check that the SDK's app mounts cleanly at `/mcp`, with no doubled path, and that its lifespan runs.
   - `.mcp.json` → `{"mcpServers": {"agent-memory-dev": {"type": "http", "url": "http://127.0.0.1:8765/mcp"}}}`. The name keeps the project entry from hiding a user's team server.
   - The MCP `INSTRUCTIONS` text.

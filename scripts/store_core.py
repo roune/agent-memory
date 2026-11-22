@@ -110,11 +110,28 @@ CREATE TABLE IF NOT EXISTS memory_embedding (
   PRIMARY KEY (memory_id, collection)
 );
 CREATE INDEX IF NOT EXISTS memory_embedding_by_collection ON memory_embedding (collection);
+CREATE TABLE IF NOT EXISTS token (
+  id TEXT PRIMARY KEY,
+  hash TEXT NOT NULL UNIQUE,
+  parent_id TEXT,
+  label TEXT NOT NULL DEFAULT '',
+  person TEXT NOT NULL,
+  org TEXT NOT NULL,
+  team TEXT NOT NULL,
+  allowed_orgs TEXT NOT NULL DEFAULT '[]',
+  allowed_teams TEXT NOT NULL DEFAULT '[]',
+  scopes TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS token_parent ON token (parent_id);
+CREATE INDEX IF NOT EXISTS token_person ON token (person);
 """
 
 
 # 2: memory.pull_request and memory_commit.
 # 3: memory.written_by, embedding_state and memory_embedding, for the server.
+#    The server's token table (PR 2c) is new, so SCHEMA creates it; no bump.
 SCHEMA_VERSION = 3
 
 

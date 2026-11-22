@@ -57,6 +57,7 @@ def body(**changes):
 @unittest.skipUnless(HAVE_STARLETTE, "needs the server extra (scripts/test-server)")
 class AppCase(unittest.TestCase):
     origins = ()
+    auth_mode = "off"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -65,7 +66,7 @@ class AppCase(unittest.TestCase):
         logging.getLogger("agent_memory_server").addHandler(quiet)
         self.addCleanup(logging.getLogger("agent_memory_server").removeHandler, quiet)
         data = Path(self.tmp.name)
-        self.settings = Settings(data_dir=data, models_dir=data / "models", auth="off", allowed_origins=self.origins)
+        self.settings = Settings(data_dir=data, models_dir=data / "models", auth=self.auth_mode, allowed_origins=self.origins)
         self.store = ServerStore(self.settings.db_path)
         self.fake = FakeQdrant()
         self.embedding = Embedding(self.store, HashEmbedder(), Qdrant("http://qdrant:6333", transport=self.fake))
@@ -228,6 +229,141 @@ class ImportRouteTest(AppCase):
         self.assertEqual(self.fake.payloads(self.embedding.collection)["miguel-learning-old"]["text"], "v2")
         bad = self.post("/v1/admin/import", {"memories": [{**self.row("x", "2026-11-03T00:00:00+00:00"), "transcript_path": "t"}]})
         self.assertEqual(bad.status_code, 400)
+
+
+class AuthOnTest(AppCase):
+    """Auth on: tokens, scopes, identity pinning, child tokens and whoami over HTTP."""
+
+    auth_mode = "on"
+
+    def setUp(self):
+        super().setUp()
+        self.writer_id, self.writer = self.store.create_token(
+            "miguel", "Acme", "Platform", ("read", "write"), allowed_teams=("Infra",)
+        )
+        _, self.reader = self.store.create_token("ana", "Acme", "Platform", ("read",))
+        _, self.admin = self.store.create_token("ops", "Acme", "Platform", ("read", "write", "admin"))
+
+    def as_(self, secret):
+        return {"Authorization": f"Bearer {secret}"}
+
+    def anonymous_body(self, **changes):
+        document = body(**changes)
+        for field in ("person", "org", "team"):
+            if field not in changes:
+                document.pop(field)
+        return document
+
+    def test_health_needs_no_token_and_everything_else_does(self):
+        self.assertEqual(self.client.get("/v1/health").json()["auth"], "on")
+        for method, path in (
+            ("get", "/v1/whoami"),
+            ("get", "/v1/memories"),
+            ("get", "/v1/memories/x-learning-y"),
+            ("post", "/v1/memories"),
+            ("post", "/v1/rejections"),
+            ("post", "/v1/commits/status"),
+            ("post", "/v1/admin/import"),
+            ("post", "/v1/tokens"),
+        ):
+            with self.subTest(path=path):
+                response = getattr(self.client, method)(path, **({"json": {}} if method == "post" else {}))
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.headers["www-authenticate"], "Bearer")
+        bogus = self.client.get("/v1/memories", headers=self.as_("am_not-a-real-token"))
+        self.assertEqual(bogus.status_code, 401)
+
+    def test_read_cant_write_and_write_cant_import(self):
+        self.assertEqual(self.client.get("/v1/memories", headers=self.as_(self.reader)).status_code, 200)
+        denied = self.client.post("/v1/memories", json=self.anonymous_body(), headers=self.as_(self.reader))
+        self.assertEqual(denied.status_code, 403)
+        self.assertIn("write scope", denied.json()["error"])
+        self.assertEqual(self.client.post("/v1/rejections", json={"repo": REPO, "shas": [A]}, headers=self.as_(self.reader)).status_code, 403)
+        imported = self.client.post("/v1/admin/import", json={"memories": []}, headers=self.as_(self.writer))
+        self.assertEqual(imported.status_code, 403)
+        self.assertEqual(self.client.post("/v1/admin/import", json={"memories": []}, headers=self.as_(self.admin)).status_code, 200)
+        self.assertEqual(self.store.count_memories(), 0)
+
+    def test_the_token_pins_person_and_records_who_wrote_it(self):
+        created = self.client.post("/v1/memories", json=self.anonymous_body(), headers=self.as_(self.writer))
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(created.json()["id"], "miguel-learning-s1")
+        kept = self.client.get("/v1/memories/miguel-learning-s1", headers=self.as_(self.reader)).json()
+        self.assertEqual((kept["person"], kept["org"], kept["team"]), ("miguel", "Acme", "Platform"))
+        connection = __import__("sqlite3").connect(self.store.path)
+        try:
+            written_by = connection.execute("SELECT written_by FROM memory").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(written_by, self.writer_id)
+        as_ana = self.client.post("/v1/memories", json=body(person="ana"), headers=self.as_(self.writer))
+        self.assertEqual(as_ana.status_code, 403)
+        self.assertIn("writes as miguel", as_ana.json()["error"])
+
+    def test_org_and_team_only_from_the_tokens_lists(self):
+        infra = self.client.post(
+            "/v1/memories", json=self.anonymous_body(session_id="s2", team="Infra"), headers=self.as_(self.writer)
+        )
+        self.assertEqual(infra.status_code, 201)
+        sales = self.client.post(
+            "/v1/memories", json=self.anonymous_body(session_id="s3", team="Sales"), headers=self.as_(self.writer)
+        )
+        self.assertEqual(sales.status_code, 403)
+        other_org = self.client.post(
+            "/v1/memories", json=self.anonymous_body(session_id="s4", org="Other"), headers=self.as_(self.writer)
+        )
+        self.assertEqual(other_org.status_code, 403)
+
+    def test_whoami_reports_the_tokens_identity(self):
+        who = self.client.get("/v1/whoami", headers=self.as_(self.writer)).json()
+        self.assertEqual((who["auth"], who["token"], who["person"]), ("on", self.writer_id, "miguel"))
+        self.assertEqual((who["allowed_orgs"], who["allowed_teams"]), (["Acme"], ["Platform", "Infra"]))
+        self.assertEqual(who["scopes"], ["read", "write"])
+
+    def test_child_tokens_for_editors(self):
+        minted = self.client.post("/v1/tokens", json={"label": "claude-code"}, headers=self.as_(self.writer))
+        self.assertEqual(minted.status_code, 201, minted.text)
+        child = minted.json()
+        self.assertEqual((child["person"], child["scopes"], child["label"]), ("miguel", ["read"], "claude-code"))
+        self.assertEqual(self.client.get("/v1/memories", headers=self.as_(child["token"])).status_code, 200)
+        self.assertEqual(
+            self.client.post("/v1/memories", json=self.anonymous_body(), headers=self.as_(child["token"])).status_code, 403
+        )
+        self.assertEqual(self.client.post("/v1/tokens", json={"label": "x"}, headers=self.as_(child["token"])).status_code, 403)
+        self.assertEqual(self.client.post("/v1/tokens", json={"label": "x"}, headers=self.as_(self.reader)).status_code, 403)
+        again = self.client.post("/v1/tokens", json={"label": "claude-code"}, headers=self.as_(self.writer)).json()
+        self.assertEqual(self.client.get("/v1/memories", headers=self.as_(child["token"])).status_code, 401)
+        self.assertEqual(self.client.get("/v1/memories", headers=self.as_(again["token"])).status_code, 200)
+        for bad in ({}, {"label": ""}, {"label": "x" * 65}, {"label": "a\nb"}, {"label": "a\tb"}, {"label": "x", "scopes": ["write"]}):
+            with self.subTest(body=bad):
+                self.assertEqual(self.client.post("/v1/tokens", json=bad, headers=self.as_(self.writer)).status_code, 400)
+
+    def test_a_write_only_token_cant_mint_read_access(self):
+        _, write_only = self.store.create_token("bot", "Acme", "Platform", ("write",))
+        refused = self.client.post("/v1/tokens", json={"label": "sneaky"}, headers=self.as_(write_only))
+        self.assertEqual(refused.status_code, 403)
+        self.assertIn("read scope", refused.json()["error"])
+        self.assertEqual(len([row for row in self.store.list_tokens() if row["parent_id"]]), 0)
+
+    def test_revoking_the_parent_revokes_its_children(self):
+        child = self.client.post("/v1/tokens", json={"label": "cursor"}, headers=self.as_(self.writer)).json()
+        self.store.revoke_token(self.writer_id)
+        for secret in (self.writer, child["token"]):
+            self.assertEqual(self.client.get("/v1/memories", headers=self.as_(secret)).status_code, 401)
+
+    def test_browser_rules_still_come_first(self):
+        response = self.client.post(
+            "/v1/memories", content=b"{}", headers={**self.as_(self.writer), "Content-Type": "text/plain"}
+        )
+        self.assertEqual(response.status_code, 415)
+
+
+class AuthOffTokensTest(AppCase):
+    def test_minting_a_token_with_auth_off_is_refused(self):
+        refused = self.client.post("/v1/tokens", json={"label": "x"})
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("auth is off", refused.json()["error"])
+        self.assertEqual(self.client.get("/v1/whoami").json()["identity"], "from the request body")
 
 
 if __name__ == "__main__":

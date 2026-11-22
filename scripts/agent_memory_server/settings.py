@@ -5,7 +5,8 @@ AGENT_MEMORY_MODELS_DIR       where a local model's checkpoint is (<data>/models
                               the image sets /opt/agent-memory/models)
 AGENT_MEMORY_QDRANT_URL       Qdrant's URL (http://qdrant:6333, the compose network)
 AGENT_MEMORY_QDRANT_API_KEY   sent as api-key when Qdrant has one (optional)
-AGENT_MEMORY_AUTH             "off" turns auth off; nothing else is built yet (PR 2c)
+AGENT_MEMORY_AUTH             "off" turns auth off (local compose only); anything
+                              else, or unset, means bearer tokens (auth.py)
 AGENT_MEMORY_ALLOWED_HOSTS    Host headers to answer (127.0.0.1:8765,localhost:8765)
 AGENT_MEMORY_ALLOWED_ORIGINS  browser Origins to answer (none)
 AGENT_MEMORY_EMBED_RETRY      seconds between embed retries (30)
