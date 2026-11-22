@@ -1,6 +1,6 @@
 # Agent brief
 
-This repo is a brief, not a product yet. There is no application code. The vector engine is Qdrant server, started by `scripts/setup` into `data/qdrant/`. The embedding model is `BAAI/bge-small-en-v1.5`, run by `scripts/embed`. See [docs/vector-engine.md](docs/vector-engine.md) and [docs/embedding-model.md](docs/embedding-model.md).
+This repo is a brief, not a product yet. There is no application code. The vector engine is Qdrant server, started by `scripts/setup` into `data/qdrant/`. The default embedding model is `BAAI/bge-small-en-v1.5` through fastembed at a pinned revision, run by `scripts/embed`. Other models plug in through `scripts/embedder.py`. See [docs/vector-engine.md](docs/vector-engine.md) and [docs/embedding-model.md](docs/embedding-model.md).
 
 ## This session’s job
 
@@ -8,7 +8,8 @@ Research first. Read [docs/context.md](docs/context.md), [docs/harnesses.md](doc
 
 ## Do not
 
-- Swap the vector engine or the embedding model. They are Qdrant server and `BAAI/bge-small-en-v1.5`. A different model means deleting the collection and embedding again.
+- Swap the vector engine. It is Qdrant server.
+- Change the default embedding model or its pinned revision, or implement a hosted adapter (OpenAI, Bedrock), without a plan PR first. A deployment runs one embedder. A different model means embedding every row of `memories.sqlite` again. Today `scripts/embed --rebuild` deletes the `memories` collection and builds it again at the new model's size. The server's `reindex` will keep one collection per model instead.
 - Add a dependency for capture or review until section 1 of [docs/research.md](docs/research.md) is answered.
 - Install hooks into `~/.cursor`, `~/.claude`, `~/.codex`, or Pi.
 - Commit transcripts, inbox dumps, or anything under `data/`.

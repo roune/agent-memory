@@ -70,7 +70,11 @@ class MemoryStoreTest(unittest.TestCase):
         self._previous = {
             "HOME": os.environ.get("HOME"),
             "AGENT_MEMORY_DIR": os.environ.get("AGENT_MEMORY_DIR"),
+            "AGENT_MEMORY_EMBEDDER": os.environ.get("AGENT_MEMORY_EMBEDDER"),
+            "AGENT_MEMORY_EMBED_MODEL": os.environ.get("AGENT_MEMORY_EMBED_MODEL"),
         }
+        os.environ.pop("AGENT_MEMORY_EMBEDDER", None)
+        os.environ.pop("AGENT_MEMORY_EMBED_MODEL", None)
         os.environ["HOME"] = str(self.home)
         os.environ["AGENT_MEMORY_DIR"] = str(self.store)
         self.db = load_store()
