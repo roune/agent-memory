@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-memory"
+version = "0.1.0"
+description = "File coding-agent sessions and git history, keep only what a person approves, and index that."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE", "NOTICE"]
+# The CLI is standard library only. AGENTS.md keeps capture and review free of
+# new dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+# The server in Docker: MCP over streamable HTTP, and the default embedder.
+server = [
+    "mcp==2.3.0",
+    "fastembed==0.9.1",
+]
+
+[project.scripts]
+agent-memory = "agent_memory:main"
+# Installed with or without the extra: an extra can't choose console scripts.
+# Without the extra it explains how to get it.
+agent-memory-server = "agent_memory_server:main"
+
+[tool.setuptools]
+# Modules stay in scripts/, so the test command does not change.
+package-dir = { "" = "scripts" }
+py-modules = [
+    "agent_memory",
+    "agent_memory_server",
+    "embed",
+    "embedder",
+    "memory_rules",
+    "memory_store",
+    "store_core",
+]

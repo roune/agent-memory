@@ -27,13 +27,14 @@ ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+import memory_rules
 import memory_store
 HOME = Path.home()
 BIN = ROOT / "bin" / "agent-memory"
 PORT_START = 4173
-KINDS = ("change", "learning", "decision")
-DOMAINS = ("code", "architecture", "operations")
-RECORDS = ("", "explanation", "history", "runbook")
+KINDS = memory_rules.KINDS
+DOMAINS = memory_rules.DOMAINS
+RECORDS = memory_rules.RECORDS
 END_EVENTS = {"session-end", "sessionend", "session_shutdown"}
 MARKER = "agent-memory-hook"
 GIT_HOOK_MARKER = "agent-memory-git-hook"
@@ -1372,10 +1373,8 @@ def approve(
     superseded_by="",
     updates="",
 ):
-    # A browser submits a textarea's line breaks as CRLF. Store LF.
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if kind not in KINDS or domain not in DOMAINS or not text:
-        raise ValueError("kind, domain, and text are required")
+    text = memory_rules.clean_text(text)
+    memory_rules.check_shape(kind, domain, text)
     repo_path = str(bundle.get("repo") or "").strip()
     tool = str(bundle.get("tool") or "").strip()
     session_id = str(bundle.get("session_id") or "").strip()
@@ -1386,10 +1385,7 @@ def approve(
     org = (org or iden.get("org") or "").strip()
     team = (team or iden.get("team") or "").strip()
     person = (person or iden.get("person") or "").strip()
-    if not org or not team or not person:
-        raise ValueError("org, team, and person are required (identity file or form)")
-    if "/" in person or person in {".", ".."}:
-        raise ValueError("person must be a single path segment")
+    memory_rules.check_identity(org, team, person)
     land = bundle.get("land") or {}
     remote_repo = (remote_repo or land.get("remote_repo") or "").strip()
     if not remote_repo:
@@ -1400,56 +1396,36 @@ def approve(
     occurred_at = (occurred_at or bundle.get("ended_at") or "").strip()
     if not occurred_at:
         occurred_at = now()
-
-    if record not in RECORDS:
-        raise ValueError("record must be empty, explanation, history, or runbook")
-    subject = subject.strip()
-    alarm = alarm.strip()
-    look_at = look_at.strip()
-    supersedes = supersedes.strip()
-    superseded_by = superseded_by.strip()
-    updates = updates.strip()
+    memory_rules.check_record(record)
 
     commits = []
     pull_request = None
     if kind == "change":
-        commit = commit.strip()
-        if len(commit) < 7 or any(char not in "0123456789abcdefABCDEF" for char in commit):
-            raise ValueError("a change needs the commit it explains")
+        commit = memory_rules.check_commit(commit)
         commits, pull_request = commits_for_change(bundle, commit)
 
-    document = {
-        "id": f"{person}-{kind}-{session_id}",
-        "kind": kind,
-        "domain": domain,
-        "repo": remote_repo,
-        "tool": tool,
-        "session_id": session_id,
-        "text": text,
-        "org": org,
-        "team": team,
-        "person": person,
-        "occurred_at": occurred_at,
-    }
-    if kind == "change":
-        document["commit"] = commit
-        document["commits"] = commits
-        if pull_request is not None:
-            document["pull_request"] = pull_request
-    if record:
-        document["record"] = record
-    if subject:
-        document["subject"] = subject
-    if alarm:
-        document["alarm"] = alarm
-    if look_at:
-        document["look_at"] = look_at
-    if supersedes:
-        document["supersedes"] = supersedes
-    if superseded_by:
-        document["superseded_by"] = superseded_by
-    if updates:
-        document["updates"] = updates
+    document = memory_rules.build_document(
+        kind=kind,
+        domain=domain,
+        text=text,
+        repo=remote_repo,
+        tool=tool,
+        session_id=session_id,
+        org=org,
+        team=team,
+        person=person,
+        occurred_at=occurred_at,
+        commit=commit,
+        commits=commits,
+        pull_request=pull_request,
+        record=record,
+        subject=subject,
+        alarm=alarm,
+        look_at=look_at,
+        supersedes=supersedes,
+        superseded_by=superseded_by,
+        updates=updates,
+    )
 
     try:
         memory_store.save_approved(document)
