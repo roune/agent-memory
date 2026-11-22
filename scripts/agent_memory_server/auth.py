@@ -3,7 +3,7 @@
 A token is a random secret, `am_…`, shown once when it is minted. The server
 keeps only its sha256. Each token has scopes:
 
-  read   GET /v1/memories, POST /v1/commits/status, and /mcp (PR 3)
+  read   GET /v1/memories, POST /v1/commits/status, and /mcp
   write  POST /v1/memories, /v1/rejections
   admin  POST /v1/admin/import
   POST /v1/tokens needs read and write, since the child it mints reads.

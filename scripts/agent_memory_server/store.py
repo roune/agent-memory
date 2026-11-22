@@ -250,6 +250,26 @@ class ServerStore(Store):
         finally:
             connection.close()
 
+    def memories_by_ids(self, ids):
+        """{id: row in get_memory's shape} for the ids that exist. Reads only.
+
+        Search reads its hits back from here, so text and superseded_by come
+        from SQLite, not from a point that may still be waiting to be embedded.
+        """
+        wanted = [memory_id for memory_id in dict.fromkeys(ids) if memory_id]
+        if not wanted:
+            return {}
+        connection = self._open_existing()
+        if connection is None:
+            return {}
+        try:
+            marks = ", ".join("?" for _ in wanted)
+            rows = connection.execute(f"SELECT * FROM memory WHERE id IN ({marks})", wanted).fetchall()
+            commits = _commits_by_id(connection, [row["id"] for row in rows])
+        finally:
+            connection.close()
+        return {row["id"]: hit_from_row(row, commits[row["id"]]) for row in rows}
+
     def embedding_state(self):
         """The active embedder and its collection, or None before the first one."""
         connection = self._open_existing()

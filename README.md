@@ -21,14 +21,14 @@ flowchart LR
 
 ### Where it is heading
 
-[docs/server-plan.md](docs/server-plan.md) moves the store into one server in Docker. Approve sends the note to the server, which embeds it on write. Editors will read through MCP. The server exists as a preview behind a compose profile ([docs/server.md](docs/server.md)), and the laptop flow above is unchanged until the cutover.
+[docs/server-plan.md](docs/server-plan.md) moves the store into one server in Docker. Approve sends the note to the server, which embeds it on write. Editors read through MCP at `/mcp` (`search`, `get`, `list`; this repo's `.mcp.json` registers it). The server exists as a preview behind a compose profile ([docs/server.md](docs/server.md)), and the laptop flow above is unchanged until the cutover.
 
 ```mermaid
 flowchart LR
   subgraph laptop["Your laptop"]
     cli["agent-memory review<br/>Approve / Reject"]
     outbox[("outbox/<br/>when offline")]
-    editors["Editors<br/>(MCP, later)"]
+    editors["Editors<br/>(MCP)"]
   end
   subgraph docker["Docker"]
     server["agent-memory-server :8765<br/>/v1 write API · /mcp read"]

@@ -14,7 +14,8 @@ Research first. Read [docs/context.md](docs/context.md), [docs/harnesses.md](doc
 - Install hooks into `~/.cursor`, `~/.claude`, `~/.codex`, or Pi.
 - Commit transcripts, inbox dumps, or anything under `data/`.
 - Reopen the decisions in [docs/context.md](docs/context.md). Those are locked.
-- Build retrieval. The first build stops at capture, review, and embed.
+- Add a write tool to the MCP server. Writes go through the authenticated `/v1` API, which only the review flow calls.
+- Build automatic retrieval: no session-start hook that injects memories into a session. Query is on demand only, through the server's read-only MCP tools.
 
 ## Server work
 

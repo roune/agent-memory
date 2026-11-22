@@ -80,6 +80,13 @@ class Qdrant:
     def upsert(self, name, points):
         self._call("PUT", f"/collections/{name}/points?wait=true", {"points": points})
 
+    def query(self, name, body):
+        """The universal query API. Returns Qdrant's points, or None when the collection is missing."""
+        found = self._call("POST", f"/collections/{name}/points/query", body, missing_ok=True)
+        if found is None:
+            return None
+        return (found.get("result") or {}).get("points") or []
+
     def count(self, name):
         found = self._call("POST", f"/collections/{name}/points/count", {"exact": True})
         return int((found.get("result") or {}).get("count", 0))

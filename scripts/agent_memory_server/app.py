@@ -8,11 +8,18 @@ web pages on this machine out:
 
 - a Host not in AGENT_MEMORY_ALLOWED_HOSTS gets 421 (DNS rebinding)
 - an Origin not in AGENT_MEMORY_ALLOWED_ORIGINS gets 403 (any web page)
-- a POST, PUT, PATCH or DELETE without Content-Type: application/json gets 415
-  (a cross-site form or text/plain POST needs no preflight; this one would)
+- a POST, PUT or PATCH without Content-Type: application/json gets 415
+  (a cross-site form or text/plain POST needs no preflight; this one would).
+  DELETE is left out: it has no body here (an MCP client ends its session
+  with one, often without a Content-Type), and a browser preflights it.
 
-They wrap the whole app, so /mcp gets them too when PR 3 mounts it there, with
-transport_security() passed to the SDK as well.
+They wrap the whole app, /mcp included, and transport_security() passes the
+same hosts and origins to the MCP SDK as well.
+
+/mcp is the MCP SDK's streamable HTTP transport with the read-only tools in
+mcp_tools.py. It needs the read scope, checked on every request before the
+SDK sees it. Sessions are the SDK's, kept in memory: after a restart a client
+gets 404 for its old session and starts a new one.
 """
 
 import asyncio
@@ -23,17 +30,19 @@ import logging
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
+from starlette.requests import Request
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from store_core import StoreError
 
-from agent_memory_server import auth, rules
+from agent_memory_server import auth, mcp_tools, rules
 
 log = logging.getLogger("agent_memory_server")
 
-WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Methods with a body. A cross-site DELETE always needs a preflight, which the server never answers.
+WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 
 def transport_security(settings):
@@ -87,6 +96,16 @@ class BrowserRules:
         return await self.app(scope, receive, send)
 
 
+class ASGIEndpoint:
+    """Marks an ASGI callable for Route, which treats a plain function as a request handler."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        await self.app(scope, receive, send)
+
+
 class BadRequest(Exception):
     pass
 
@@ -127,11 +146,27 @@ def create_app(settings, store, embedding, retry_seconds=None):
                 log.exception("embed retry failed")
             await asyncio.sleep(retry)
 
+    mcp_server = mcp_tools.build_server(store, embedding)
+    # Builds the SDK's session manager. Its own Starlette app is not used: /mcp
+    # is a route of this app, so there is one path, one lifespan, and the auth
+    # check below runs first.
+    mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        transport_security=transport_security(settings),
+    )
+    sessions = mcp_server.session_manager
+
+    async def mcp_endpoint(scope, receive, send):
+        await caller(Request(scope, receive), "read")
+        await sessions.handle_request(scope, receive, send)
+
     @contextlib.asynccontextmanager
     async def lifespan(app):
         task = asyncio.create_task(retry_loop()) if retry else None
         try:
-            yield
+            async with sessions.run():
+                yield
         finally:
             if task is not None:
                 task.cancel()
@@ -273,6 +308,7 @@ def create_app(settings, store, embedding, retry_seconds=None):
             Route("/v1/commits/status", commits_status, methods=["POST"]),
             Route("/v1/admin/import", admin_import, methods=["POST"]),
             Route("/v1/tokens", post_tokens, methods=["POST"]),
+            Route("/mcp", ASGIEndpoint(mcp_endpoint)),
         ],
         exception_handlers={
             auth.AuthError: refused,

@@ -63,7 +63,8 @@ jobs:
 
   image:
     # The image builds and answers /v1/health with auth on and off. With auth
-    # on, /v1/whoami needs a token, and one made with `token create` works.
+    # on, /v1/whoami and /mcp need a token, and one made with `token create`
+    # works for both.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +96,30 @@ jobs:
           who = json.load(urllib.request.urlopen(request, timeout=4))
           assert who['person'] == 'ci' and who['scopes'] == ['read'], who
           print('whoami:', who['person'], who['scopes'])
+          "
+          docker exec -e TOKEN="$secret" server python -c "
+          import json, os, urllib.error, urllib.request
+          def mcp(message, token=None, session=None):
+              headers = {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', 'MCP-Protocol-Version': '2025-06-18'}
+              if token:
+                  headers['Authorization'] = 'Bearer ' + token
+              if session:
+                  headers['Mcp-Session-Id'] = session
+              request = urllib.request.Request('http://127.0.0.1:8765/mcp', data=json.dumps(message).encode(), headers=headers)
+              return urllib.request.urlopen(request, timeout=10)
+          hello = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'ci', 'version': '1'}}}
+          try:
+              mcp(hello)
+              raise SystemExit('/mcp answered without a token')
+          except urllib.error.HTTPError as error:
+              assert error.code == 401, error.code
+          token = os.environ['TOKEN']
+          session = mcp(hello, token).headers['mcp-session-id']
+          mcp({'jsonrpc': '2.0', 'method': 'notifications/initialized'}, token, session)
+          tools = json.load(mcp({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, token, session))['result']['tools']
+          names = sorted(tool['name'] for tool in tools)
+          assert names == ['get', 'list', 'search'], names
+          print('mcp tools:', names)
           "
       - name: Auth off, with Qdrant absent
         run: |
