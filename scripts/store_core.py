@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS memory (
   updates TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL,
   embedded_at TEXT,
-  flushed_at TEXT
+  flushed_at TEXT,
+  written_by TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS memory_team_occurred ON memory (team, occurred_at);
 CREATE INDEX IF NOT EXISTS memory_org_occurred ON memory (org, occurred_at);
@@ -92,10 +93,29 @@ CREATE TABLE IF NOT EXISTS rejected_commit (
   rejected_at TEXT NOT NULL,
   PRIMARY KEY (repo, sha)
 );
+CREATE TABLE IF NOT EXISTS embedding_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  revision TEXT NOT NULL,
+  dimension INTEGER NOT NULL,
+  distance TEXT NOT NULL,
+  collection TEXT NOT NULL,
+  activated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_embedding (
+  memory_id TEXT NOT NULL,
+  collection TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (memory_id, collection)
+);
+CREATE INDEX IF NOT EXISTS memory_embedding_by_collection ON memory_embedding (collection);
 """
 
 
-SCHEMA_VERSION = 2
+# 2: memory.pull_request and memory_commit.
+# 3: memory.written_by, embedding_state and memory_embedding, for the server.
+SCHEMA_VERSION = 3
 
 
 class StoreError(Exception):
@@ -120,26 +140,32 @@ def connect(path, create=True):
 
 
 def _migrate(connection):
-    """Bring a file from before version 2 up to date. Safe to run every time.
+    """Bring an older file up to date. Safe to run every time.
 
     Version 2 adds memory.pull_request and the memory_commit table, filled from
-    each row's commit_sha.
+    each row's commit_sha. Version 3 adds memory.written_by; its tables come
+    from SCHEMA. The laptop never writes them, so a v3 file still works with
+    the v2 code.
     """
     if connection.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
         return
     connection.execute("BEGIN IMMEDIATE")
     try:
-        if connection.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version < SCHEMA_VERSION:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(memory)")}
-            if "pull_request" not in columns:
-                connection.execute("ALTER TABLE memory ADD COLUMN pull_request INTEGER")
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO memory_commit (memory_id, sha, position)
-                SELECT id, lower(trim(commit_sha)), 0 FROM memory
-                WHERE length(trim(commit_sha)) >= 7
-                """
-            )
+            if version < 2:
+                if "pull_request" not in columns:
+                    connection.execute("ALTER TABLE memory ADD COLUMN pull_request INTEGER")
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO memory_commit (memory_id, sha, position)
+                    SELECT id, lower(trim(commit_sha)), 0 FROM memory
+                    WHERE length(trim(commit_sha)) >= 7
+                    """
+                )
+            if "written_by" not in columns:
+                connection.execute("ALTER TABLE memory ADD COLUMN written_by TEXT NOT NULL DEFAULT ''")
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.execute("COMMIT")
     except sqlite3.Error:

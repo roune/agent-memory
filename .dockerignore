@@ -1,0 +1,13 @@
+# Only what the image needs. data/, inbox/ and transcripts must never reach it,
+# so this is an allowlist.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!NOTICE
+!scripts/*.py
+!scripts/agent_memory_server/
+scripts/test_*.py
+scripts/server_doubles.py
+**/__pycache__

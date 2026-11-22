@@ -1,0 +1,10 @@
+#!/bin/sh
+# The whole suite with the server extra installed, so the tests that the plain
+# python3 skips (Starlette routes, the MCP SDK's settings) run too.
+# Extra arguments go to unittest, e.g. scripts/test-server -k Browser
+
+set -eu
+
+cd "$(dirname "$0")/.."
+
+exec uv run --frozen --extra server python -m unittest discover -s scripts -p 'test_*.py' "$@"

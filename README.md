@@ -2,6 +2,46 @@
 
 Agent memory files a coding-agent session, or a slice of git history, and lets you choose what to keep. Only the notes you approve are saved, and only those notes are embedded for search.
 
+## How it works
+
+Hooks file each session or commit into a local inbox. Nothing is kept until you approve it on the review page, where you can also edit the text. Only approved notes reach the store and the search index. Transcripts stay on your laptop.
+
+```mermaid
+flowchart LR
+  subgraph laptop["Your laptop"]
+    hooks["Editor hooks<br/>Cursor · Claude Code · Codex · Pi"] --> inbox[("inbox/<br/>bundles + transcript pointers")]
+    githooks["git hooks<br/>agent-memory land"] --> inbox
+    inbox --> review["agent-memory review<br/>127.0.0.1:4173"]
+    review -- "Approve<br/>(edited text)" --> db[("data/memories.sqlite<br/>approved notes only")]
+    review -- "Reject" --> rejected["bundle dropped<br/>commits remembered"]
+    db --> embed["scripts/embed<br/>bge-small-en-v1.5"]
+  end
+  embed --> qdrant[("Qdrant<br/>127.0.0.1:6333")]
+```
+
+### Where it is heading
+
+[docs/server-plan.md](docs/server-plan.md) moves the store into one server in Docker. Approve sends the note to the server, which embeds it on write. Editors will read through MCP. The server exists as a preview behind a compose profile ([docs/server.md](docs/server.md)), and the laptop flow above is unchanged until the cutover.
+
+```mermaid
+flowchart LR
+  subgraph laptop["Your laptop"]
+    cli["agent-memory review<br/>Approve / Reject"]
+    outbox[("outbox/<br/>when offline")]
+    editors["Editors<br/>(MCP, later)"]
+  end
+  subgraph docker["Docker"]
+    server["agent-memory-server :8765<br/>/v1 write API · /mcp read"]
+    sqlite[("memories.sqlite<br/>source of truth")]
+    qdrant[("Qdrant<br/>internal only")]
+  end
+  cli -- "POST /v1/memories" --> server
+  cli -. "server down" .-> outbox -. "agent-memory sync" .-> server
+  editors -. "search · get · list" .-> server
+  server --> sqlite
+  server -- "embed on write" --> qdrant
+```
+
 ## Install
 
 From a clone of this repo:
@@ -102,3 +142,4 @@ Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agen
 - [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
 - [docs/research.md](docs/research.md) — the “what already does this” question, still open.
 - [docs/server-plan.md](docs/server-plan.md) — the approved plan for moving to one server in Docker, in ordered PRs.
+- [docs/server.md](docs/server.md) — the server preview: routes, browser rules, `reindex`, and how to try it before the cutover.

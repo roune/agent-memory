@@ -196,12 +196,12 @@ class ServerCommandTest(unittest.TestCase):
         self.assertIn("mcp, fastembed not installed", err.getvalue())
         self.assertIn("agent-memory[server] @ git+https://github.com/roune/agent-memory", err.getvalue())
 
-    def test_with_the_extra_it_says_the_server_is_not_built_yet(self):
+    def test_with_the_extra_it_asks_for_a_command(self):
         err = io.StringIO()
-        with redirect_stderr(err):
-            code = agent_memory_server.main([], find_spec=lambda name: object())
-        self.assertEqual(code, 1)
-        self.assertIn("PR 2b", err.getvalue())
+        with redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+            agent_memory_server.main([], find_spec=lambda name: object())
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("{serve,reindex}", err.getvalue())
 
 
 if __name__ == "__main__":
