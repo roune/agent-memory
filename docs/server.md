@@ -1,25 +1,26 @@
 # The agent-memory server
 
-Status: a preview, built in PR 2b, 2c, 3 and 4 of [server-plan.md](server-plan.md). Editors can query it through MCP. On the laptop, `agent-memory connect` points the CLI at it, `migrate` copies the local store into it, and `list` reads from it. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 5 is the cutover.
+Status: in use since the cutover (PR 5 of [server-plan.md](server-plan.md)). `./scripts/setup` starts it next to Qdrant. Approve, Reject, `land`, the git hooks and `list` go through it, and editors query it through MCP. When it doesn't answer, Approve and Reject wait in the laptop's outbox. PR 6 (editor setup) and PR 7 (packaging and the published image) are still to come.
 
 ## The shape
 
 ```mermaid
 flowchart LR
-  subgraph laptop["Laptop (unchanged until PR 5)"]
-    review["agent-memory review"]
-    localdb[("data/memories.sqlite")]
-    embed["scripts/embed"]
-    review --> localdb --> embed
+  subgraph laptop["Laptop"]
+    review["agent-memory review · land · git-hook"]
+    outbox[("outbox/<br/>when offline")]
+    localdb[("data/memories.sqlite<br/>old store, read by migrate")]
+    review -. "server down" .-> outbox
   end
-  subgraph compose["docker compose --profile server"]
+  subgraph compose["docker compose (compose.yaml)"]
     server["agent-memory-server<br/>127.0.0.1:8765 → :8765"]
     serverdb[("data/server/memories.sqlite")]
-    qdrant[("Qdrant<br/>127.0.0.1:6333 (temporary)")]
+    qdrant[("Qdrant<br/>no published port")]
     server --> serverdb
     server -- "memories-fastembed-384-2d705fdd" --> qdrant
   end
-  embed -- "legacy collection: memories" --> qdrant
+  review -- "/v1/..." --> server
+  outbox -. "agent-memory sync" .-> server
   cli["agent-memory connect · migrate · list"] -- "/v1/..." --> server
   localdb -. "read-only, by migrate" .-> cli
   editor["Claude Code, Cursor, Codex"] -. "/mcp: search · get · list" .-> server
@@ -30,12 +31,13 @@ The server and the laptop never open the same SQLite file. Data moves between th
 ## Try it
 
 ```
-./scripts/setup                                   # creates data/server and writes your uid/gid to .env
-docker compose --profile server up -d --build
+./scripts/setup
 curl -s http://127.0.0.1:8765/v1/health
 ```
 
-The server keeps its own `data/server/memories.sqlite`, separate from the laptop's file. It starts empty. `docker compose --profile server stop server` stops it.
+`scripts/setup` creates `data/server` and `data/qdrant`, writes your uid and gid to `.env`, runs `docker compose up -d --build`, and waits for `/v1/health`. If `~/.config/agent-memory/server` is missing, it writes `url = http://127.0.0.1:8765` there (mode 0600), with the mode of the legacy `database` file, or `shared`. An existing file is left alone.
+
+The server keeps its own `data/server/memories.sqlite`, separate from the laptop's old file. Qdrant has no published port: only the server reaches it, as `http://qdrant:6333`. `docker compose stop server` stops the server.
 
 The local `compose.yaml` turns auth off (`AGENT_MEMORY_AUTH=off`). That is safe only because it publishes the port on `127.0.0.1`, and because of the browser rules below. Anywhere else auth is on, which is the default: see [Auth and tokens](#auth-and-tokens).
 
@@ -67,9 +69,40 @@ agent-memory migrate
 - Which local files it reads depends on the legacy `database` file's mode, because that is where the laptop wrote: `data/memories.sqlite` in shared mode, or every file under `~/.local/share/agent-memory/databases/` in per-repo mode. The `server` file's mode decides only where each row goes. If no file is found in that mode but the other mode's location has one, migrate says so and exits 1.
 - The client never follows a redirect. urllib would send the token to whatever host the redirect names, so a 3xx is reported as an error.
 
-Until the cutover, Approve still writes the laptop file, while `list` reads the server once `server` exists. So run `migrate` again to copy what you approved since the last run. PR 5 makes Approve send to the server.
+Since the cutover, Approve sends to the server. Run `migrate` once more after upgrading, so anything approved into the laptop file before the upgrade is copied too. Then `scripts/embed --prune` drops the legacy `memories` collection.
+
+The CLI no longer reads the legacy `database` and `databases` files, apart from `migrate` and `connect`, which take the mode from `database`. `review`, `land`, `list` and `sync` print one note when they find them.
 
 **Times** are stored in UTC. Approve and the import convert an `occurred_at` with another offset, such as `+01:00` or `Z`. A bare date means midnight UTC, and a time without a zone is refused. The store compares and sorts these times as text, so every stored time has to be in the same form.
+
+## The outbox
+
+Approve and Reject send right away. When the server doesn't answer, or answers with a 5xx, the request goes to the outbox and the bundle is deleted. A git hook with `auto_approve` writes to the outbox first, always, and a detached `agent-memory sync` sends it.
+
+- Each item is one JSON file in `outbox/`, next to `inbox/`, named `<utc stamp>-<uuid>.json`, mode 0600. `outbox/` is gitignored.
+- An item is `{server_url, op, body, created_at, attempts, last_error}`. `op` is `memory` or `rejection`. `body` is the request exactly as it would have been sent: approved text and tags, never a transcript path.
+- The token isn't stored in the item. `sync` takes the one the config files hold for `server_url` when it sends.
+
+```mermaid
+flowchart TD
+  item["next item, oldest first"] --> send["POST to its server_url"]
+  send -- "2xx" --> gone["deleted"]
+  send -- "no answer, 5xx" --> stop["stop for that server:<br/>keep it and the rest,<br/>record attempts, last_error"]
+  send -- "401, 403, 3xx" --> keep["stop for that server:<br/>keep its whole queue"]
+  send -- "409" --> failed409["outbox/failed/,<br/>with the stored text"]
+  send -- "other 4xx" --> failed["outbox/failed/,<br/>with the error"]
+```
+
+- `agent-memory sync` sends the queue in order. It runs at the start of `review`, `land` and `list`, and detached after the hooks. A lock file (`outbox/.lock`) makes sure one runs at a time: a second one waits, then finds the queue already sent.
+- A server that is down costs one timeout, not one per item. Items for another server in per-repo mode keep going.
+- A revoked or rotated token is fixed with `agent-memory connect`. Nothing approved is set aside meanwhile.
+- `agent-memory sync --retry-failed` moves `outbox/failed/` back into the queue, in its old place, and sends it. Delete a file from `outbox/failed/` to drop that item.
+- `sync` exits 1 while anything waits or failed.
+- While something waits for a server, Approve queues behind it, so the order is kept.
+
+The review page shows a banner: connected (as whom), offline, or not configured; how many items wait, and the oldest one's age; and each failed item with its error, and the stored text for a 409. With auth on it fills org and team from `/v1/whoami`, offers only the values the token allows, and shows `person` read-only.
+
+`land` and the hooks skip a commit that the server reports kept or rejected (`/v1/commits/status`, one call per batch), or that an outbox item already covers. If the server can't be reached they offer it anyway: a duplicate costs one Reject, while a missed memory is lost. The git hook's call has a 1-second timeout and it makes no other network call, so it returns within about two seconds.
 
 ## Routes
 
@@ -168,7 +201,7 @@ docker compose exec server agent-memory-server token revoke t_1a2b3c4d5e6f
 ```mermaid
 sequenceDiagram
   autonumber
-  participant C as CLI (PR 4) or curl
+  participant C as CLI (Approve, sync) or curl
   participant R as Browser rules
   participant A as /v1/memories
   participant S as memories.sqlite
@@ -249,16 +282,18 @@ agent-memory-server token create | list | revoke
 `serve` holds `/data/server.lock`. `reindex` takes the same lock, so stop the server first:
 
 ```
-docker compose --profile server stop server
-docker compose --profile server run --rm server agent-memory-server reindex
-docker compose --profile server start server
+docker compose stop server
+docker compose run --rm server agent-memory-server reindex
+docker compose start server
 ```
+
+`scripts/embed --rebuild` runs those three steps with `reindex --rebuild`, and `scripts/embed --prune` with `reindex --prune --yes --include-legacy`. It refuses every other flag, `--repo` among them, and goes away one release after the cutover.
 
 - **`reindex`** embeds every row the configured embedder's collection lacks. It checks that the point count matches the row count, then makes that collection the active one.
 - **`--rebuild`** drops that collection first.
 - **`--prune`** lists the other collections whose name starts with `memories`. With `--yes` it deletes them.
 
-`--prune` keeps the legacy `memories` collection, because the laptop's `scripts/embed` still writes it until the cutover. `--prune --yes --include-legacy` deletes it too; PR 5 runs that after the cutover.
+`--prune` keeps the legacy `memories` collection unless you add `--include-legacy`. Nothing writes it since the cutover, so `scripts/embed --prune` deletes it too.
 
 ## Settings
 
@@ -275,4 +310,4 @@ docker compose --profile server start server
 
 ## Tests
 
-`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `test_server_client.py` checks the CLI's config files, `connect`, `migrate` and `list` against a stub server on `127.0.0.1`, using real urllib requests. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests and `/mcp` through the SDK's session manager (`test_server_mcp.py`), and one `migrate` run against the real app. CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` and `/mcp` need a token, and that a read token made with `token create` works for both. Last, the CLI on the runner runs `connect`, `migrate` (twice) and `list` against the image.
+`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `test_server_client.py` checks the CLI's config files, `connect`, `migrate` and `list` against a stub server on `127.0.0.1` (`stub_server.py`), using real urllib requests. `test_cutover.py` checks Approve, Reject, the outbox and `sync`, `land`, the git hook's timing, the review page, `scripts/embed` and `scripts/setup` the same way, and the older CLI tests in `test_agent_memory.py` run against that stub too. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests and `/mcp` through the SDK's session manager (`test_server_mcp.py`), and one `migrate` run against the real app. CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` and `/mcp` need a token, and that a read token made with `token create` works for both. Last, the CLI on the runner runs `connect`, `migrate` (twice) and `list` against the image.

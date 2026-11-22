@@ -28,11 +28,11 @@ Sources: [Qdrant installation](https://qdrant.tech/documentation/installation/),
 
 `scripts/setup` reads [compose.yaml](../compose.yaml) and:
 
-1. Creates `data/qdrant/` (already gitignored via `data/`).
-2. Starts `qdrant/qdrant:v1.20.0` with that directory mounted at `/qdrant/storage`. HTTP is `127.0.0.1:6333`, gRPC is `127.0.0.1:6334`.
-3. Waits until `GET /readyz` returns.
+1. Creates `data/qdrant/` and `data/server/` (already gitignored via `data/`).
+2. Starts `qdrant/qdrant:v1.20.0` with `data/qdrant/` mounted at `/qdrant/storage`, and the agent-memory server next to it. Qdrant publishes no port: only the server reaches it, as `http://qdrant:6333` on the compose network. The server publishes `127.0.0.1:8765`.
+3. Waits until the server's `GET /v1/health` answers.
 
-The embed step talks to `http://127.0.0.1:6333`. It does not open the directory from the client. `scripts/embed` creates the `memories` collection at 384 dimensions, the size of the chosen model.
+The server creates one collection per embedder, `memories-fastembed-384-2d705fdd` for the default, at 384 dimensions, the size of the chosen model. See [server.md](server.md#embedding).
 
 Pin the image tag. `:latest` moves.
 

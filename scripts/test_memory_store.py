@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""SQLite store, metadata queries, import, and flush. No Docker."""
+"""The laptop's old SQLite store, which migrate reads: metadata queries and commits. No Docker."""
 
 import importlib.util
 import json
 import os
 import sqlite3
-import threading
 import unittest
-from unittest import mock
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,30 +29,6 @@ def load_embed():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-class ReadyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.split("?", 1)[0] == "/readyz":
-            body = b"ok"
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-    def log_message(self, fmt, *args):
-        return
-
-
-def start_ready():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), ReadyHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    port = server.server_address[1]
-    return server, f"http://127.0.0.1:{port}"
 
 
 class MemoryStoreTest(unittest.TestCase):
@@ -216,109 +189,6 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual([hit["document_id"] for hit in hits], ["person-learning-a"])
         self.assertEqual(self.db.qdrant_url("github.com/example/one"), "http://qdrant.internal:6340")
 
-    def test_flush_leaves_the_laptop_unchanged_when_the_container_is_down(self):
-        (self.home / ".config" / "agent-memory" / "database").write_text(
-            "mode = shared\nqdrant_url = http://127.0.0.1:9\n",
-            encoding="utf-8",
-        )
-        self.db.save_approved(
-            self._doc("a", "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00")
-        )
-        self.assertEqual(self.db.flush(), 0)
-        rows = self._rows(self.store / "data" / "memories.sqlite")
-        self.assertIsNone(rows[0]["flushed_at"])
-        self.assertFalse((self.store / "data" / "shared" / "memories.sqlite").exists())
-
-    def test_flush_copies_and_resolves_conflicts(self):
-        server, url = start_ready()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
-        (self.home / ".config" / "agent-memory" / "database").write_text(
-            f"mode = shared\nqdrant_url = {url}\n",
-            encoding="utf-8",
-        )
-        self.db.save_approved(
-            self._doc("a", "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00", "local")
-        )
-        self.assertEqual(self.db.flush(), 0)
-        shared = self.store / "data" / "shared" / "memories.sqlite"
-        shared_rows = self._rows(shared)
-        self.assertEqual(shared_rows[0]["text"], "local")
-        local_rows = self._rows(self.store / "data" / "memories.sqlite")
-        self.assertEqual(local_rows[0]["flushed_at"], local_rows[0]["updated_at"])
-        self.assertEqual(self.db.flush(), 0)
-
-        connection = sqlite3.connect(shared)
-        connection.execute(
-            "UPDATE memory SET text = 'shared-newer', updated_at = '2999-01-01T00:00:00+00:00' WHERE id = 'person-learning-a'"
-        )
-        connection.commit()
-        connection.close()
-        local = sqlite3.connect(self.store / "data" / "memories.sqlite")
-        local.execute("UPDATE memory SET flushed_at = NULL WHERE id = 'person-learning-a'")
-        local.commit()
-        local.close()
-        self.assertEqual(self.db.flush(), 0)
-        self.assertEqual(self._rows(shared)[0]["text"], "shared-newer")
-
-        stamped = self._rows(self.store / "data" / "memories.sqlite")[0]["updated_at"]
-        connection = sqlite3.connect(shared)
-        connection.execute(
-            "UPDATE memory SET text = 'clash', updated_at = ? WHERE id = 'person-learning-a'",
-            (stamped,),
-        )
-        connection.commit()
-        connection.close()
-        local = sqlite3.connect(self.store / "data" / "memories.sqlite")
-        local.execute("UPDATE memory SET flushed_at = NULL WHERE id = 'person-learning-a'")
-        local.commit()
-        local.close()
-        self.assertEqual(self.db.flush(), 0)
-        self.assertEqual(self._rows(shared)[0]["text"], "clash")
-        self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
-
-    def _flush_setup(self):
-        server, url = start_ready()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
-        (self.home / ".config" / "agent-memory" / "database").write_text(
-            f"mode = shared\nqdrant_url = {url}\n",
-            encoding="utf-8",
-        )
-        self.db.save_approved(
-            self._doc("a", "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00", "local")
-        )
-        return self.store / "data" / "shared" / "memories.sqlite"
-
-    def test_flush_reports_a_failed_shared_write_and_keeps_the_laptop_rows_pending(self):
-        shared = self._flush_setup()
-        failure = sqlite3.OperationalError("disk I/O error")
-        with mock.patch.object(self.db, "_upsert_shared", side_effect=failure):
-            with self.assertRaises(self.db.StoreError) as raised:
-                self.db.flush()
-        self.assertEqual(str(raised.exception), "could not flush: disk I/O error")
-        self.assertEqual(self._rows(shared), [])
-        self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
-
-    def test_flush_reports_a_locked_shared_file(self):
-        shared = self._flush_setup()
-        real_connect = self.db.connect
-
-        def connect_without_waiting(path, create=True):
-            connection = real_connect(path, create)
-            connection.execute("PRAGMA busy_timeout = 0")
-            return connection
-
-        holder = real_connect(shared)
-        self.addCleanup(holder.close)
-        holder.execute("BEGIN EXCLUSIVE")
-        self.addCleanup(holder.execute, "ROLLBACK")
-        with mock.patch.object(self.db, "connect", connect_without_waiting):
-            with self.assertRaises(self.db.StoreError) as raised:
-                self.db.flush()
-        self.assertIn("could not flush: database is locked", str(raised.exception))
-        self.assertIsNone(self._rows(self.store / "data" / "memories.sqlite")[0]["flushed_at"])
-
     def _change(self, suffix, commits, pull_request=None):
         document = self._doc(suffix, "Platform", "Acme", "github.com/example/one", "2026-11-02T00:00:00+00:00")
         document["id"] = f"person-change-{suffix}"
@@ -397,24 +267,6 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertIn("written_by", columns)
         finally:
             connection.close()
-
-    def test_flush_copies_commit_rows(self):
-        server, url = start_ready()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
-        (self.home / ".config" / "agent-memory" / "database").write_text(
-            f"mode = shared\nqdrant_url = {url}\n",
-            encoding="utf-8",
-        )
-        a, b = "a" * 40, "b" * 40
-        self.db.save_approved(self._change("pr", [a, b], pull_request=9))
-        self.assertEqual(self.db.flush(), 0)
-        shared = self.store / "data" / "shared" / "memories.sqlite"
-        self.assertEqual(
-            self._commit_rows(shared),
-            [("person-change-pr", a, 0), ("person-change-pr", b, 1)],
-        )
-        self.assertEqual(self._rows(shared)[0]["pull_request"], 9)
 
     def test_embed_payload_carries_the_pointer(self):
         a, b, c = "a" * 40, "b" * 40, "c" * 40

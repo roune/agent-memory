@@ -2,12 +2,14 @@
 """agent-memory command: capture, review, hook install, and repo config.
 
 Editor hooks call `capture` and return. Git post-commit/post-merge call `git-hook`.
-Review is a page on 127.0.0.1. Approve writes the local SQLite database.
+Review is a page on 127.0.0.1. Approve and Reject send to the agent-memory
+server that `connect` (or ./scripts/setup) configured. When it doesn't answer,
+the request waits in the outbox and `sync` sends it later.
 `install` writes editor hooks only after a yes; with `--git-repo` it can also
 install git hooks and repo policy under `.agent-memory.toml`.
 Use `config` to change git hook policy and auto-approve without reinstalling.
-`connect` points the CLI at an agent-memory server, `migrate` copies the local
-store to it, and `list` reads from it once one is connected.
+`migrate` copies the old local memories.sqlite to the server, and `list` reads
+from the server.
 """
 
 import argparse
@@ -32,6 +34,7 @@ if str(_SCRIPTS) not in sys.path:
 import memory_migrate
 import memory_rules
 import memory_store
+import outbox
 import server_client
 HOME = Path.home()
 BIN = ROOT / "bin" / "agent-memory"
@@ -373,21 +376,22 @@ def single_commit_hook_group(repo, sha, message):
     }
 
 
-def try_auto_approve_bundle(bundle):
-    """If identity is complete, approve with change/code and commit from draft. Else raise ValueError."""
+def draft_choice(bundle):
+    """kind, domain, text and commit an auto-approve takes from a bundle's draft."""
     draft = bundle.get("draft") or {}
-    text = (draft.get("text") or "").strip()
-    commit = (draft.get("commit") or "").strip()
     kind = draft.get("kind") if draft.get("kind") in KINDS else "change"
     domain = draft.get("domain") if draft.get("domain") in DOMAINS else "code"
-    approve(
-        bundle,
-        kind,
-        domain,
-        text,
-        commit=commit,
-    )
-    return True
+    return kind, domain, (draft.get("text") or "").strip(), (draft.get("commit") or "").strip()
+
+
+def try_auto_approve_bundle(bundle):
+    """Queue the bundle's draft as approved, and delete the bundle. Raises ValueError or ConfigError.
+
+    Hooks never wait on the network: the document goes to the outbox, and a
+    detached sync sends it.
+    """
+    kind, domain, text, commit = draft_choice(bundle)
+    return approve(bundle, kind, domain, text, commit=commit, queue_only=True)
 
 
 def is_merge_commit(repo, sha):
@@ -412,14 +416,16 @@ def hook_commit_shas(repo, event, head):
 
 
 def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve):
-    if commit_settled(sha, remote_id):
-        return
+    """File one commit locally: an approved document in the outbox, or a bundle in the inbox.
+
+    Returns the path written, or None when there was nothing to file.
+    """
     msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
     group = single_commit_hook_group(repo_s, sha, msg)
     session_id = land_session_id(remote_id or repo_s, sha[:12], None, [sha])
     bundle_path = land_bundle_path("git", session_id)
     if bundle_path.is_file():
-        return
+        return None
     draft_text = draft_text_commit_only(msg)
     bundle = {
         "tool": "git",
@@ -456,16 +462,23 @@ def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_app
             ],
         },
     }
+    if auto_approve:
+        try:
+            kind, domain, text, commit = draft_choice(bundle)
+            url, body = approved_request(bundle, kind, domain, text, commit=commit)
+            return outbox.add(store_root(), url, "memory", body)
+        except (ValueError, OSError, server_client.ConfigError) as error:
+            log(f"git-hook: auto_approve failed, inbox bundle kept for review: {error}")
     write_json(bundle_path, bundle)
-    if not auto_approve:
-        return
-    try:
-        try_auto_approve_bundle(bundle)
-    except (ValueError, OSError) as error:
-        log(f"git-hook: auto_approve failed: {error}")
+    return bundle_path
 
 
 def git_hook(args):
+    """File the new commits locally first, check them with one short call, then start a detached sync.
+
+    The hook makes no other network call, so it returns within about two
+    seconds even when the server doesn't answer.
+    """
     repo = Path(args.repo or os.getcwd()).resolve()
     if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
         log("git-hook skipped: not a git repository")
@@ -484,22 +497,28 @@ def git_hook(args):
         log("git-hook skipped: could not resolve HEAD")
         return 0
     shas = hook_commit_shas(repo_s, event, head)
+    remote_id = git_remote_repo_id(repo_s)
+    waiting = waiting_settled(remote_id, shas)
+    shas = [sha for sha in shas if sha not in waiting]
     if not shas:
         return 0
 
-    auto_approve = False
-    if cfg.get("auto_approve"):
-        iden = read_identity()
-        if all(iden.get(k) for k in ("org", "team", "person")):
-            auto_approve = True
-        else:
-            log("git-hook: auto_approve set but identity incomplete; inbox bundle kept for review")
-
-    remote_id = git_remote_repo_id(repo_s)
     branch, tip = default_branch_tip(repo_s)
     since = parse_since("", 24)
+    written = {}
     for sha in shas:
-        file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve)
+        path = file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, bool(cfg.get("auto_approve")))
+        if path is not None:
+            written[sha] = path
+    # Commits pulled in by a merge may be settled already, by someone else or
+    # by another laptop. On any failure the files stay.
+    for sha in server_settled(remote_id, list(written), timeout=HOOK_STATUS_TIMEOUT):
+        path = written[sha]
+        if path.name == "bundle.json":
+            shutil.rmtree(path.parent, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    spawn_sync()
     return 0
 
 
@@ -683,28 +702,186 @@ def land_bundle_path(tool, session_id):
     return session_dir(tool, session_id) / "bundle.json"
 
 
-def memory_exists_for_commit(sha, remote_id=None):
-    """True when a kept row already explains this commit.
+NO_SERVER = (
+    "no agent-memory server is configured: run ./scripts/setup, "
+    "or agent-memory connect --url http://127.0.0.1:8765"
+)
+# The commits/status check a git hook makes. The hook does no other network work.
+HOOK_STATUS_TIMEOUT = 1.0
+STATUS_BATCH = 500
 
-    A stored abbreviated hash matches the full id, and the other way around.
-    Sharing the first 7 hex digits is not enough: that skipped unrelated commits.
+
+class Refused(ValueError):
+    """The server refused an Approve or Reject. The bundle is kept, and nothing is queued."""
+
+    def __init__(self, error):
+        super().__init__(server_client.explain(error))
+        self.error = error
+        self.stored = None
+        if error.status == 409:
+            self.stored = (error.body.get("stored") or {}).get("text")
+
+
+_warned_legacy = False
+
+
+def warn_legacy():
+    """Say once that the legacy database files are no longer read."""
+    global _warned_legacy
+    if _warned_legacy:
+        return
+    _warned_legacy = True
+    folder = server_client.config_dir()
+    found = [name for name in ("database", "databases") if (folder / name).is_file()]
+    if found:
+        names = " and ".join(str(folder / name) for name in found)
+        print(
+            f"note: {names} {'is' if len(found) == 1 else 'are'} no longer read. The CLI uses "
+            f"{folder / 'server'}; only agent-memory migrate and connect still read the old files.",
+            file=sys.stderr,
+        )
+
+
+def server_config():
+    """The server file, or ConfigError when there is none."""
+    config = server_client.read_config()
+    if config is None:
+        raise server_client.ConfigError(NO_SERVER)
+    return config
+
+
+def server_for(remote_id):
+    """(url, token) of the server that keeps remote_id's memories."""
+    return server_client.target(remote_id or None, server_config())
+
+
+def client_for(url, timeout=server_client.TIMEOUT):
+    """A client for url, with the token the config files hold for it."""
+    try:
+        token = server_client.token_for(url)
+    except server_client.ConfigError:
+        token = None
+    return server_client.Client(url, token, timeout)
+
+
+def deliver(url, op, body, queue_only=False):
+    """Send one request now, or queue it. Returns ("sent", answer) or ("queued", reason).
+
+    Whatever is already queued for url goes first, so the order is kept. With
+    queue_only (the hooks) nothing is sent here: a detached sync sends it.
+    Raises Refused for a 4xx, a revoked token included, and then nothing is queued.
     """
-    return memory_store.memory_exists_for_commit(sha, remote_id)
+    root = store_root()
+    if queue_only:
+        outbox.add(root, url, op, body)
+        return "queued", None
+    with outbox.lock(root):
+        report = outbox.drain(root, client_for)
+        stopped = report.stopped.get(url)
+        if isinstance(stopped, server_client.ServerError) and stopped.status < 500:
+            raise Refused(stopped)
+        if stopped is None and not outbox.pending_for(root, url):
+            try:
+                return "sent", outbox.send(client_for(url), {"op": op, "body": body})
+            except server_client.ServerError as error:
+                if error.status < 500:
+                    raise Refused(error) from None
+                stopped = error
+            except server_client.ServerUnreachable as error:
+                stopped = error
+        outbox.add(root, url, op, body)
+        return "queued", server_client.explain(stopped) if stopped else None
 
 
-def commit_settled(sha, remote_id=None):
-    """True when review already decided this commit: kept in a row, or rejected."""
-    return memory_exists_for_commit(sha, remote_id) or memory_store.commit_rejected(sha, remote_id)
+def spawn_sync():
+    """Start `agent-memory sync --quiet` detached, so a hook returns at once."""
+    if not outbox.queued(store_root()):
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "sync", "--quiet"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as error:
+        log(f"could not start agent-memory sync: {error}")
+
+
+def sync_first(quiet=True):
+    """Send what the outbox holds before a command reads the server. Never raises."""
+    root = store_root()
+    if not outbox.queued(root):
+        return None
+    try:
+        report = outbox.sync(root, client_for)
+    except OSError as error:
+        log(f"sync failed: {error}")
+        return None
+    if not quiet:
+        for line in report.lines(root):
+            print(f"sync: {line}", file=sys.stderr)
+    return report
+
+
+def waiting_settled(remote_id, shas):
+    """The shas an item in the outbox already settles. No network."""
+    waiting = outbox.waiting_commits(store_root(), remote_id)
+    return {sha for sha in shas if any(outbox.same_commit(sha, other) for other in waiting)}
+
+
+def server_settled(remote_id, shas, timeout=server_client.TIMEOUT):
+    """The shas the server reports kept or rejected, in one call per batch.
+
+    If the server can't be reached they count as not settled, so they are
+    offered anyway: a duplicate costs one Reject, while a missed memory is lost.
+    """
+    shas = [sha for sha in dict.fromkeys(shas) if memory_rules.is_sha(sha)]
+    if not shas or not remote_id:
+        return set()
+    try:
+        url, token = server_for(remote_id)
+        client = server_client.Client(url, token, timeout)
+        settled = set()
+        for start in range(0, len(shas), STATUS_BATCH):
+            batch = shas[start : start + STATUS_BATCH]
+            answer = client.commits_status(remote_id, batch)
+            for sha in batch:
+                info = answer.get(sha)
+                if isinstance(info, dict) and (info.get("kept") or info.get("rejected")):
+                    settled.add(sha)
+        return settled
+    except (server_client.ConfigError, server_client.ServerError, server_client.ServerUnreachable) as error:
+        log(f"commits/status: {server_client.explain(error)}; the commits are offered anyway")
+        return set()
+
+
+def settled_commits(remote_id, shas, timeout=server_client.TIMEOUT):
+    """The shas review already decided: waiting in the outbox, or kept or rejected on the server."""
+    waiting = waiting_settled(remote_id, shas)
+    return waiting | server_settled(remote_id, [sha for sha in shas if sha not in waiting], timeout)
 
 
 def reject_bundle(bundle):
-    """Remember a git bundle's commits as rejected, then delete the bundle."""
+    """Send a git bundle's commits as rejected (or queue them), then delete the bundle.
+
+    Returns "sent", "queued", or None when there was nothing to send. A refusal
+    raises Refused and keeps the bundle.
+    """
     land = bundle.get("land") or {}
     shas = [str(c.get("sha") or "") for c in land.get("commits") or [] if isinstance(c, dict)]
+    shas = [sha for sha in shas if memory_rules.is_sha(sha)]
+    status = None
     if bundle.get("tool") == "git" and shas:
         remote_id = (land.get("remote_repo") or "").strip() or git_remote_repo_id(str(bundle.get("repo") or ""))
-        memory_store.reject_commits(remote_id, shas)
+        if not remote_id:
+            raise ValueError("remote repo id is required (origin URL or .agent-memory.toml repo=)")
+        url, _ = server_for(remote_id)
+        status, _ = deliver(url, "rejection", {"repo": remote_id, "shas": shas})
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
+    return status
 
 
 def default_branch_tip(repo):
@@ -870,6 +1047,8 @@ def land(args):
     if capture_disabled(str(repo)):
         log("land skipped: capture disabled for repo")
         return 0
+    warn_legacy()
+    sync_first(quiet=False)
 
     since = parse_since(args.since, args.since_hours)
     branch = local_default_branch(str(repo))
@@ -880,12 +1059,14 @@ def land(args):
 
     tool = "git"
     wrote = 0
+    # One commits/status call for the whole window, plus what waits in the outbox.
+    settled = settled_commits(remote_id, [m["sha"] for group in groups for m in group["commits"]])
     for group in groups:
         # Approve stores every commit of a group, so a commit already kept is
         # explained, and Reject remembers its commits. A PR that grew past an
         # earlier window files only the rest, under a new session id, so the
         # kept memory is not overwritten.
-        members = [m for m in group["commits"] if not commit_settled(m["sha"], remote_id)]
+        members = [m for m in group["commits"] if m["sha"] not in settled]
         if not members:
             continue
         group = dict(group, commits=members)
@@ -1031,10 +1212,6 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     cfg = read_repo_config(repo)
     if not cfg.get("auto_approve"):
         return
-    iden = read_identity()
-    if not all(iden.get(k) for k in ("org", "team", "person")):
-        log("capture session-end: auto_approve set but identity incomplete; inbox bundle kept")
-        return
     started = previous.get("started_at")
     if not started:
         log("capture session-end: auto_approve left inbox; session has no earlier capture")
@@ -1046,8 +1223,8 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     if not head:
         log("capture session-end: auto_approve left inbox; could not resolve HEAD")
         return
-    if memory_exists_for_commit(head, git_remote_repo_id(repo)):
-        log("capture session-end: commit already kept; inbox left for review")
+    if settled_commits(git_remote_repo_id(repo), [head], timeout=HOOK_STATUS_TIMEOUT):
+        log("capture session-end: commit already kept or rejected; inbox left for review")
         return
     if is_merge_commit(repo, head):
         log("capture session-end: HEAD is a merge commit; inbox left for review")
@@ -1084,8 +1261,10 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     write_json(bundle_path, fresh)
     try:
         try_auto_approve_bundle(read_json(bundle_path))
-    except (ValueError, OSError) as error:
-        log(f"capture session-end auto_approve failed: {error}")
+    except (ValueError, OSError, server_client.ConfigError) as error:
+        log(f"capture session-end auto_approve failed, inbox bundle kept: {error}")
+        return
+    spawn_sync()
 
 
 def capture(args):
@@ -1377,7 +1556,65 @@ def approve(
     supersedes="",
     superseded_by="",
     updates="",
+    queue_only=False,
 ):
+    """Send the approved document to the server, or queue it, then delete the bundle.
+
+    Returns {"status": "sent" or "queued", "id", "reason"}. A refusal (a 4xx)
+    raises Refused and keeps the bundle; so does any other ValueError.
+    """
+    url, body = approved_request(
+        bundle,
+        kind,
+        domain,
+        text,
+        commit=commit,
+        org=org,
+        team=team,
+        person=person,
+        occurred_at=occurred_at,
+        remote_repo=remote_repo,
+        record=record,
+        subject=subject,
+        alarm=alarm,
+        look_at=look_at,
+        supersedes=supersedes,
+        superseded_by=superseded_by,
+        updates=updates,
+    )
+    status, answer = deliver(url, "memory", body, queue_only=queue_only)
+    shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
+    if status == "sent":
+        return {"status": "sent", "id": (answer or {}).get("id"), "reason": None}
+    return {"status": "queued", "id": None, "reason": answer}
+
+
+def approved_request(
+    bundle,
+    kind,
+    domain,
+    text,
+    commit="",
+    org="",
+    team="",
+    person="",
+    occurred_at="",
+    remote_repo="",
+    record="",
+    subject="",
+    alarm="",
+    look_at="",
+    supersedes="",
+    superseded_by="",
+    updates="",
+):
+    """(server url, POST /v1/memories body) for an approved bundle. Raises ValueError or ConfigError.
+
+    The body is checked with the same rules the server uses. It has no id: the
+    server builds it. With a token (auth on) the server takes person from the
+    token, so the body leaves it out, and org and team stay out unless the form
+    named them. With auth off they come from the form or the identity file.
+    """
     text = memory_rules.clean_text(text)
     memory_rules.check_shape(kind, domain, text)
     repo_path = str(bundle.get("repo") or "").strip()
@@ -1386,17 +1623,27 @@ def approve(
     if not repo_path or not tool or not session_id:
         raise ValueError("repo, tool, and session id are required")
 
-    iden = read_identity()
-    org = (org or iden.get("org") or "").strip()
-    team = (team or iden.get("team") or "").strip()
-    person = (person or iden.get("person") or "").strip()
-    memory_rules.check_identity(org, team, person)
     land = bundle.get("land") or {}
     remote_repo = (remote_repo or land.get("remote_repo") or "").strip()
     if not remote_repo:
         remote_repo = git_remote_repo_id(repo_path)
     if not remote_repo:
         raise ValueError("remote repo id is required (origin URL or .agent-memory.toml repo=)")
+    url, token = server_for(remote_repo)
+    pinned = bool(token)
+
+    org = (org or "").strip()
+    team = (team or "").strip()
+    if pinned:
+        # Placeholders only for the checks below; they are not sent.
+        check_org, check_team, person = org or "-", team or "-", "-"
+    else:
+        iden = read_identity()
+        org = org or (iden.get("org") or "").strip()
+        team = team or (iden.get("team") or "").strip()
+        person = ((person or "").strip() or (iden.get("person") or "").strip())
+        memory_rules.check_identity(org, team, person)
+        check_org, check_team = org, team
 
     occurred_at = (occurred_at or bundle.get("ended_at") or "").strip()
     if not occurred_at:
@@ -1416,8 +1663,8 @@ def approve(
         repo=remote_repo,
         tool=tool,
         session_id=session_id,
-        org=org,
-        team=team,
+        org=check_org,
+        team=check_team,
         person=person,
         occurred_at=occurred_at,
         commit=commit,
@@ -1431,14 +1678,13 @@ def approve(
         superseded_by=superseded_by,
         updates=updates,
     )
-
-    try:
-        memory_store.save_approved(document)
-    except memory_store.StoreError as error:
-        raise ValueError(str(error)) from error
-
-    shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
-    return document
+    body = {key: value for key, value in document.items() if key != "id"}
+    if pinned:
+        del body["person"]
+        for field, chosen in (("org", org), ("team", team)):
+            if not chosen:
+                del body[field]
+    return url, body
 
 
 PAGE = """<!DOCTYPE html>
@@ -1461,11 +1707,17 @@ PAGE = """<!DOCTYPE html>
   a { color: #1d4ed8; }
   code { font-family: ui-monospace, monospace; font-size: 0.88rem; overflow-wrap: anywhere; }
   ul.commits { margin: 0.3rem 0; padding-left: 1.2rem; }
+  .banner { border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.6rem 0; background: #f5f5f4; }
+  .banner.ok { background: #ecfdf5; }
+  .banner.warn { background: #fffbeb; }
+  .banner.bad { background: #fef2f2; }
+  input[readonly] { background: #f5f5f4; }
 </style>
 </head>
 <body>
 <h1>Review</h1>
 <p class="meta">__LEAD__</p>
+__BANNER__
 __ITEMS__
 </body>
 </html>
@@ -1510,7 +1762,156 @@ def select_options(choices, selected):
     )
 
 
-def render_page(items, include_all):
+# whoami on each page load. Short, so an offline page still opens at once.
+PAGE_TIMEOUT = 2.0
+
+DONE = {
+    "sent": ("ok", "Approved and sent to the server."),
+    "queued": ("warn", "Approved and queued: the server didn't answer. agent-memory sync sends it."),
+    "rejected": ("ok", "Rejected."),
+    "rejected-queued": ("warn", "Rejected and queued: the server didn't answer. agent-memory sync sends it."),
+}
+
+
+def page_status():
+    """What the banner and the identity fields need: the server, whoami, and the outbox."""
+    root = store_root()
+    status = {
+        "configured": False,
+        "url": None,
+        "connected": False,
+        "error": "",
+        "who": None,
+        "pinned": False,
+        "outbox": outbox.summary(root),
+        "failed": outbox.failed(root),
+    }
+    try:
+        config = server_client.read_config()
+    except server_client.ConfigError as error:
+        status["error"] = str(error)
+        return status
+    if config is None:
+        status["error"] = NO_SERVER
+        return status
+    status.update(configured=True, url=config["url"], pinned=bool(config["token"]))
+    try:
+        who = server_client.Client(config["url"], config["token"], PAGE_TIMEOUT).whoami()
+    except (server_client.ServerError, server_client.ServerUnreachable) as error:
+        status["error"] = server_client.explain(error)
+        return status
+    if isinstance(who, dict):
+        status.update(connected=True, who=who)
+    return status
+
+
+def _banner(kind, text):
+    return f'<p class="banner {kind}">{text}</p>'
+
+
+def render_banner(status, done=""):
+    """Connected, offline or not configured; what waits in the outbox; and what failed for good."""
+    parts = []
+    if done in DONE:
+        kind, text = DONE[done]
+        parts.append(_banner(kind, html.escape(text)))
+    if status is None:
+        return "\n".join(parts)
+    url = html.escape(status.get("url") or "")
+    if not status["configured"]:
+        parts.append(_banner("bad", html.escape(status["error"]) + ". Approve and Reject need a server."))
+    elif status["connected"]:
+        who = status["who"] or {}
+        parts.append(_banner("ok", f"Connected to <code>{url}</code> as {html.escape(describe_caller(who))}."))
+    else:
+        parts.append(
+            _banner(
+                "warn",
+                f"Offline: <code>{url}</code> didn't answer ({html.escape(status['error'])}). "
+                "Approve and Reject wait in the outbox until <code>agent-memory sync</code> sends them.",
+            )
+        )
+    waiting = status["outbox"]
+    if waiting["queued"]:
+        parts.append(
+            _banner(
+                "warn",
+                f"Queued: {waiting['queued']} waiting in the outbox, the oldest for "
+                f"{html.escape(waiting['oldest'] or 'a while')}. <code>agent-memory sync</code> sends them.",
+            )
+        )
+    if status["failed"]:
+        parts.append(render_failed(status["failed"]))
+    return "\n".join(parts)
+
+
+def render_failed(failed):
+    """Items the server refused for good, each with its error, and the stored text for a 409."""
+    rows = []
+    for path, item in failed:
+        if item is None:
+            rows.append(f"<li><code>{html.escape(path.name)}</code>: not readable.</li>")
+            continue
+        body = item.get("body") if isinstance(item.get("body"), dict) else {}
+        what = "Memory" if item.get("op") == "memory" else "Rejection"
+        error = f"{item.get('status') or ''} {item.get('error') or ''}".strip()
+        detail = ""
+        if item.get("op") == "memory":
+            detail = f"<pre>{html.escape(str(body.get('text') or '')[:2000])}</pre>"
+        elif body.get("shas"):
+            detail = f"<p class=\"meta\">{html.escape(body.get('repo') or '')}: {html.escape(', '.join(body['shas']))}</p>"
+        if item.get("status") == 409:
+            stored_id = html.escape(item.get("stored_id") or "that id")
+            detail += (
+                f'<p class="meta">The server already keeps {stored_id} with this text:</p>'
+                f"<pre>{html.escape(str(item.get('stored') or ''))}</pre>"
+                '<p class="meta">A newer note replaces it through Supersedes.</p>'
+            )
+        rows.append(
+            f"<li>{what} for <code>{html.escape(body.get('repo') or '')}</code>, queued "
+            f"{html.escape(item.get('created_at') or '')}: {html.escape(error)}"
+            f"{detail}<p class=\"meta\">File: <code>{html.escape(path.name)}</code></p></li>"
+        )
+    return (
+        '<div class="banner bad"><strong>Failed</strong>: the server refused these. Fix the cause, '
+        "then run <code>agent-memory sync --retry-failed</code>, or delete the file from "
+        "<code>outbox/failed/</code>."
+        f'<ul>{"".join(rows)}</ul></div>'
+    )
+
+
+def identity_fields(status, iden):
+    """Organization, team and person. With a token the server pins person, and org and team to its lists."""
+    if status and status.get("pinned"):
+        who = status.get("who") or {}
+        if who.get("auth") == "on":
+            orgs = [value for value in who.get("allowed_orgs") or [who.get("org")] if value]
+            teams = [value for value in who.get("allowed_teams") or [who.get("team")] if value]
+            person = html.escape(who.get("person") or "")
+            return (
+                f'<label>Organization <select name="org">{select_options(orgs, who.get("org"))}</select></label>\n'
+                f'<label>Team <select name="team">{select_options(teams, who.get("team"))}</select></label>\n'
+                f'<label>Person (id prefix) <input name="person" type="text" value="{person}" readonly></label>\n'
+                '<p class="meta">Your token sets person, and the organizations and teams you may write as.</p>'
+            )
+        return (
+            '<label>Organization <input name="org" type="text" value="" placeholder="your token\'s"></label>\n'
+            '<label>Team <input name="team" type="text" value="" placeholder="your token\'s"></label>\n'
+            '<label>Person (id prefix) <input name="person" type="text" value="" '
+            'placeholder="set by your token" readonly></label>\n'
+            '<p class="meta">Your token sets person. Blank organization and team mean your token\'s.</p>'
+        )
+    org_d = html.escape(iden.get("org") or "")
+    team_d = html.escape(iden.get("team") or "")
+    person_d = html.escape(iden.get("person") or "")
+    return (
+        f'<label>Organization <input name="org" type="text" value="{org_d}" autocomplete="organization"></label>\n'
+        f'<label>Team <input name="team" type="text" value="{team_d}" autocomplete="organization-title"></label>\n'
+        f'<label>Person (id prefix) <input name="person" type="text" value="{person_d}"></label>'
+    )
+
+
+def render_page(items, include_all, status=None, done=""):
     lead = "Sessions whose work is on the default branch, plus anything you pinned."
     if include_all:
         lead = "Every inbox bundle."
@@ -1572,9 +1973,6 @@ def render_page(items, include_all):
                 )
             iden = read_identity()
             rr_default = (land_meta.get("remote_repo") or "").strip()
-            org_d = html.escape(iden.get("org") or "")
-            team_d = html.escape(iden.get("team") or "")
-            person_d = html.escape(iden.get("person") or "")
             remote_d = html.escape(rr_default)
             occurred_default = html.escape(item.get("ended_at") or "")
             record_val = ""
@@ -1587,9 +1985,7 @@ def render_page(items, include_all):
                 + "</select></label>"
             )
             extra_fields = f"""
-<label>Organization <input name="org" type="text" value="{org_d}" autocomplete="organization"></label>
-<label>Team <input name="team" type="text" value="{team_d}" autocomplete="organization-title"></label>
-<label>Person (id prefix) <input name="person" type="text" value="{person_d}"></label>
+{identity_fields(status, iden)}
 <label>Occurred at <input name="occurred_at" type="text" value="{occurred_default}"></label>
 <label>Remote repo id <input name="remote_repo" type="text" value="{remote_d}" placeholder="github.com/owner/repo"></label>
 {record_block}
@@ -1628,7 +2024,11 @@ def render_page(items, include_all):
     toggle = "Show the hidden sessions" if not include_all else "Show the default queue"
     href = "/?all=1" if not include_all else "/"
     body += f'<p><a href="{href}">{toggle}</a></p>'
-    return PAGE.replace("__LEAD__", html.escape(lead)).replace("__ITEMS__", body)
+    return (
+        PAGE.replace("__LEAD__", html.escape(lead))
+        .replace("__BANNER__", render_banner(status, done))
+        .replace("__ITEMS__", body)
+    )
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -1655,7 +2055,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         query = parse_qs(urlparse(self.path).query)
         include_all = query.get("all", ["0"])[0] == "1"
-        self._send(200, render_page(offered(include_all), include_all))
+        done = query.get("done", [""])[0]
+        self._send(200, render_page(offered(include_all), include_all, page_status(), done))
 
     def do_POST(self):
         host = self.headers.get("Host", "")
@@ -1668,7 +2069,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             bundle = find_bundle(session_id, form.get("tool") or None)
             path = urlparse(self.path).path
             if path == "/approve":
-                approve(
+                result = approve(
                     bundle,
                     form.get("kind", ""),
                     form.get("domain", ""),
@@ -1687,16 +2088,30 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     superseded_by=form.get("superseded_by", ""),
                     updates=form.get("updates", ""),
                 )
+                done = result["status"]
             elif path == "/reject":
-                reject_bundle(bundle)
+                done = "rejected-queued" if reject_bundle(bundle) == "queued" else "rejected"
             else:
                 self._send(404, "not found")
                 return
-        except (SystemExit, ValueError, OSError) as error:
+        except Refused as error:
+            stored = ""
+            if error.stored is not None:
+                stored = (
+                    "<p>The server keeps this text under that id:</p>"
+                    f"<pre>{html.escape(error.stored)}</pre>"
+                    "<p>To replace it, approve a new note with Supersedes set to that id.</p>"
+                )
+            self._send(
+                error.error.status if 400 <= error.error.status < 500 else 400,
+                f"<p>{html.escape(str(error))}</p>{stored}<p>The bundle is kept.</p><p><a href='/'>Back</a></p>",
+            )
+            return
+        except (SystemExit, ValueError, OSError, server_client.ConfigError) as error:
             self._send(400, f"<p>{html.escape(str(error))}</p><p><a href='/'>Back</a></p>")
             return
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", f"/?done={done}")
         self.end_headers()
 
 
@@ -1717,6 +2132,8 @@ def review_alive(state):
 
 
 def review(args):
+    warn_legacy()
+    sync_first(quiet=False)
     state_path = review_state_path()
     if state_path.is_file():
         state = read_json(state_path)
@@ -2108,54 +2525,41 @@ def list_from_server(args, config):
 
 def list_memories(args):
     config = _server_config()
-    if config is not None:
-        return list_from_server(args, config)
-    mode = memory_store.database_config()["mode"]
-    remote = (args.database or "").strip()
-    if mode == "shared" and remote:
-        raise SystemExit("database is only used in per-repo mode")
-    if mode == "per-repo" and not remote:
-        remote = git_remote_repo_id(os.getcwd())
-        if not remote:
-            raise SystemExit("per-repo list needs --database <remote id>")
-    try:
-        hits = memory_store.query_memories(
-            remote_id=remote if mode == "per-repo" else None,
-            team=args.team,
-            org=args.org,
-            repo=args.repo,
-            person=args.person,
-            since=args.since,
-            until=args.until,
-            kind=args.kind,
-            domain=args.domain,
-            tool=args.tool,
-            session_id=args.session_id,
-            limit=args.limit,
-            offset=args.offset,
-        )
-    except (ValueError, memory_store.StoreError) as error:
-        raise SystemExit(str(error)) from error
-    print(json.dumps(hits, indent=2))
-    return 0
+    if config is None:
+        raise SystemExit(NO_SERVER)
+    warn_legacy()
+    sync_first(quiet=False)
+    return list_from_server(args, config)
 
 
 def flush_cmd(args):
-    mode = memory_store.database_config()["mode"]
-    remote = (args.repo or "").strip()
-    if mode == "per-repo":
-        if remote and Path(remote).is_dir():
-            remote = git_remote_repo_id(str(Path(remote).resolve()))
-        elif not remote:
-            remote = git_remote_repo_id(os.getcwd())
-        if not remote:
-            raise SystemExit("per-repo flush needs --repo <remote id or checkout>")
-    else:
-        remote = None
+    """Retired with the cutover: Approve sends to the server, and the outbox holds what waits."""
+    print("flush is retired: use `agent-memory sync`", file=sys.stderr)
+    return 1
+
+
+def sync_cmd(args):
+    """Send the outbox to the server, in order. Exit 1 when anything is left waiting or failed."""
+    root = store_root()
+    if not args.quiet:
+        warn_legacy()
     try:
-        return memory_store.flush(remote)
-    except memory_store.StoreError as error:
-        raise SystemExit(str(error)) from error
+        report = outbox.sync(root, client_for, retry=args.retry_failed)
+    except OSError as error:
+        if args.quiet:
+            log(f"sync failed: {error}")
+            return 1
+        raise SystemExit(f"sync failed: {error}") from None
+    lines = report.lines(root)
+    if args.quiet:
+        if report.sent or report.failed or report.stopped:
+            for line in lines:
+                log(f"sync: {line}")
+    else:
+        for line in lines:
+            print(line)
+    left = outbox.summary(root)
+    return 1 if left["queued"] or report.failed else 0
 
 
 def describe_caller(who):
@@ -2191,7 +2595,7 @@ def connect_cmd(args):
         print(f"wrote {path} ({mode} mode)")
     print(f"connected to {url} as {describe_caller(who)}")
     if who.get("auth") == "on" and "write" not in (who.get("scopes") or []):
-        print("this token can't write: after the cutover, Approve needs a token with the write scope")
+        print("this token can't write: Approve needs a token with the write scope")
     return 0
 
 
@@ -2332,12 +2736,15 @@ def build_parser():
     migrate_parser.add_argument("--dry-run", action="store_true", help="print the counts and send nothing")
     migrate_parser.set_defaults(func=migrate_cmd)
 
-    flush_parser = sub.add_parser("flush", help="copy pending rows to the container when it is reachable")
-    flush_parser.add_argument(
-        "--repo",
-        default="",
-        help="per-repo remote id or checkout; ignored in shared mode",
+    sync_parser = sub.add_parser("sync", help="send the outbox to the server, in order")
+    sync_parser.add_argument(
+        "--retry-failed", action="store_true", help="move outbox/failed/ back into the queue first"
     )
+    sync_parser.add_argument("--quiet", action="store_true", help="write to capture.log only (hooks)")
+    sync_parser.set_defaults(func=sync_cmd)
+
+    flush_parser = sub.add_parser("flush", help="retired: use agent-memory sync")
+    flush_parser.add_argument("--repo", default="", help=argparse.SUPPRESS)
     flush_parser.set_defaults(func=flush_cmd)
     return parser
 
