@@ -2,6 +2,29 @@
 
 Status: a preview, built in PR 2b of [server-plan.md](server-plan.md). Nothing on the laptop talks to it yet. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 4 adds the client, and PR 5 is the cutover.
 
+## The shape
+
+```mermaid
+flowchart LR
+  subgraph laptop["Laptop (unchanged until PR 5)"]
+    review["agent-memory review"]
+    localdb[("data/memories.sqlite")]
+    embed["scripts/embed"]
+    review --> localdb --> embed
+  end
+  subgraph compose["docker compose --profile server"]
+    server["agent-memory-server<br/>127.0.0.1:8765 → :8765"]
+    serverdb[("data/server/memories.sqlite")]
+    qdrant[("Qdrant<br/>127.0.0.1:6333 (temporary)")]
+    server --> serverdb
+    server -- "memories-fastembed-384-2d705fdd" --> qdrant
+  end
+  embed -- "legacy collection: memories" --> qdrant
+  curl["curl / the CLI from PR 4"] -- "/v1/..." --> server
+```
+
+The server and the laptop never open the same SQLite file. Data moves between them only through `/v1/admin/import`, which `agent-memory migrate` uses in PR 4.
+
 ## Try it
 
 ```
@@ -27,15 +50,72 @@ Auth is off in this version. That is safe only because compose publishes the por
 | `POST /v1/commits/status` `{repo, shas}` | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
 | `POST /v1/admin/import` `{memories, rejections}` | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. |
 
+## A write, step by step
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as CLI (PR 4) or curl
+  participant R as Browser rules
+  participant A as /v1/memories
+  participant S as memories.sqlite
+  participant Q as Qdrant
+  C->>R: POST, Content-Type: application/json
+  R->>A: Host, Origin and Content-Type pass
+  A->>A: memory_rules.build_document()<br/>unknown keys or transcript_path → 400
+  A->>S: BEGIN IMMEDIATE, look up the id
+  break same id, different content
+    S-->>A: conflict, the stored row is kept
+    A-->>C: 409 with the stored text
+  end
+  alt new id
+    S-->>A: inserted (supersedes stamps the old row)
+  else same id, same content
+    S-->>A: unchanged, nothing written
+  end
+  A->>Q: embed every pending row, upsert
+  alt Qdrant answers
+    A-->>C: 201 or 200, embedded: true
+  else Qdrant down
+    A-->>C: 201 or 200, embedded: false
+    Note over A,Q: the retry loop embeds it at startup and every 30 s
+  end
+```
+
 ## Browser rules
 
 These apply to every route, `/mcp` included, whether auth is on or off:
+
+```mermaid
+flowchart TD
+  req["HTTP request"] --> host{"Host in<br/>AGENT_MEMORY_ALLOWED_HOSTS?"}
+  host -- no --> r421["421<br/>(DNS rebinding)"]
+  host -- yes --> origin{"Origin header?"}
+  origin -- "yes, not listed" --> r403["403<br/>(a web page)"]
+  origin -- "none, or listed" --> write{"POST, PUT,<br/>PATCH or DELETE?"}
+  write -- no --> route["the route"]
+  write -- yes --> json{"Content-Type:<br/>application/json?"}
+  json -- no --> r415["415<br/>(form or text/plain POST)"]
+  json -- yes --> route
+```
 
 - A `Host` that isn't in `AGENT_MEMORY_ALLOWED_HOSTS` gets a 421. The default is `127.0.0.1:8765,localhost:8765`.
 - A request with an `Origin` that isn't in `AGENT_MEMORY_ALLOWED_ORIGINS` gets a 403. The default allows none. The CLI sends no `Origin`.
 - A `POST`, `PUT`, `PATCH` or `DELETE` without `Content-Type: application/json` gets a 415.
 
 ## Embedding
+
+```mermaid
+flowchart TD
+  start["serve starts"] --> cfg{"configured embedder<br/>= embedding_state?"}
+  cfg -- "no" --> stop1["refuse: run reindex"]
+  cfg -- "yes, or no state yet" --> reach{"Qdrant reachable?"}
+  reach -- "no" --> wait["start anyway<br/>rows wait as pending"]
+  reach -- "yes" --> coll{"active collection<br/>exists, right size?"}
+  coll -- "missing or other size" --> stop2["refuse: run reindex --rebuild"]
+  coll -- "yes, or first run (created)" --> ready["ready: embed pending rows"]
+  wait -. "retry every 30 s" .-> reach
+```
 
 Each embedder gets its own Qdrant collection, `memories-<provider>-<dimension>-<hash8>`. The default is `memories-fastembed-384-2d705fdd`. The collection's metadata records the provider, model, revision, dimension and distance, and so does the `embedding_state` row in `memories.sqlite`.
 
