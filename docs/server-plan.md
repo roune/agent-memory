@@ -265,13 +265,13 @@ The last bullet replaces "Build retrieval…". It carries over the wording from 
 ```
 agent-memory connect --url https://memory.acme.internal --token-stdin
 agent-memory connect --url http://127.0.0.1:8765                # local, auth off
-agent-memory connect --editor claude-code,cursor,codex [--print]
+agent-memory connect --editor claude-code,cursor,codex [--print | --yes]
 ```
 
 - `connect` calls `/v1/whoami`, then writes `server` and prints who you are connected as.
 - `--editor` mints a read-scope token through `POST /v1/tokens`, with the label `editor-<tool>`, so editor configs never hold the write token. Running it again replaces that editor's token instead of adding one. It then prints the lines below. With a yes at a prompt (or `--yes`), it writes them instead. That is the same consent pattern `install` uses.
 - The commands to run, or the files to change. Each holds the read token as a literal value:
-  - **Claude Code:** `claude mcp add --transport http --scope user --header "Authorization: Bearer <read token>" agent-memory <url>/mcp`. User scope is stored in `~/.claude.json`.
+  - **Claude Code:** `claude mcp add --transport http --scope user agent-memory <url>/mcp --header "Authorization: Bearer <read token>"`. User scope is stored in `~/.claude.json`. PR 6 found that `--header` takes several values, so the name and URL must come before it; the order first written here fails with "missing required argument 'name'".
   - **Cursor:** `~/.cursor/mcp.json` → `{"mcpServers": {"agent-memory": {"url": "<url>/mcp", "headers": {"Authorization": "Bearer <read token>"}}}}`
   - **Codex:** `~/.codex/config.toml` → `[mcp_servers.agent-memory]` with `url = "<url>/mcp"` and `http_headers = { "Authorization" = "Bearer <read token>" }`. `bearer_token_env_var` would need the variable set wherever Codex is launched, which a desktop app doesn't inherit.
   - **Pi:** no MCP registration. Pi keeps capture through its extension.

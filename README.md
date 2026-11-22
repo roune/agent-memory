@@ -110,7 +110,13 @@ agent-memory config /path/to/repo
 agent-memory config /path/to/repo --git-hooks true --auto-approve false
 ```
 
-Pin a draft, force a captured session into the default queue, drop a bundle, or remove the editor hooks this tool added:
+Let Claude Code, Cursor and Codex search the kept notes through MCP. It shows what it will write and asks first; with auth on, each editor gets its own read-only token:
+
+```
+agent-memory connect --editor claude-code,cursor,codex
+```
+
+Pin a draft, force a captured session into the default queue, drop a bundle, or remove the editor hooks and MCP entries this tool added:
 
 ```
 agent-memory note --session-id my-note --kind learning --domain code --text "what to keep"

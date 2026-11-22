@@ -39,6 +39,9 @@ class StubServer:
         # path -> (status, payload), answered every time until removed.
         self.fail_path = {}
         self.redirect_to = None
+        # POST /v1/tokens: label -> the active child secret, and every secret it replaced.
+        self.children = {}
+        self.revoked = []
         self.lock = threading.Lock()
         stub = self
 
@@ -162,6 +165,19 @@ class StubServer:
                     "label": None,
                 }
             return 200, {"auth": "off", "person": "", "org": "", "team": "", "scopes": ["read", "write", "admin"]}
+        if path == "/v1/tokens" and method == "POST":
+            if not self.token:
+                return 400, {"error": "auth is off, so editors need no token"}
+            if not {"read", "write"} <= set(self.scopes):
+                return 403, {"error": "this token lacks the write scope"}
+            if not isinstance(body, dict) or set(body) != {"label"}:
+                return 400, {"error": 'send {"label": "<what the token is for>"}'}
+            number = len(self.children) + len(self.revoked) + 1
+            secret = f"am_child{number}_{body['label']}"
+            if body["label"] in self.children:
+                self.revoked.append(self.children[body["label"]])
+            self.children[body["label"]] = secret
+            return 201, {"id": f"t_child{number}", "token": secret, "label": body["label"], "person": self.person, "scopes": ["read"]}
         if path == "/v1/memories" and method == "POST":
             return self.post_memory(body)
         if path == "/v1/rejections" and method == "POST":
