@@ -243,18 +243,33 @@ def _header_names(names):
 
 
 def _drop_tables(text, names):
-    """The text without the [mcp_servers.<name>] tables (and their sub-tables) for these names."""
+    """The text without the [mcp_servers.<name>] tables (and their sub-tables) for these names.
+
+    Comments and blank lines after a dropped table's last key are the user's:
+    they are kept, whether another table or the end of the file follows.
+    """
     if not names:
         return text
     starts = _header_names(names)
     kept = []
+    pending = []
     dropping = False
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
         if stripped.startswith("["):
+            kept.extend(pending)
+            pending = []
             dropping = bool(starts.match(line))
-        if not dropping:
+            if not dropping:
+                kept.append(line)
+        elif not dropping:
             kept.append(line)
+        elif not stripped or stripped.startswith("#"):
+            pending.append(line)
+        else:
+            # A key of the dropped table: comments above it were inside the table.
+            pending = []
+    kept.extend(pending)
     return "".join(kept)
 
 
@@ -375,8 +390,18 @@ def ours(tool, home, record):
     ]
 
 
+def server_of(item):
+    """The server URL a recorded entry was minted on: its /mcp url without /mcp."""
+    url = item.get("url") or ""
+    return url[: -len("/mcp")] if url.endswith("/mcp") else url
+
+
 def remove_all(home):
-    """Drop every entry connect --editor added and still owns. Returns [(tool, path, names, token ids)]."""
+    """Drop every entry connect --editor added and still owns.
+
+    Returns [(tool, path, names, [(server url, token id)])]: `token revoke`
+    takes one id, run on the server that minted it.
+    """
     record = read_record()
     done = []
     for tool in EDITORS:
@@ -385,7 +410,11 @@ def remove_all(home):
         names = ours(tool, home, record)
         if names:
             path = apply(tool, home, {}, names)
-            ids = [record[tool][name].get("token_id") for name in names if record[tool][name].get("token_id")]
+            ids = [
+                (server_of(record[tool][name]), record[tool][name]["token_id"])
+                for name in names
+                if record[tool][name].get("token_id")
+            ]
             done.append((tool, path, names, ids))
         record.pop(tool)
     write_record(record)

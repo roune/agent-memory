@@ -208,6 +208,34 @@ class MergeTest(Case):
         # Codex is checked before anything is minted or written: Cursor is unchanged too.
         self.assertEqual(self.files(), before)
 
+    def test_comments_after_its_table_are_kept(self):
+        path = self.home / ".codex" / "config.toml"
+        self.assertEqual(self.run_cli("connect", "--editor", "codex", "--yes")[0], 0)
+        # Below our table: a comment block, then a table, then a commented-out table at the end.
+        middle = "# ---- work laptop ----\n# [profiles.old]\n# model = \"o1\"\n\n[profiles.work]\nmodel = \"o3\"\n"
+        tail = "\n# disabled for now:\n# [mcp_servers.foo]\n# command = \"foo\"\n"
+        path.write_text(path.read_text(encoding="utf-8") + "\n" + middle + tail, encoding="utf-8")
+        self.assertEqual(self.run_cli("connect", "--editor", "codex", "--yes")[0], 0)
+        text = self.codex_text()
+        self.assertIn(middle, text)
+        self.assertIn(tail.strip("\n"), text)
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        text = self.codex_text()
+        self.assertIn(middle, text)
+        self.assertIn(tail.strip("\n"), text)
+        self.assertNotIn("[mcp_servers.agent-memory]", text)
+
+    def test_a_table_header_inside_a_multiline_string_is_refused(self):
+        (self.home / ".codex").mkdir()
+        path = self.home / ".codex" / "config.toml"
+        tricky = "x = '''\n[mcp_servers.agent-memory]\n'''\ny = '''\n[z]\n'''\n"
+        path.write_text(tricky, encoding="utf-8")
+        code, out = self.run_cli("connect", "--editor", "codex", "--yes")
+        self.assertNotEqual(code, 0)
+        self.assertIn("can't edit", out)
+        self.assertEqual(path.read_text(encoding="utf-8"), tricky)
+        self.assertEqual(self.server.posts("/v1/tokens"), [])
+
     def test_broken_json_is_refused_before_anything_is_minted(self):
         (self.home / ".cursor").mkdir()
         (self.home / ".cursor" / "mcp.json").write_text("{not json", encoding="utf-8")
@@ -258,6 +286,19 @@ class PrintTest(Case):
         code, out = self.run_cli("connect", "--editor", "cursor", tty_answer="y")
         self.assertEqual(code, 0, out)
         self.assertIn("agent-memory", self.cursor()["mcpServers"])
+
+    def test_print_refuses_to_revoke_a_token_it_wrote(self):
+        self.assertEqual(self.run_cli("connect", "--editor", "cursor", "--yes")[0], 0)
+        before = self.files()
+        minted = len(self.server.posts("/v1/tokens"))
+        code, out = self.run_cli("connect", "--editor", "cursor,codex", "--print")
+        self.assertNotEqual(code, 0)
+        self.assertIn("already wrote cursor", out)
+        self.assertEqual(len(self.server.posts("/v1/tokens")), minted)
+        self.assertEqual(self.server.revoked, [])
+        self.assertEqual(self.files(), before)
+        # An editor it never wrote can still be printed.
+        self.assertEqual(self.run_cli("connect", "--editor", "codex", "--print")[0], 0)
 
     def test_pi_gets_no_entry(self):
         before = self.files()
@@ -353,6 +394,34 @@ class PerRepoTest(Case):
                 self.assertEqual(request["headers"]["Authorization"], f"Bearer {OTHER_TOKEN}")
         for value in self.tokens_in_files():
             self.assertNotIn(value, (f"Bearer {WRITE_TOKEN}", f"Bearer {OTHER_TOKEN}"))
+
+    def test_a_server_that_fails_keeps_its_old_entry_and_the_others_are_written(self):
+        self.assertEqual(self.run_cli("connect", "--editor", "cursor,codex", "--yes")[0], 0)
+        old = self.cursor()["mcpServers"]
+        self.other.fail_path["/v1/tokens"] = (500, {"error": "boom"})
+        code, out = self.run_cli("connect", "--editor", "cursor,codex", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("minting the cursor token failed", out)
+        new = self.cursor()["mcpServers"]
+        # The default server's token was replaced, and the file has the new one.
+        self.assertNotEqual(new["agent-memory"], old["agent-memory"])
+        token = new["agent-memory"]["headers"]["Authorization"].removeprefix("Bearer ")
+        self.assertEqual(self.server.children["editor-cursor"], token)
+        # The failing server's entry is untouched, and its token was never revoked.
+        self.assertEqual(new["agent-memory-127-0-0-1"], old["agent-memory-127-0-0-1"])
+        self.assertEqual(self.other.revoked, [])
+        self.assertEqual(self.codex()["mcp_servers"]["agent-memory"]["http_headers"]["Authorization"],
+                         f"Bearer {self.server.children['editor-codex']}")
+        record = editors.read_record()
+        self.assertEqual(record["cursor"]["agent-memory"]["token_id"], "t_child3")
+
+    def test_uninstall_prints_one_revoke_per_token_with_its_server(self):
+        self.assertEqual(self.run_cli("connect", "--editor", "cursor", "--yes")[0], 0)
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"on {self.server.url}: agent-memory-server token revoke t_child1\n", out)
+        self.assertIn(f"on {self.other.url}: agent-memory-server token revoke t_child1\n", out)
+        self.assertNotIn("revoke t_child1 t_child1", out)
 
     def test_a_server_no_longer_configured_loses_its_entry(self):
         self.assertEqual(self.run_cli("connect", "--editor", "cursor", "--yes")[0], 0)

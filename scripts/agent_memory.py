@@ -2550,11 +2550,8 @@ def uninstall(args):
         raise SystemExit(f"MCP entries left in place: {error}") from None
     for tool, path, names, ids in removed:
         print(f"removed MCP {', '.join(names)} from {tool} ({path})")
-        if ids:
-            print(
-                f"  its read token stays valid on the server until revoked: "
-                f"agent-memory-server token revoke {' '.join(ids)}"
-            )
+        for server, token_id in ids:
+            print(f"  its read token stays valid until revoked, on {server}: agent-memory-server token revoke {token_id}")
     return 0
 
 
@@ -2687,6 +2684,14 @@ def connect_editors(args):
         raise SystemExit(str(error)) from None
 
     if args.print:
+        auth_on = {name for name, *_rest, on in servers if on}
+        written = [tool for tool, _present, owned, _stale in plan if auth_on & set(owned)]
+        if written:
+            raise SystemExit(
+                f"connect --editor already wrote {', '.join(written)}, and --print would mint a new token that "
+                "revokes the one in that file. Run it without --print to replace the entry, or run "
+                "agent-memory uninstall first."
+            )
         return print_editor_lines(tools, servers, config)
 
     print("This will write MCP entries for agent-memory:")
@@ -2709,8 +2714,14 @@ def connect_editors(args):
             print("editor configs left unchanged; no token was minted")
             return 0
 
+    failures = []
     for tool, _present, _owned, stale in plan:
-        add, ids = mint_for(tool, servers, config)
+        # A server whose mint failed keeps its old entry: the old token wasn't replaced.
+        add, ids, failed = mint_for(tool, servers, config)
+        failures += failed
+        if not add and not stale:
+            print(f"{tool}: nothing written")
+            continue
         try:
             path = editors.apply(tool, HOME, add, stale)
         except editors.EditorError as error:
@@ -2721,14 +2732,23 @@ def connect_editors(args):
         for name, (url, _token) in add.items():
             entries[name] = {"url": editors.mcp_url(url), "token_id": ids.get(name)}
         editors.write_record(record)
-        print(f"wrote {tool}: {path} ({', '.join(add)})")
+        print(f"wrote {tool}: {path} ({', '.join(add) or 'removed ' + ', '.join(stale)})")
     print("Restart the editors to pick up the change. Pi keeps capture through its extension and has no MCP entry.")
+    if failures:
+        for line in failures:
+            print(line)
+        print("Those entries were left as they were. Fix the cause, then run this again.")
+        return 1
     return 0
 
 
 def mint_for(tool, servers, config):
-    """{name: (url, read token or None)} and {name: token id} for one editor. Never the caller's own token."""
-    add, ids = {}, {}
+    """{name: (url, read token or None)}, {name: token id}, and a line for each server that failed.
+
+    Every server is tried, so one that fails doesn't keep the others from
+    being written. Never the caller's own token.
+    """
+    add, ids, failed = {}, {}, []
     own = {config.get("token")} | set(server_client.read_tokens().values())
     for name, url, token, auth_on in servers:
         if not auth_on:
@@ -2738,26 +2758,32 @@ def mint_for(tool, servers, config):
             minted = server_client.Client(url, token).mint_token(editors.label(tool))
         except (server_client.ServerError, server_client.ServerUnreachable, server_client.ConfigError) as error:
             message = server_client.explain(error) if not isinstance(error, server_client.ConfigError) else str(error)
-            raise SystemExit(f"{url}: minting the {tool} token failed: {message}") from None
+            failed.append(f"{url}: minting the {tool} token failed: {message}")
+            continue
         if minted["token"] in own:
-            raise SystemExit(f"{url}: the server answered with the CLI's own token, which never goes in an editor file")
+            failed.append(f"{url}: the server answered with the CLI's own token, which never goes in an editor file")
+            continue
         add[name] = (url, minted["token"])
         ids[name] = minted.get("id")
-    return add, ids
+    return add, ids, failed
 
 
 def print_editor_lines(tools, servers, config):
     """--print: mint the tokens and print the commands and file lines. No file is written."""
     if any(auth_on for *_, auth_on in servers):
         print("Each line holds a new read token, and the earlier token with that label stops working.")
+    failures = []
     for tool in tools:
-        add, _ids = mint_for(tool, servers, config)
+        add, _ids, failed = mint_for(tool, servers, config)
+        failures += failed
         print(f"{tool}:")
         for name, (url, token) in add.items():
             for line in editors.shown(tool, name, url, token).splitlines():
                 print(f"  {line}")
+    for line in failures:
+        print(line)
     print("Nothing was written.")
-    return 0
+    return 1 if failures else 0
 
 
 def connect_cmd(args):
