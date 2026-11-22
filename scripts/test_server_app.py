@@ -226,10 +226,11 @@ class ImportRouteTest(AppCase):
             "/v1/admin/import",
             {"memories": [self.row("v1", "2026-11-01T00:00:00+00:00")], "rejections": [{"repo": REPO, "sha": A}]},
         )
-        self.assertEqual(first.json(), {"written": 1, "skipped": 0, "rejections": 1, "embedded": True})
+        self.assertEqual(first.json(), {"written": 1, "skipped": 0, "rejections": 1, "newer": [], "embedded": True})
         newer = self.post("/v1/admin/import", {"memories": [self.row("v2", "2026-11-02T00:00:00+00:00")]})
         older = self.post("/v1/admin/import", {"memories": [self.row("v0", "2026-10-01T00:00:00+00:00")]})
         self.assertEqual((newer.json()["written"], older.json()["skipped"]), (1, 1))
+        self.assertEqual(older.json()["newer"], ["miguel-learning-old"])
         kept = self.client.get("/v1/memories/miguel-learning-old").json()
         self.assertEqual((kept["text"], kept["person"]), ("v2", "miguel"))
         self.assertEqual(self.fake.payloads(self.embedding.collection)["miguel-learning-old"]["text"], "v2")

@@ -233,11 +233,16 @@ class WriteTest(ServerCase):
     def test_import_keeps_ids_and_the_newer_row_wins(self):
         old = {**body(text="old"), "id": "someone-learning-x", "person": "someone", "updated_at": "2026-11-01T00:00:00+00:00"}
         result = self.store.import_rows([old], [{"repo": REPO, "sha": A, "rejected_at": ""}], "local")
-        self.assertEqual(result, {"written": 1, "skipped": 0, "rejections": 1})
+        self.assertEqual(result, {"written": 1, "skipped": 0, "rejections": 1, "newer": []})
         newer = {**old, "text": "newer", "updated_at": "2026-11-02T00:00:00+00:00"}
         older = {**old, "text": "older", "updated_at": "2026-10-01T00:00:00+00:00"}
         self.assertEqual(self.store.import_rows([newer], [], "local")["written"], 1)
-        self.assertEqual(self.store.import_rows([older, newer], [], "local"), {"written": 0, "skipped": 2, "rejections": 0})
+        self.assertEqual(
+            self.store.import_rows([older, newer], [], "local"),
+            {"written": 0, "skipped": 2, "rejections": 0, "newer": ["someone-learning-x"]},
+            "the older one is reported as newer on the server; the same updated_at is not",
+        )
+        self.assertEqual(self.store.import_rows([newer], [], "local")["newer"], [])
         kept = self.store.get_memory("someone-learning-x")
         self.assertEqual((kept["text"], kept["person"]), ("newer", "someone"))
         self.assertTrue(self.store.commit_rejected(A[:9], REPO))

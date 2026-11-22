@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 TIMEOUT = 10.0
 HOOK_TIMEOUT = 2.0
@@ -204,10 +204,22 @@ def check_token(token):
     return text
 
 
+class _NoRedirects(HTTPRedirectHandler):
+    """Never follow a redirect. urllib would send the Authorization header to
+    whatever host Location names, https to http included, and turn a POST into
+    a GET. The API never redirects, so a 3xx is answered as an error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = build_opener(_NoRedirects)
+
+
 class Client:
     """One server. Every call returns the decoded JSON or raises ServerError / ServerUnreachable."""
 
-    def __init__(self, url, token=None, timeout=TIMEOUT, opener=urlopen):
+    def __init__(self, url, token=None, timeout=TIMEOUT, opener=_OPENER.open):
         self.url = clean_url(url)
         self.token = token
         self.timeout = timeout
@@ -233,6 +245,11 @@ class Client:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 decoded = {}
             message = decoded.get("error") if isinstance(decoded, dict) else None
+            if 300 <= error.code < 400:
+                message = (
+                    f"the server redirected to {error.headers.get('Location') or 'another URL'}, and agent-memory "
+                    "never follows a redirect; connect to the URL it should use instead"
+                )
             raise ServerError(error.code, message or error.reason or "error", decoded if isinstance(decoded, dict) else {}) from None
         except (URLError, TimeoutError, OSError, http.client.HTTPException) as error:
             reason = getattr(error, "reason", error)

@@ -33,6 +33,24 @@ def sources(mode):
     return [path for path in candidates if path.is_file()]
 
 
+def other_mode(mode):
+    return "per-repo" if mode == "shared" else "shared"
+
+
+def check_scopes(client):
+    """Refuse before anything is sent unless the token can import and read back."""
+    who = client.whoami()
+    if who.get("auth") == "off":
+        return
+    scopes = set(who.get("scopes") or [])
+    missing = sorted({"admin", "read"} - scopes)
+    if missing:
+        raise server_client.ConfigError(
+            f"migrate needs a token with the admin and read scopes; the one for {client.url} lacks "
+            f"{' and '.join(missing)}. Nothing was sent."
+        )
+
+
 def gather(paths, config):
     """Rows and rejections grouped by the server each one goes to.
 
@@ -113,11 +131,12 @@ def expected_hit(document):
 
 def send(client, group, out):
     """Import one group in batches. Returns the server's summed counts."""
-    total = {"written": 0, "skipped": 0, "rejections": 0}
+    total = {"written": 0, "skipped": 0, "rejections": 0, "newer": []}
     for batch in _chunks(group["memories"], BATCH):
         answer = client.import_rows(batch, [])
         for key in ("written", "skipped"):
             total[key] += int(answer.get(key, 0))
+        total["newer"].extend(answer.get("newer") or [])
     for batch in _chunks(group["rejections"], BATCH):
         answer = client.import_rows([], batch)
         total["rejections"] += int(answer.get("rejections", 0))
@@ -129,15 +148,20 @@ def send(client, group, out):
     return total
 
 
-def verify(client, group, out):
-    """Read every id back and check every rejection. Returns the problems, one line each."""
+def verify(client, group, out, newer=()):
+    """Read every id back and check every rejection. Returns the problems, one line each.
+
+    A row in newer is one the server holds at a later updated_at, such as one
+    superseded there since an earlier run. It is expected to differ.
+    """
     problems = []
+    newer = set(newer)
     for document in group["memories"]:
         found = client.get_memory(document["id"])
         if found is None:
             problems.append(f"missing on the server: {document['id']}")
-        elif found != expected_hit(document):
-            problems.append(f"differs on the server (it may hold a newer edit): {document['id']}")
+        elif document["id"] not in newer and found != expected_hit(document):
+            problems.append(f"differs on the server: {document['id']}")
     by_repo = {}
     for rejection in group["rejections"]:
         by_repo.setdefault(rejection["repo"], []).append(rejection["sha"])
@@ -155,9 +179,19 @@ def migrate(dry_run=False, out=None, client_for=None):
     out = out or sys.stdout
     client_for = client_for or (lambda url, token: server_client.Client(url, token))
     config = server_client.read_config()
-    mode = config["mode"] if config else server_client.legacy_mode()
+    # Where the laptop kept its files is the legacy database file's mode. The
+    # server file's mode only decides where each row goes.
+    mode = server_client.legacy_mode()
     paths = sources(mode)
     if not paths:
+        elsewhere = sources(other_mode(mode))
+        if elsewhere:
+            print(
+                f"no local memories.sqlite in {mode} mode, but {elsewhere[0]} is a {other_mode(mode)} store; "
+                f"set mode = {other_mode(mode)} in ~/.config/agent-memory/database and rerun",
+                file=out,
+            )
+            return 1
         print(f"no local memories.sqlite to migrate ({mode} mode)", file=out)
         return 0
     for path in paths:
@@ -171,12 +205,17 @@ def migrate(dry_run=False, out=None, client_for=None):
         return 0
     if config is None:
         raise server_client.ConfigError("no server configured; run agent-memory connect --url <server url> first")
+    clients = {url: client_for(url, group["token"]) for url, group in groups.items()}
+    for client in clients.values():
+        check_scopes(client)
     failed = False
-    for group in groups.values():
+    for url, group in groups.items():
         print_counts(group, out)
-        client = client_for(group["url"], group["token"])
-        send(client, group, out)
-        problems = verify(client, group, out)
+        client = clients[url]
+        sent = send(client, group, out)
+        for document_id in sent["newer"]:
+            print(f"  newer on the server, kept there: {document_id}", file=out)
+        problems = verify(client, group, out, newer=sent["newer"])
         for problem in problems:
             print(f"  {problem}", file=out)
         if problems:

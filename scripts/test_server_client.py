@@ -43,13 +43,15 @@ OTHER = "github.com/example/other"
 class StubServer:
     """The /v1 routes migrate, connect and list call, in memory. Newer updated_at wins on import."""
 
-    def __init__(self, token=None, person="tester"):
+    def __init__(self, token=None, person="tester", scopes=("read", "write", "admin")):
         self.token = token
         self.person = person
+        self.scopes = list(scopes)
         self.rows = {}
         self.rejections = set()
         self.requests = []
         self.fail_next = None
+        self.redirect_to = None
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -84,6 +86,19 @@ class StubServer:
 
             do_GET = do_POST = _handle
 
+            def handle_one_request(self):
+                if stub.redirect_to:
+                    self.raw_requestline = self.rfile.readline(65537)
+                    if not self.parse_request():
+                        return
+                    stub.requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers)})
+                    self.send_response(302)
+                    self.send_header("Location", stub.redirect_to + self.path)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                super().handle_one_request()
+
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -99,22 +114,25 @@ class StubServer:
     def route(self, method, path, query, body):
         if path == "/v1/whoami":
             if self.token:
-                return 200, {"auth": "on", "person": self.person, "org": "Org", "team": "Team", "scopes": ["read", "write"], "label": None}
+                return 200, {"auth": "on", "person": self.person, "org": "Org", "team": "Team", "scopes": self.scopes, "label": None}
             return 200, {"auth": "off", "person": "", "org": "", "team": "", "scopes": ["read", "write", "admin"]}
         if path == "/v1/admin/import" and method == "POST":
             written = 0
+            newer = []
             for document in body["memories"]:
                 current = self.rows.get(document["id"])
                 if current is None or document["updated_at"] > current["updated_at"]:
                     self.rows[document["id"]] = document
                     written += 1
+                elif current["updated_at"] > document["updated_at"]:
+                    newer.append(document["id"])
             added = 0
             for rejection in body["rejections"]:
                 key = (rejection["repo"], rejection["sha"])
                 if key not in self.rejections:
                     self.rejections.add(key)
                     added += 1
-            return 200, {"written": written, "skipped": len(body["memories"]) - written, "rejections": added}
+            return 200, {"written": written, "skipped": len(body["memories"]) - written, "rejections": added, "newer": newer}
         if path == "/v1/memories" and method == "GET":
             if "since" in query and query["since"][0] == "yesterday":
                 return 400, {"error": "since must be an ISO-8601 time, e.g. 2026-11-01T00:00:00+00:00"}
@@ -293,6 +311,21 @@ class ClientTest(HomeCase):
         with self.assertRaisesRegex(server_client.ServerUnreachable, "did not answer"):
             server_client.Client(stub.url, "am_t", timeout=2).whoami()
 
+    def test_a_redirect_is_never_followed(self):
+        # urllib would send the token to the Location host, and turn the POST into a GET.
+        elsewhere = self.stub()
+        stub = self.stub(token="am_t")
+        stub.redirect_to = elsewhere.url + "/steal"
+        client = server_client.Client(stub.url, "am_t")
+        for call in (client.whoami, lambda: client.import_rows([], [])):
+            with self.assertRaises(server_client.ServerError) as caught:
+                call()
+            self.assertEqual(caught.exception.status, 302)
+            self.assertIn("never follows a redirect", str(caught.exception))
+            self.assertIn(elsewhere.url + "/steal", str(caught.exception))
+        self.assertEqual(elsewhere.requests, [], "nothing reached the other host")
+        self.assertEqual([request["method"] for request in stub.requests], ["GET", "POST"])
+
     def test_a_page_that_is_not_json_is_not_the_server(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _HtmlHandler)
         self.addCleanup(server.server_close)
@@ -446,7 +479,7 @@ class MigrateTest(HomeCase):
             code, out = migrate()
         self.assertEqual(code, 1)
         self.assertIn("missing on the server: ana-learning-s1", out)
-        self.assertIn("differs on the server (it may hold a newer edit): miguel-change-s0", out)
+        self.assertIn("differs on the server: miguel-change-s0", out)
 
     def test_a_refused_import_stops_with_its_error(self):
         self.stub_server.fail_next = (403, {"error": "this token lacks the admin scope"})
@@ -461,6 +494,7 @@ class MigrateTest(HomeCase):
 
     def test_per_repo_files_go_to_the_server_their_remote_maps_to(self):
         self.local.unlink()
+        self.write_config("database", "mode = per-repo\n")
         team = self.stub(token="am_team")
         self.write_config("server", f"url = {self.stub_server.url}\ntoken = am_admin\nmode = per-repo\n")
         self.write_config("servers", f"{OTHER} = {team.url}\n")
@@ -475,8 +509,42 @@ class MigrateTest(HomeCase):
         self.assertEqual(self.stub_server.rejections, {(REPO, sha(9))})
         self.assertEqual(team.rejections, set())
 
+    def test_a_row_superseded_on_the_server_is_kept_and_passes(self):
+        migrate()
+        held = self.stub_server.rows["ana-learning-s1"]
+        self.stub_server.rows["ana-learning-s1"] = {**held, "superseded_by": "ana-learning-s9", "updated_at": "2026-12-01T00:00:00+00:00"}
+        code, out = migrate()
+        self.assertEqual(code, 0, out)
+        self.assertIn("newer on the server, kept there: ana-learning-s1", out)
+        self.assertNotIn("differs", out)
+        self.assertEqual(self.stub_server.rows["ana-learning-s1"]["superseded_by"], "ana-learning-s9")
+
+    def test_the_token_needs_admin_and_read_before_anything_is_sent(self):
+        for scopes, missing in ((("admin",), "lacks read"), (("read", "write"), "lacks admin")):
+            self.stub_server.scopes = list(scopes)
+            with self.subTest(scopes=scopes):
+                with self.assertRaisesRegex(server_client.ConfigError, f"admin and read scopes.*{missing}. Nothing was sent"):
+                    migrate()
+        self.assertEqual(self.imports(), [])
+        self.assertEqual(self.stub_server.rows, {})
+
+    def test_the_local_files_come_from_the_legacy_mode_not_the_server_file(self):
+        # data/memories.sqlite is a shared store: no database file says otherwise.
+        self.write_config("server", f"url = {self.stub_server.url}\ntoken = am_admin\nmode = per-repo\n")
+        code, out = migrate()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.stub_server.rows), 86)
+
+    def test_files_in_the_other_mode_are_not_silently_skipped(self):
+        self.write_config("database", "mode = per-repo\n")
+        code, out = migrate()
+        self.assertEqual(code, 1)
+        self.assertIn("is a shared store; set mode = shared in ~/.config/agent-memory/database", out)
+        self.assertEqual(self.stub_server.requests, [])
+
     def test_an_id_in_two_local_files_is_refused(self):
         self.local.unlink()
+        self.write_config("database", "mode = per-repo\n")
         self.write_config("server", f"url = {self.stub_server.url}\nmode = per-repo\n")
         base = self.home / ".local" / "share" / "agent-memory" / "databases"
         write_store(base / "a" / "memories.sqlite", fixture_rows(1))
@@ -584,6 +652,16 @@ class MigrateIntoTheRealServerTest(HomeCase):
         code, out = migrate(client_for=self.client_for)
         self.assertEqual(code, 0, out)
         self.assertIn("sent: 0 written, 86 already there or newer, 0 rejections new", out)
+        # A newer note supersedes a migrated one on the server; a rerun keeps it and passes.
+        newer = {
+            "kind": "learning", "domain": "code", "text": "replaces s1", "repo": REPO, "tool": "git", "session_id": "late",
+            "org": "Org", "team": "Team", "person": "ana", "occurred_at": "2026-11-21T10:00:00+00:00", "supersedes": "ana-learning-s1",
+        }
+        self.assertEqual(self.http.post("/v1/memories", json=newer).status_code, 201)
+        self.assertEqual(self.server_store.get_memory("ana-learning-s1")["superseded_by"], "ana-learning-late")
+        code, out = migrate(client_for=self.client_for)
+        self.assertEqual(code, 0, out)
+        self.assertIn("newer on the server, kept there: ana-learning-s1", out)
 
 
 if __name__ == "__main__":

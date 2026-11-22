@@ -127,7 +127,10 @@ class ServerStore(Store):
     def import_rows(self, documents, rejections, written_by):
         """Upsert full rows that keep their id, person and updated_at. A newer updated_at wins.
 
-        Returns {"written": n, "skipped": n, "rejections": n}.
+        Returns {"written": n, "skipped": n, "rejections": n, "newer": [ids]}. newer lists
+        the skipped rows the server holds at a later updated_at than the one sent,
+        such as a row superseded since an earlier import, so migrate can tell
+        them from rows that differ.
         """
         columns = ", ".join((*COPY_COLUMNS, "written_by"))
         marks = ", ".join("?" for _ in range(len(COPY_COLUMNS) + 1))
@@ -142,12 +145,17 @@ class ServerStore(Store):
 
         def work(connection):
             written = 0
+            newer = []
             for document in documents:
                 row = normalize_document(document, _text(document.get("updated_at")))
                 cursor = connection.execute(sql, [*(row[name] for name in COPY_COLUMNS), written_by])
                 if cursor.rowcount:
                     _write_commits(connection, row["id"], row["commits"])
                     written += 1
+                    continue
+                held = connection.execute("SELECT updated_at FROM memory WHERE id = ?", (row["id"],)).fetchone()
+                if held is not None and held[0] > row["updated_at"] and row["id"] not in newer:
+                    newer.append(row["id"])
             added = 0
             for rejection in rejections:
                 cursor = connection.execute(
@@ -155,7 +163,7 @@ class ServerStore(Store):
                     (_text(rejection["repo"]), _sha(rejection["sha"]), _text(rejection.get("rejected_at")) or utc_now()),
                 )
                 added += cursor.rowcount
-            return {"written": written, "skipped": len(documents) - written, "rejections": added}
+            return {"written": written, "skipped": len(documents) - written, "rejections": added, "newer": newer}
 
         return self._transaction(work, "could not import")
 

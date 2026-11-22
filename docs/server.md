@@ -57,14 +57,15 @@ agent-memory migrate
 | `tokens` | Per-repo mode: `<server url> = <token>`, written by `connect --repo`. Mode 0600. The `server` file's token is used only for its own url. |
 | `database`, `databases` | Legacy. `connect` and `migrate` read the mode from `database`. |
 
-**`migrate`** copies the laptop's `memories.sqlite` into the server. It needs the admin scope, which auth off implies.
+**`migrate`** copies the laptop's `memories.sqlite` into the server. It needs a token with both the admin and read scopes (auth off implies every scope), and it checks that with `/v1/whoami` before sending anything.
 
 - It opens the laptop file read-only and never changes it.
 - Rows go to `/v1/admin/import` in batches of 50, each keeping its `id`, `person` and `updated_at`, and the rejected commits go with them.
 - It then reads every id back and compares it with what it sent. It checks every rejection with `/v1/commits/status`, prints the server's own count, and exits 1 if anything is missing or different.
-- A rerun is safe. The server keeps a row only when its `updated_at` is newer, so a second run writes nothing.
+- A rerun is safe. The server keeps a row only when its `updated_at` is newer, so a second run writes nothing. A row the server holds at a later `updated_at`, such as one superseded there since the last run, is listed as "newer on the server" and kept. It doesn't count as a difference.
 - `--dry-run` prints the counts for each server (memories, rejected commits, repos, people) and sends nothing.
-- In per-repo mode it reads every file under `~/.local/share/agent-memory/databases/` and sends each row to the server its repo maps to.
+- Which local files it reads depends on the legacy `database` file's mode, because that is where the laptop wrote: `data/memories.sqlite` in shared mode, or every file under `~/.local/share/agent-memory/databases/` in per-repo mode. The `server` file's mode decides only where each row goes. If no file is found in that mode but the other mode's location has one, migrate says so and exits 1.
+- The client never follows a redirect. urllib would send the token to whatever host the redirect names, so a 3xx is reported as an error.
 
 Until the cutover, Approve still writes the laptop file, while `list` reads the server once `server` exists. So run `migrate` again to copy what you approved since the last run. PR 5 makes Approve send to the server.
 
@@ -83,7 +84,7 @@ Until the cutover, Approve still writes the laptop file, while `list` reads the 
 | `POST /v1/commits/status` `{repo, shas}` | read | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
 | `POST /v1/tokens` `{label}` | read and write | Mints a read-only child of the caller's token, for an editor. Returns the secret once. The same label again replaces the earlier child. A label is at most 64 characters, one line. 400 with auth off. |
 | `POST /mcp` | read | MCP over streamable HTTP, with the read-only tools `search`, `get` and `list`. See [MCP](#mcp). |
-| `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. |
+| `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. Returns `{written, skipped, rejections, newer}`, where `newer` lists the skipped ids the server holds at a later `updated_at`. |
 
 With auth off, every caller has every scope.
 
