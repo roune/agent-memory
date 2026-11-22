@@ -22,7 +22,7 @@ if str(SCRIPTS) not in sys.path:
 import memory_rules
 import store_core
 from agent_memory_server import cli, rules
-from agent_memory_server.embedding import Embedding, EmbeddingMismatch, collection_name, describe
+from agent_memory_server.embedding import Embedding, EmbeddingMismatch, collection_name, describe, points_for
 from agent_memory_server.lock import ServerLock
 from agent_memory_server.qdrant import Qdrant
 from agent_memory_server.reindex import ReindexError, reindex
@@ -172,6 +172,25 @@ class RulesTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 rules.import_from_body(bad)
 
+    def test_import_timestamps_are_checked_and_written_as_utc(self):
+        row = {**body(), "id": "tester-learning-s1", "commits": []}
+        memories, rejections = rules.import_from_body(
+            {
+                "memories": [{**row, "updated_at": "2026-11-01T01:30:00Z"}],
+                "rejections": [{"repo": REPO, "sha": A, "rejected_at": "2026-11-01T02:00:00+01:00"}],
+            }
+        )
+        self.assertEqual(memories[0]["updated_at"], "2026-11-01T01:30:00+00:00")
+        self.assertEqual(rejections[0]["rejected_at"], "2026-11-01T01:00:00+00:00")
+        for bad, message in (
+            ("not-a-time", "tester-learning-s1: updated_at must be an ISO-8601 time"),
+            ("2026-11-01T00:00:00", "tester-learning-s1: updated_at needs a time zone"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                rules.import_from_body({"memories": [{**row, "updated_at": bad}]})
+        with self.assertRaisesRegex(ValueError, "rejected_at must be an ISO-8601 time"):
+            rules.import_from_body({"rejections": [{"repo": REPO, "sha": A, "rejected_at": "yesterday"}]})
+
     def test_query_params(self):
         self.assertEqual(rules.query_from_params({"team": "T", "limit": "5"}), {"team": "T", "limit": 5})
         with self.assertRaisesRegex(ValueError, "unknown parameter: q"):
@@ -242,6 +261,21 @@ class EmbeddingTest(ServerCase):
         embedding.embed_pending()
         payloads = self.fake.payloads(embedding.collection)
         self.assertEqual(payloads["tester-learning-s1"]["superseded_by"], "tester-learning-s2")
+
+    def test_a_same_second_supersede_during_an_embed_is_embedded_again(self):
+        embedding = self.embedding()
+        embedding.prepare()
+        self.store.write_memory(document(session_id="s1"), "local")
+        read_before = self.store.pending_for(embedding.collection)
+        self.store.write_memory(document(session_id="s2", supersedes="tester-learning-s1"), "local")
+        # The embed that read s1 before the supersede finishes now, with s1's old payload.
+        vectors = self.model.embed_documents([doc["text"] for doc in read_before])
+        self.qdrant.upsert(embedding.collection, points_for(read_before, vectors, embedding.description))
+        self.store.mark_embedded_in(embedding.collection, [(doc["id"], doc["updated_at"]) for doc in read_before])
+        self.assertEqual(self.store.count_pending(embedding.collection), 2)
+        embedding.embed_pending()
+        payload = self.fake.payloads(embedding.collection)["tester-learning-s1"]
+        self.assertEqual(payload["superseded_by"], "tester-learning-s2")
 
     def test_qdrant_down_keeps_the_row_and_a_later_try_embeds_it(self):
         embedding = self.embedding()
@@ -332,12 +366,29 @@ class ReindexTest(ServerCase):
         self.fill(1)
         self.fake.collections["memories"] = {"vectors": {"size": 384, "distance": "Cosine"}, "metadata": {}, "indexes": {}, "points": {}}
         self.fake.collections["unrelated"] = {"vectors": {"size": 4, "distance": "Cosine"}, "metadata": {}, "indexes": {}, "points": {}}
+        self.fake.collections["memories-old-8-00000000"] = {"vectors": {"size": 8, "distance": "Cosine"}, "metadata": {}, "indexes": {}, "points": {}}
         lines = []
         reindex(self.store, self.model, self.qdrant, prune=True, out=lines.append)
-        self.assertIn("would delete: memories", lines)
-        self.assertIn("memories", self.fake.collections)
+        self.assertIn("would delete: memories-old-8-00000000", lines)
+        self.assertTrue(any(line.startswith("keeping memories:") for line in lines))
         reindex(self.store, self.model, self.qdrant, prune=True, yes=True, out=lines.append)
-        self.assertEqual(sorted(self.fake.collections), sorted([describe(self.model)["collection"], "unrelated"]))
+        active = describe(self.model)["collection"]
+        self.assertEqual(sorted(self.fake.collections), sorted([active, "memories", "unrelated"]))
+        reindex(self.store, self.model, self.qdrant, prune=True, yes=True, include_legacy=True, out=lines.append)
+        self.assertEqual(sorted(self.fake.collections), sorted([active, "unrelated"]))
+
+
+class LaterThanTest(unittest.TestCase):
+    def test_a_stamp_in_the_same_second_moves_past_the_old_one(self):
+        from agent_memory_server.store import later_than
+
+        same = "2026-11-22T10:00:00+00:00"
+        bumped = later_than(same, same)
+        self.assertEqual(bumped, "2026-11-22T10:00:00.000001+00:00")
+        self.assertGreater(bumped, same)
+        self.assertLess(bumped, "2026-11-22T10:00:01+00:00")
+        self.assertEqual(later_than("2026-11-22T10:00:01+00:00", same), "2026-11-22T10:00:01+00:00")
+        self.assertEqual(later_than(same, bumped), "2026-11-22T10:00:00.000002+00:00")
 
 
 class LockTest(ServerCase):
@@ -409,6 +460,7 @@ class CommandTest(ServerCase):
         self.assertEqual(code, 0)
         self.assertIn("embedded 1 into", out[0])
         self.assertEqual(self.run_cli(["reindex", "--yes"])[0], 2)
+        self.assertEqual(self.run_cli(["reindex", "--include-legacy"])[0], 2)
 
     def test_an_unknown_embedder_stops_the_command(self):
         err = io.StringIO()

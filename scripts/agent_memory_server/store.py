@@ -11,6 +11,7 @@ Standard library only.
 """
 
 import sqlite3
+from datetime import datetime, timedelta
 
 from store_core import (
     COPY_COLUMNS,
@@ -37,6 +38,22 @@ STATE_FIELDS = ("provider", "model", "revision", "dimension", "distance", "colle
 
 def _value(value):
     return "" if value is None else value
+
+
+def later_than(stamp, previous):
+    """stamp, or a microsecond after previous when stamp isn't later.
+
+    Timestamps have one-second resolution, so a supersede in the same second
+    as the old row's last write would leave its updated_at unchanged. Then an
+    embed that read the old row just before could still mark its stale
+    payload as current. A changed updated_at makes that mark miss.
+    """
+    if not previous or stamp > previous:
+        return stamp
+    try:
+        return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat()
+    except ValueError:
+        return stamp
 
 
 class ServerStore(Store):
@@ -79,12 +96,17 @@ class ServerStore(Store):
                 [*(row[name] for name in COPY_COLUMNS), written_by],
             )
             _write_commits(connection, row["id"], row["commits"])
+            old = None
             if row["supersedes"]:
+                old = connection.execute(
+                    "SELECT updated_at FROM memory WHERE id = ?", (row["supersedes"],)
+                ).fetchone()
+            if old is not None:
                 connection.execute(
                     "UPDATE memory SET superseded_by = ?, updated_at = ? WHERE id = ?",
-                    (row["id"], row["updated_at"], row["supersedes"]),
+                    (row["id"], later_than(row["updated_at"], old["updated_at"]), row["supersedes"]),
                 )
-                # Its payload changed in every collection, even within the same second.
+                # Its payload changed, so every collection embeds it again.
                 connection.execute("DELETE FROM memory_embedding WHERE memory_id = ?", (row["supersedes"],))
             current = connection.execute("SELECT * FROM memory WHERE id = ?", (row["id"],)).fetchone()
             return "created", current, row["commits"]

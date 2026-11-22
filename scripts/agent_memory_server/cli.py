@@ -34,6 +34,11 @@ def _parser():
     again.add_argument("--rebuild", action="store_true", help="drop that collection first and embed everything")
     again.add_argument("--prune", action="store_true", help="list the other memories* collections")
     again.add_argument("--yes", action="store_true", help="with --prune, delete them")
+    again.add_argument(
+        "--include-legacy",
+        action="store_true",
+        help="with --prune, also the legacy `memories` collection (only after the cutover)",
+    )
     return parser
 
 
@@ -89,8 +94,8 @@ def serve(settings, store, model, qdrant, host, port, start=_uvicorn, build=_cre
 
 
 def run_reindex(settings, store, model, qdrant, args, out=print, err=sys.stderr):
-    if args.yes and not args.prune:
-        print("agent-memory-server: --yes goes with --prune", file=err)
+    if (args.yes or args.include_legacy) and not args.prune:
+        print("agent-memory-server: --yes and --include-legacy go with --prune", file=err)
         return 2
     lock = ServerLock(settings.lock_path)
     if not lock.acquire():
@@ -102,7 +107,16 @@ def run_reindex(settings, store, model, qdrant, args, out=print, err=sys.stderr)
         return 1
     try:
         model.load()
-        return reindex(store, model, qdrant, rebuild=args.rebuild, prune=args.prune, yes=args.yes, out=out)
+        return reindex(
+            store,
+            model,
+            qdrant,
+            rebuild=args.rebuild,
+            prune=args.prune,
+            yes=args.yes,
+            include_legacy=args.include_legacy,
+            out=out,
+        )
     except (EmbeddingMismatch, ReindexError, QdrantError, StoreError, embedders.EmbedderError) as error:
         print(f"agent-memory-server: {error}", file=err)
         return 1

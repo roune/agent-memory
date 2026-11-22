@@ -349,7 +349,7 @@ The move happens in PR 4 and PR 5:
    - An MCP `search` returns hits.
    - `/v1/commits/status` reports both rejected shas as rejected.
 7. **Rerun after the cutover:** `migrate` is idempotent, because a newer `updated_at` wins. Run it once more after upgrading to PR 5, so anything approved between PR 4 and PR 5 is copied too.
-8. **Clean up:** `scripts/embed --prune` runs `reindex --prune --yes` with the server stopped, which drops the legacy `memories` collection. The laptop's `data/memories.sqlite` is left in place as a backup. The CLI no longer opens it, apart from `migrate`.
+8. **Clean up:** `scripts/embed --prune` runs `reindex --prune --yes --include-legacy` with the server stopped, which drops the legacy `memories` collection. The laptop's `data/memories.sqlite` is left in place as a backup. The CLI no longer opens it, apart from `migrate`.
 
 Per-repo mode works the same way. Each local file under `~/.local/share/agent-memory/databases/<remote>/` goes to the server that `servers` maps that remote to.
 

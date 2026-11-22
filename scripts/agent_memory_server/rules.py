@@ -5,6 +5,8 @@ only the fields of an approved document: any other key, transcript_path
 included, is refused, so nothing but reviewed text reaches the server.
 """
 
+from datetime import datetime, timezone
+
 import memory_rules
 
 # The fields of the document approve() builds.
@@ -59,6 +61,23 @@ def memory_from_body(body):
     return document
 
 
+def utc_timestamp(value, name):
+    """An ISO-8601 time with a zone, as UTC in the store's own format.
+
+    The store compares timestamps as text, so "newer wins" holds only when
+    every one is written the same way: 2026-11-01T00:00:00+00:00 (plus
+    microseconds when there are any). A Z suffix or another offset is
+    converted; a time without a zone, or not a time, is refused.
+    """
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except (AttributeError, ValueError):
+        raise ValueError(f"{name} must be an ISO-8601 time, e.g. 2026-11-01T00:00:00+00:00") from None
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} needs a time zone, e.g. +00:00")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def _shas(value):
     if not isinstance(value, list) or not value or len(value) > MAX_SHAS:
         raise ValueError(f"shas must be a list of 1 to {MAX_SHAS} commit hashes")
@@ -103,9 +122,10 @@ def _import_memory(item):
         if item.get("commit"):
             memory_rules.check_commit(item["commit"])
         memory_rules.check_pull_request(item.get("pull_request"))
+        updated_at = utc_timestamp(item["updated_at"], "updated_at")
     except ValueError as error:
         raise ValueError(f"{item['id']}: {error}") from None
-    return item
+    return {**item, "updated_at": updated_at}
 
 
 def _import_rejection(item):
@@ -115,8 +135,8 @@ def _import_rejection(item):
     if not isinstance(sha, str):
         raise ValueError("each rejection needs a sha")
     rejected_at = item.get("rejected_at", "")
-    if not isinstance(rejected_at, str):
-        raise ValueError("rejected_at must be text")
+    if rejected_at:
+        rejected_at = utc_timestamp(rejected_at, "rejected_at")
     return {"repo": repo, "sha": memory_rules.check_commit(sha), "rejected_at": rejected_at}
 
 

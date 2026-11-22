@@ -123,6 +123,8 @@ Each embedder gets its own Qdrant collection, `memories-<provider>-<dimension>-<
 - **Qdrant down:** the row is still stored and the response says `embedded: false`. The server tries again at startup and every 30 seconds (`AGENT_MEMORY_EMBED_RETRY`).
 - **Mismatch:** at startup the server compares the configured embedder with `embedding_state`, and with the live collection's vector size. On any mismatch it refuses to start, and names the command that fixes it.
 
+In compose, the variables in the settings table below come from `.env`. To switch models, set `AGENT_MEMORY_EMBEDDER` and `AGENT_MEMORY_EMBED_MODEL` there, then run `reindex` as below.
+
 ## Commands
 
 ```
@@ -142,7 +144,7 @@ docker compose --profile server start server
 - **`--rebuild`** drops that collection first.
 - **`--prune`** lists the other collections whose name starts with `memories`. With `--yes` it deletes them.
 
-**Before the cutover, don't run `--prune --yes`.** The laptop's `scripts/embed` still writes the legacy `memories` collection, and `--prune --yes` would delete it.
+`--prune` keeps the legacy `memories` collection, because the laptop's `scripts/embed` still writes it until the cutover. `--prune --yes --include-legacy` deletes it too; PR 5 runs that after the cutover.
 
 ## Settings
 
@@ -152,7 +154,7 @@ docker compose --profile server start server
 | `AGENT_MEMORY_SERVER_DATA` | `/data` | `memories.sqlite` and `server.lock`. |
 | `AGENT_MEMORY_QDRANT_URL` | `http://qdrant:6333` | Qdrant on the compose network. |
 | `AGENT_MEMORY_QDRANT_API_KEY` | none | Sent as `api-key` when Qdrant has one. |
-| `AGENT_MEMORY_ALLOWED_HOSTS` | `127.0.0.1:8765,localhost:8765` | See the browser rules. |
+| `AGENT_MEMORY_ALLOWED_HOSTS` | `127.0.0.1:8765,localhost:8765` | See the browser rules. If you publish another port, list it here and keep `127.0.0.1:8765`, which the image's health check sends. |
 | `AGENT_MEMORY_ALLOWED_ORIGINS` | none | See the browser rules. |
 | `AGENT_MEMORY_MODELS_DIR` | `/opt/agent-memory/models` in the image | Where the baked checkpoint is. The image sets `HF_HUB_OFFLINE=1`, so the server never downloads a model. |
 | `AGENT_MEMORY_EMBEDDER`, `AGENT_MEMORY_EMBED_MODEL` | `fastembed`, `BAAI/bge-small-en-v1.5` | See [embedding-model.md](embedding-model.md). |

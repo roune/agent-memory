@@ -6,17 +6,24 @@ Run it while the server is stopped (cli.py takes the server lock first):
                      count, and switch embedding_state to this embedder
   reindex --rebuild  drop that collection first and embed everything again
   --prune            list the other collections whose name starts with
-                     "memories"; with --yes, delete them
+                     "memories"; with --yes, delete them. The legacy
+                     `memories` collection, which the laptop's scripts/embed
+                     still writes until the cutover, is kept unless
+                     --include-legacy is passed too.
 """
 
 from agent_memory_server.embedding import Embedding, ensure_collection
+
+LEGACY_COLLECTION = "memories"
 
 
 class ReindexError(Exception):
     pass
 
 
-def reindex(store, embedder, qdrant, rebuild=False, prune=False, yes=False, out=print, batch_size=64):
+def reindex(
+    store, embedder, qdrant, rebuild=False, prune=False, yes=False, include_legacy=False, out=print, batch_size=64
+):
     embedding = Embedding(store, embedder, qdrant, batch_size=batch_size)
     name = embedding.collection
     if rebuild:
@@ -40,6 +47,12 @@ def reindex(store, embedder, qdrant, rebuild=False, prune=False, yes=False, out=
         out(f"active collection: {name} (was {was})")
     if prune:
         others = [other for other in qdrant.collection_names() if other.startswith("memories") and other != name]
+        if LEGACY_COLLECTION in others and not include_legacy:
+            others.remove(LEGACY_COLLECTION)
+            out(
+                f"keeping {LEGACY_COLLECTION}: the laptop's scripts/embed still writes it until the cutover "
+                "(pass --include-legacy to delete it too)"
+            )
         if not others:
             out("nothing to prune")
         elif not yes:
