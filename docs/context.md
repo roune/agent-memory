@@ -13,7 +13,7 @@ The two jobs, in order:
 
 ## The store
 
-The vector database belongs to this tool. A setup script creates it in this repo’s `data/` directory, which is gitignored. Other repositories are tags on a memory, not places that each grow their own index.
+The vector database belongs to this tool. A setup script creates it in this repo’s `data/` directory, which is gitignored. Without a clone, `data/` sits next to the `compose.yaml` you run. Other repositories are tags on a memory, not places that each grow their own index.
 
 Tags on every memory:
 
@@ -69,15 +69,16 @@ session end hook
   -> local inbox bundle
 agent-memory review
   -> keep nothing, or one document (change, learning, or decision)
-setup and embed script
-  -> vectors in data/
+Approve
+  -> agent-memory server, which embeds
+  -> vectors in Qdrant
 ```
 
 **Same clone, after each commit or merge (optional git hooks):**
 
 ```
 post-commit / post-merge
-  -> inbox bundle (tool: git), draft = commit message only; or auto-approve into data/memories.sqlite when configured
+  -> inbox bundle (tool: git), draft = commit message only; or auto-approve to the server (outbox when offline) when configured
 ```
 
 **Default-branch commits in another repo:**
@@ -97,13 +98,13 @@ The hook writes the inbox bundle and returns. It does not prompt. End hooks cann
 - Codex `SessionEnd` is advisory and capped at about 3 seconds.
 - Transcript files are sometimes missing or stale by the time `SessionEnd` runs.
 
-The review command is where the person decides to keep nothing, the change summary, the learnings, or specific slices. Approve stamps `org`, `team`, `person`, `occurred_at`, and the remote `repo` id, then writes the row `<person>-<kind>-<session_id>` in `data/memories.sqlite` and deletes the inbox folder. Reject deletes the bundle and, for git bundles, remembers its commits so they are not offered again. If you set `supersedes` to an existing document id, the old row gets `superseded_by` set to this document’s id.
+The review command is where the person decides to keep nothing, the change summary, the learnings, or specific slices. Approve stamps `org`, `team`, `person`, `occurred_at`, and the remote `repo` id, then sends the document to the server, which writes the row `<person>-<kind>-<session_id>` in its `memories.sqlite`, and deletes the inbox folder. Reject deletes the bundle and, for git bundles, remembers its commits so they are not offered again. If you set `supersedes` to an existing document id, the old row gets `superseded_by` set to this document’s id.
 
 ## Hooks, once they exist
 
 User-level hooks call one capture command. Locations and which event does the real capture are in [harnesses.md](harnesses.md).
 
-Hooks always write a local spool first. A sync step, later, pushes only approved documents when a remote is configured.
+Hooks always write a local spool first. A sync step, later, pushes only approved documents when a remote is configured. That step is `agent-memory sync` and the outbox.
 
 ## Later, not now
 
