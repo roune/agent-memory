@@ -109,6 +109,10 @@ class LoadEmbedderTest(unittest.TestCase):
         self.assertIn("BAAI/bge-base-en-v1.5", str(raised.exception))
         self.assertIn("aa8f8b060edb00e03bfdd08813a2949946c8ba55", str(raised.exception))
 
+    def test_model_name_is_matched_without_case(self):
+        config = {"provider": "FastEmbed", "model": "baai/BGE-small-en-v1.5"}
+        self.assertIsInstance(embedder.load_embedder(config, self.models), embedder.FastEmbedBge)
+
     def test_loading_the_config_does_not_load_weights(self):
         model = embedder.load_embedder({}, self.models)
         self.assertFalse(model.model_dir.exists())
@@ -144,10 +148,14 @@ class FastEmbedBgeTest(unittest.TestCase):
 class EmbedScriptTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = {name: os.environ.get(name) for name in ("HOME", "AGENT_MEMORY_DIR", embedder.PROVIDER_ENV)}
-        os.environ["HOME"] = str(Path(self.tmp.name) / "home")
+        names = ("HOME", "AGENT_MEMORY_DIR", embedder.PROVIDER_ENV, embedder.MODEL_ENV)
+        self.saved = {name: os.environ.get(name) for name in names}
+        self.home = Path(self.tmp.name) / "home"
+        (self.home / ".config" / "agent-memory").mkdir(parents=True)
+        os.environ["HOME"] = str(self.home)
         os.environ["AGENT_MEMORY_DIR"] = str(Path(self.tmp.name) / "store")
         os.environ.pop(embedder.PROVIDER_ENV, None)
+        os.environ.pop(embedder.MODEL_ENV, None)
         self.embed = load_embed()
 
     def tearDown(self):
@@ -214,6 +222,71 @@ class EmbedScriptTest(unittest.TestCase):
         self.embed.api = api
         self.embed.ensure_collection("http://qdrant", SmallEmbedder())
         self.assertEqual(calls[1], ("PUT", "/collections/memories", {"vectors": {"size": 8, "distance": "Cosine"}}))
+
+    def write_config(self, name, text):
+        (self.home / ".config" / "agent-memory" / name).write_text(text, encoding="utf-8")
+
+    def test_rebuild_with_a_wrong_length_vector_deletes_nothing(self):
+        self.embed.memory_store.save_approved(self.document())
+        calls = []
+
+        def api(base, method, path, body=None, missing_ok=False):
+            calls.append((method, path))
+            return {}
+
+        class ShortVectors(SmallEmbedder):
+            def embed_documents(self, texts):
+                return [[0.5] * (self.dimension - 1) for _ in texts]
+
+        self.embed.api = api
+        self.embed.load_model = lambda: ShortVectors()
+        with mock.patch.object(self.embed.memory_store, "container_ready", lambda url: True):
+            with self.assertRaises(SystemExit) as raised:
+                self.embed.main(["--rebuild"])
+        self.assertIn("length 7", str(raised.exception.code))
+        self.assertEqual(calls, [])
+
+    def test_rebuild_with_repo_in_shared_mode_is_refused(self):
+        def ready(url):
+            raise AssertionError("embed asked Qdrant before refusing --rebuild --repo")
+
+        with mock.patch.object(self.embed.memory_store, "container_ready", ready):
+            with self.assertRaises(SystemExit) as raised:
+                self.embed.main(["--rebuild", "--repo", "github.com/example/proj"])
+        self.assertIn("without --repo", str(raised.exception.code))
+
+    def test_rebuild_in_per_repo_mode_refuses_a_shared_url(self):
+        self.write_config("database", "mode = per-repo\n")
+        self.write_config(
+            "databases",
+            "github.com/example/one = http://127.0.0.1:9\n"
+            "github.com/example/two = http://127.0.0.1:9/\n"
+            "github.com/example/three = http://127.0.0.1:10\n",
+        )
+
+        def ready(url):
+            raise AssertionError("embed asked Qdrant before refusing the shared URL")
+
+        with mock.patch.object(self.embed.memory_store, "container_ready", ready):
+            with self.assertRaises(SystemExit) as raised:
+                self.embed.main(["--rebuild", "--repo", "github.com/example/one"])
+        message = str(raised.exception.code)
+        self.assertIn("github.com/example/two", message)
+        self.assertNotIn("three", message)
+
+    def test_rebuild_in_per_repo_mode_with_its_own_url_goes_on(self):
+        self.write_config("database", "mode = per-repo\n")
+        self.write_config(
+            "databases",
+            "github.com/example/one = http://127.0.0.1:9\n"
+            "github.com/example/three = http://127.0.0.1:10\n",
+        )
+        asked = []
+        with mock.patch.object(self.embed.memory_store, "container_ready", lambda url: asked.append(url) or False):
+            with self.assertRaises(SystemExit) as raised:
+                self.embed.main(["--rebuild", "--repo", "github.com/example/one"])
+        self.assertEqual(asked, ["http://127.0.0.1:9"])
+        self.assertIn("Qdrant is not ready", str(raised.exception.code))
 
     def test_unimplemented_provider_stops_before_qdrant(self):
         os.environ[embedder.PROVIDER_ENV] = "openai"

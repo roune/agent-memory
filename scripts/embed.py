@@ -44,9 +44,9 @@ def api(base, method, path, body=None, missing_ok=False):
 
 
 def models_dir():
-    """Where a local model keeps its checkpoint: next to the SQLite file.
+    """Where a local model keeps its checkpoint: data/models under the store root.
 
-    That is AGENT_MEMORY_DIR when it is set, otherwise the repo, so the
+    The store root is AGENT_MEMORY_DIR when it is set, otherwise the repo, so the
     bge-small checkpoint stays at data/models/bge-small-en-v1.5-onnx-q.
     """
     return memory_store.store_root() / "data" / "models"
@@ -196,6 +196,32 @@ def points_for(documents, vectors, model):
     return points
 
 
+def check_rebuild(mode, remote):
+    """Stop a --rebuild that would delete points it does not embed again.
+
+    --rebuild deletes the whole collection at that Qdrant URL. In shared mode
+    --repo embeds only one repo's rows, and in per-repo mode another remote can
+    point at the same URL. Either way the other points would vanish while their
+    rows stay marked embedded.
+    """
+    if mode == "shared" and remote:
+        raise SystemExit(
+            "--rebuild rebuilds every repo in shared mode; run it without --repo"
+        )
+    if mode == "per-repo":
+        url = memory_store.qdrant_url(remote)
+        others = sorted(
+            other
+            for other, other_url in memory_store.remote_urls().items()
+            if other != remote and other_url.strip().rstrip("/") == url
+        )
+        if others:
+            raise SystemExit(
+                f"--rebuild would delete the points of {', '.join(others)}, "
+                f"which share {url} with {remote}"
+            )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="embed")
     parser.add_argument("--repo", default="", help="remote id; required in per-repo mode")
@@ -209,6 +235,8 @@ def main(argv=None):
     model = load_model()
     try:
         base = memory_store.qdrant_url(selected)
+        if args.rebuild:
+            check_rebuild(mode, remote)
     except memory_store.StoreError as error:
         raise SystemExit(str(error)) from error
     if not memory_store.container_ready(base):

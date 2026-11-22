@@ -9,7 +9,7 @@ Research first. Read [docs/context.md](docs/context.md), [docs/harnesses.md](doc
 ## Do not
 
 - Swap the vector engine. It is Qdrant server.
-- Change the default embedding model or its pinned revision, or implement a hosted adapter (OpenAI, Bedrock), without a plan PR first. A deployment runs one embedder. A different model means a new collection and embedding every row of `memories.sqlite` again. Until the server's `reindex` exists, that is `scripts/embed --rebuild`.
+- Change the default embedding model or its pinned revision, or implement a hosted adapter (OpenAI, Bedrock), without a plan PR first. A deployment runs one embedder. A different model means embedding every row of `memories.sqlite` again. Today `scripts/embed --rebuild` deletes the `memories` collection and builds it again at the new model's size. The server's `reindex` will keep one collection per model instead.
 - Add a dependency for capture or review until section 1 of [docs/research.md](docs/research.md) is answered.
 - Install hooks into `~/.cursor`, `~/.claude`, `~/.codex`, or Pi.
 - Commit transcripts, inbox dumps, or anything under `data/`.

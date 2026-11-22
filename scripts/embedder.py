@@ -25,6 +25,13 @@ class EmbedderError(Exception):
 
 
 class Embedder(Protocol):
+    """What embed.py and a query path need from a model.
+
+    A class in PROVIDERS is built as cls(models_dir, backend=None). models_dir
+    is where a local model keeps its checkpoint, and backend replaces the
+    loaded model in tests. A hosted model may ignore both.
+    """
+
     provider: str
     model: str
     revision: str
@@ -137,7 +144,7 @@ def load_embedder(config, models_dir, backend=None):
             'See docs/embedding-model.md, "Adding a provider".'
         )
     model = (config.get("model") or factory.model).strip()
-    if model != factory.model:
+    if model.lower() != factory.model.lower():
         raise EmbedderError(
             f"{provider} runs only {factory.model} at revision {factory.revision}, not {model!r}"
         )

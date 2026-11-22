@@ -17,8 +17,7 @@ Documents are embedded with no query instruction. BGE v1.5 still suggests prepen
 
 A second machine gets the same vectors by running `scripts/embed`, which fetches revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55` and FastEmbed 0.9.1. The collection is `memories`. Switching checkpoints means deleting that collection and embedding the documents again.
 
-A hosted model is a different vector space, so it gets its own collection and a full reindex. It is never mixed into an index built with this one. A later cloud deploy runs this same ONNX file next to Qdrant. Approved documents stay the source of truth either way.
-
+A hosted model is a different vector space, so switching to it means embedding every row again. Its vectors are never mixed into an index built with this one. A later cloud deploy runs this same ONNX file next to Qdrant. Approved documents stay the source of truth either way.
 
 ## Choosing the embedder
 
@@ -26,8 +25,8 @@ A hosted model is a different vector space, so it gets its own collection and a 
 
 | Variable | Default | Today |
 | --- | --- | --- |
-| `AGENT_MEMORY_EMBEDDER` | `fastembed` | Only `fastembed` is implemented. Any other value stops `scripts/embed` with an error that names this section. |
-| `AGENT_MEMORY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed runs only this model, at the pinned revision above. |
+| `AGENT_MEMORY_EMBEDDER` | `fastembed` | Only `fastembed` is implemented. Any other value stops `scripts/embed` with an error that points to "Adding a provider" below. |
+| `AGENT_MEMORY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed runs only this model, at the pinned revision above. Any other name stops `scripts/embed` with an error that names the model and revision it runs. |
 
 An embedder names its `provider`, `model`, `revision`, `dimension`, and `distance`. Each point's payload records `embedding_model` and `embedding_revision`. The vector length is checked against `dimension` before anything is written, and an existing collection of another size is refused.
 
@@ -35,7 +34,7 @@ An embedder names its `provider`, `model`, `revision`, `dimension`, and `distanc
 
 OpenAI and AWS Bedrock are not implemented. They are left for a later plan PR, as `AGENTS.md` asks. This is how one would plug in:
 
-1. Write a class in `scripts/embedder.py` with the five attributes and three methods of `Embedder`:
+1. Write a class in `scripts/embedder.py` with the five attributes and three methods of `Embedder`. `load_embedder` builds it as `cls(models_dir, backend=None)`, and a hosted model may ignore both arguments:
    - `load()` may do nothing for a hosted model.
    - `embed_documents(texts)` embeds passages as they are.
    - `embed_query(text)` adds whatever instruction that model expects for a query.
@@ -48,6 +47,6 @@ OpenAI and AWS Bedrock are not implemented. They are left for a later plan PR, a
 
 A hosted provider sends the approved text to that provider. Review is still the redaction step, and nothing else leaves the machine: no transcript, and no draft that was never approved. Whether a deployment may send approved text to that provider is the deployment's decision to make.
 
-Switching an existing index to another model means embedding every approved row again into a collection made for that model. Today that is `scripts/embed --rebuild` with the new `AGENT_MEMORY_EMBEDDER`. [server-plan.md](server-plan.md) moves this to the server's `reindex`, which keeps one collection per model and refuses to start on a mismatch.
+Switching an existing index to another model means embedding every approved row again. Today that is `scripts/embed --rebuild` with the new `AGENT_MEMORY_EMBEDDER`, which deletes the `memories` collection and builds it again at the new size. In shared mode it refuses `--repo`, because it would delete every repo's points but embed only one. [server-plan.md](server-plan.md) moves this to the server's `reindex`, which keeps one collection per model and refuses to start on a mismatch.
 
 Sources: [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), [Qdrant/bge-small-en-v1.5-onnx-Q](https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q), [FastEmbed 0.9.1 model list](https://qdrant.tech/documentation/embeddings/fastembed/).
