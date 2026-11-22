@@ -6,10 +6,12 @@
   what it is missing.
 - embedding_state: the one active embedder and its collection.
 - import_rows: the bulk upsert behind /v1/admin/import, newer updated_at wins.
+- token: hashed bearer tokens, their scopes and identity (auth.py).
 
 Standard library only.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -27,6 +29,8 @@ from store_core import (
     normalize_document,
     utc_now,
 )
+
+from agent_memory_server import auth
 
 # Compared for an identical resend. superseded_by is left out: the server sets
 # it on the old row when a newer memory supersedes it, so a resend of the old
@@ -68,6 +72,10 @@ class ServerStore(Store):
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise StoreError(f"{message}: {error}") from error
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
 
@@ -271,3 +279,136 @@ class ServerStore(Store):
             ),
             "could not record the embedder",
         )
+
+    # Tokens. Secrets are never stored: only their sha256 (auth.hash_secret).
+
+    def create_token(
+        self,
+        person,
+        org,
+        team,
+        scopes,
+        allowed_orgs=(),
+        allowed_teams=(),
+        label="",
+        parent_id=None,
+        same_person=False,
+    ):
+        """Mint a token. Returns (token id, secret); the secret is not kept.
+
+        A top-level token for a person who already has an active one is
+        refused unless same_person, so two people can't share a name by
+        accident. A child with the label of an active sibling revokes it.
+        """
+        secret = auth.new_secret()
+        token_id = auth.new_token_id()
+        stamp = utc_now()
+
+        def work(connection):
+            if parent_id is None and not same_person:
+                taken = connection.execute(
+                    "SELECT id FROM token WHERE person = ? AND parent_id IS NULL AND revoked_at IS NULL LIMIT 1",
+                    (person,),
+                ).fetchone()
+                if taken is not None:
+                    raise auth.AuthError(
+                        409,
+                        f"{person} already has an active token ({taken['id']}). Pass --same-person if this is "
+                        "the same person's second token, or choose another name.",
+                    )
+            if parent_id is not None and label:
+                replaced = [
+                    row["id"]
+                    for row in connection.execute(
+                        "SELECT id FROM token WHERE parent_id = ? AND label = ? AND revoked_at IS NULL",
+                        (parent_id, label),
+                    )
+                ]
+                self._revoke_ids(connection, replaced, stamp)
+            connection.execute(
+                """
+                INSERT INTO token (id, hash, parent_id, label, person, org, team,
+                                   allowed_orgs, allowed_teams, scopes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_id,
+                    auth.hash_secret(secret),
+                    parent_id,
+                    label,
+                    person,
+                    org,
+                    team,
+                    json.dumps(list(allowed_orgs)),
+                    json.dumps(list(allowed_teams)),
+                    json.dumps(list(scopes)),
+                    stamp,
+                ),
+            )
+
+        self._transaction(work, "could not create the token")
+        return token_id, secret
+
+    @staticmethod
+    def _revoke_ids(connection, ids, stamp):
+        """Revoke these tokens and every descendant. Returns how many were active."""
+        count = 0
+        pending = list(ids)
+        while pending:
+            token_id = pending.pop()
+            cursor = connection.execute(
+                "UPDATE token SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (stamp, token_id)
+            )
+            count += cursor.rowcount
+            pending.extend(row["id"] for row in connection.execute("SELECT id FROM token WHERE parent_id = ?", (token_id,)))
+        return count
+
+    def revoke_token(self, token_id):
+        """Revoke a token and its children. Returns how many were revoked; 0 when none was active."""
+        return self._transaction(
+            lambda connection: self._revoke_ids(connection, [token_id], utc_now()), "could not revoke the token"
+        )
+
+    def token_for_secret(self, secret):
+        """The active token with this secret, or None. A token whose parent is revoked is not active."""
+        connection = self._open_existing()
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                """
+                SELECT t.* FROM token t LEFT JOIN token p ON p.id = t.parent_id
+                WHERE t.hash = ? AND t.revoked_at IS NULL
+                  AND (t.parent_id IS NULL OR (p.id IS NOT NULL AND p.revoked_at IS NULL))
+                """,
+                (auth.hash_secret(secret),),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else dict(row)
+
+    def list_tokens(self):
+        """Every token, oldest first, without hashes."""
+        connection = self._open_existing()
+        if connection is None:
+            return []
+        try:
+            rows = connection.execute(
+                """
+                SELECT id, parent_id, label, person, org, team, allowed_orgs, allowed_teams,
+                       scopes, created_at, revoked_at
+                FROM token ORDER BY created_at, id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+    def count_active_tokens(self):
+        connection = self._open_existing()
+        if connection is None:
+            return 0
+        try:
+            return connection.execute("SELECT count(*) FROM token WHERE revoked_at IS NULL").fetchone()[0]
+        finally:
+            connection.close()

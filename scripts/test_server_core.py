@@ -425,10 +425,12 @@ class CommandTest(ServerCase):
         self.assertEqual(self.model.loads, 1)
         self.assertIsNotNone(self.store.embedding_state())
 
-    def test_serve_refuses_auth_on_until_tokens_exist(self):
-        code, err, started, _ = self.run_cli(["serve"], AGENT_MEMORY_AUTH="")
-        self.assertEqual((code, started), (2, []))
-        self.assertIn("PR 2c", err)
+    def test_serve_starts_with_auth_on_and_says_how_to_make_the_first_token(self):
+        with self.assertLogs("agent_memory_server", "WARNING") as logged:
+            code, err, started, _ = self.run_cli(["serve"], AGENT_MEMORY_AUTH="")
+        self.assertEqual((code, len(started)), (0, 1))
+        self.assertIn("no tokens yet", "\n".join(logged.output))
+        self.assertNotIn("auth is off", "\n".join(logged.output))
 
     def test_serve_refuses_a_changed_embedder(self):
         self.embedding().prepare()

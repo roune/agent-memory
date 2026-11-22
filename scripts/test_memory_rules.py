@@ -201,7 +201,7 @@ class ServerCommandTest(unittest.TestCase):
         with redirect_stderr(err), self.assertRaises(SystemExit) as raised:
             agent_memory_server.main([], find_spec=lambda name: object())
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("{serve,reindex}", err.getvalue())
+        self.assertIn("{serve,reindex,token}", err.getvalue())
 
 
 if __name__ == "__main__":

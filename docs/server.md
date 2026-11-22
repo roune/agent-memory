@@ -1,6 +1,6 @@
 # The agent-memory server
 
-Status: a preview, built in PR 2b of [server-plan.md](server-plan.md). Nothing on the laptop talks to it yet. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 4 adds the client, and PR 5 is the cutover.
+Status: a preview, built in PR 2b and PR 2c of [server-plan.md](server-plan.md). Nothing on the laptop talks to it yet. `agent-memory review`, `land` and `scripts/embed` still use `data/memories.sqlite` and Qdrant on `127.0.0.1:6333`. PR 4 adds the client, and PR 5 is the cutover.
 
 ## The shape
 
@@ -35,20 +35,62 @@ curl -s http://127.0.0.1:8765/v1/health
 
 The server keeps its own `data/server/memories.sqlite`, separate from the laptop's file. It starts empty. `docker compose --profile server stop server` stops it.
 
-Auth is off in this version. That is safe only because compose publishes the port on `127.0.0.1`, and because of the browser rules below. With any other `AGENT_MEMORY_AUTH` value the server refuses to start, until PR 2c adds tokens.
+The local `compose.yaml` turns auth off (`AGENT_MEMORY_AUTH=off`). That is safe only because it publishes the port on `127.0.0.1`, and because of the browser rules below. Anywhere else auth is on, which is the default: see [Auth and tokens](#auth-and-tokens).
 
 ## Routes
 
-| Route | Purpose |
-| --- | --- |
-| `GET /v1/health` | Liveness, Qdrant readiness, the embedder and its collection, and the counts of memories and pending rows. |
-| `GET /v1/whoami` | Reports auth off. With auth off, identity comes from the request body. |
-| `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | Metadata query. |
-| `GET /v1/memories/{id}` | One memory with its commits. 404 when missing. |
-| `POST /v1/memories` | Approve. The body has the fields of the document `approve()` builds, and nothing else: an unknown key, `transcript_path` included, gets a 400. Returns `{id, updated_at, embedded}`: 201 when new, 200 for an identical resend, 409 with the stored text for different content under an existing id. |
-| `POST /v1/rejections` `{repo, shas}` | Remembers rejected commits. |
-| `POST /v1/commits/status` `{repo, shas}` | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
-| `POST /v1/admin/import` `{memories, rejections}` | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. |
+| Route | Scope | Purpose |
+| --- | --- | --- |
+| `GET /v1/health` | none | Liveness, Qdrant readiness, auth on or off, the embedder and its collection, and the counts of memories and pending rows. |
+| `GET /v1/whoami` | any token | The token's id, label, person, org, team, the orgs and teams it may write as, and its scopes. With auth off, it says identity comes from the request body. |
+| `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | read | Metadata query. |
+| `GET /v1/memories/{id}` | read | One memory with its commits. 404 when missing. |
+| `POST /v1/memories` | write | Approve. The body has the fields of the document `approve()` builds, and nothing else: an unknown key, `transcript_path` included, gets a 400. With auth on, `person` comes from the token (see below). Returns `{id, updated_at, embedded}`: 201 when new, 200 for an identical resend, 409 with the stored text for different content under an existing id. |
+| `POST /v1/rejections` `{repo, shas}` | write | Remembers rejected commits. |
+| `POST /v1/commits/status` `{repo, shas}` | read | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
+| `POST /v1/tokens` `{label}` | write | Mints a read-only child of the caller's token, for an editor. Returns the secret once. The same label again replaces the earlier child. 400 with auth off. |
+| `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. |
+
+With auth off, every caller has every scope.
+
+## Auth and tokens
+
+With auth on, every route but `/v1/health` needs `Authorization: Bearer am_…`. A token is minted by a server command, shown once, and stored only as its sha256.
+
+```mermaid
+flowchart TD
+  req["Request, past the browser rules"] --> health{"/v1/health?"}
+  health -- yes --> answer["the route"]
+  health -- no --> bearer{"Authorization:<br/>Bearer am_…?"}
+  bearer -- no --> r401a["401"]
+  bearer -- yes --> known{"an active token?<br/>(not revoked, nor its parent)"}
+  known -- no --> r401b["401"]
+  known -- yes --> scope{"has the route's scope?<br/>read · write · admin"}
+  scope -- no --> r403a["403"]
+  scope -- yes --> write{"POST /v1/memories?"}
+  write -- no --> answer
+  write -- yes --> person{"person absent or<br/>the token's own?"}
+  person -- no --> r403b["403"]
+  person -- yes --> lists{"org and team the token's,<br/>or on its allowed lists?"}
+  lists -- no --> r403c["403"]
+  lists -- yes --> stored["stored as the token's person<br/>written_by = token id"]
+```
+
+- **Scopes don't imply each other.** A laptop's token is usually `read,write`. `agent-memory migrate` (PR 4) needs `admin` as well. An editor gets a read-only child from `POST /v1/tokens`.
+- **Identity:** `person` always comes from the token. `org` and `team` default to the token's own, and a write may name another only if the token lists it (`--allow-org`, `--allow-team`).
+- **Children:** a child token belongs to the same person, with `read` only. Revoking a token revokes every token minted from it.
+- **Import keeps people:** `/v1/admin/import` keeps each row's own `person`, because it moves memories that are already kept. That is why it needs `admin`.
+
+Mint and manage tokens next to the running server:
+
+```
+docker compose exec server agent-memory-server token create --person miguel --org acme --team platform \
+  --scopes read,write [--allow-team infra] [--label laptop] [--same-person]
+docker compose exec server agent-memory-server token list
+docker compose exec server agent-memory-server token revoke t_1a2b3c4d5e6f
+```
+
+`token create` prints the secret once. It refuses a `--person` who already has an active token, unless you pass `--same-person`, so two people can't share a name by accident. `token list` never shows secrets or hashes. With auth on and no tokens yet, `serve` logs the command to create the first one.
 
 ## A write, step by step
 
@@ -129,7 +171,8 @@ In compose, the variables in the settings table below come from `.env`. To switc
 
 ```
 agent-memory-server serve [--host 0.0.0.0] [--port 8765]
-agent-memory-server reindex [--rebuild] [--prune [--yes]]
+agent-memory-server reindex [--rebuild] [--prune [--yes] [--include-legacy]]
+agent-memory-server token create | list | revoke
 ```
 
 `serve` holds `/data/server.lock`. `reindex` takes the same lock, so stop the server first:
@@ -150,7 +193,7 @@ docker compose --profile server start server
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AGENT_MEMORY_AUTH` | `on` | `off` is the only value that starts the server until PR 2c. |
+| `AGENT_MEMORY_AUTH` | `on` | `off` turns auth off; the local `compose.yaml` sets it. Anything else means bearer tokens. |
 | `AGENT_MEMORY_SERVER_DATA` | `/data` | `memories.sqlite` and `server.lock`. |
 | `AGENT_MEMORY_QDRANT_URL` | `http://qdrant:6333` | Qdrant on the compose network. |
 | `AGENT_MEMORY_QDRANT_API_KEY` | none | Sent as `api-key` when Qdrant has one. |
@@ -161,4 +204,4 @@ docker compose --profile server start server
 
 ## Tests
 
-`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests. CI runs both, and also builds the image and checks that `/v1/health` answers.
+`python3 -m unittest discover -s scripts -p 'test_*.py'` runs everything that needs only the standard library. That includes the store, request rules, tokens and identity, embedding, reindex, lock, and CLI, with a `HashEmbedder` and an in-memory Qdrant. `scripts/test-server` runs the same suite under `uv run --extra server`, which adds the HTTP route tests. CI runs both. It also builds the image, checks that `/v1/health` answers with auth on and off, that `/v1/whoami` needs a token, and that a token made with `token create` works.
