@@ -206,6 +206,21 @@ class GetAndListTest(StoreCase):
         team = mcp_tools.list_memories(self.store, team="Infra", limit=1)
         self.assertEqual([hit["document_id"] for hit in team["memories"]], ["miguel-decision-other"])
 
+    def test_since_and_until_are_times_compared_in_utc(self):
+        self.keep(session_id="early", occurred_at="2026-11-20T09:30:00+00:00")
+        self.keep(session_id="late", occurred_at="2026-11-20T10:30:00+00:00")
+        # 11:00+01:00 is 10:00 UTC: only the 10:30 row is later. As text it sorted after both.
+        since = mcp_tools.list_memories(self.store, since="2026-11-20T11:00:00+01:00")
+        self.assertEqual([hit["document_id"] for hit in since["memories"]], ["miguel-learning-late"])
+        until = mcp_tools.list_memories(self.store, until="2026-11-20T10:00:00Z")
+        self.assertEqual([hit["document_id"] for hit in until["memories"]], ["miguel-learning-early"])
+        day = mcp_tools.list_memories(self.store, since="2026-11-20", until="2026-11-21")
+        self.assertEqual(len(day["memories"]), 2)
+        self.assertEqual(mcp_tools.list_memories(self.store, since="2026-11-21")["memories"], [])
+        for bad in ("yesterday", "2026-11-20T10:00:00", "2026-13-01", 7):
+            with self.subTest(bad=bad), self.assertRaisesRegex(QueryError, "since"):
+                mcp_tools.list_memories(self.store, since=bad)
+
     def test_memories_by_ids(self):
         self.keep(session_id="s1")
         self.assertEqual(set(self.store.memories_by_ids(["miguel-learning-s1", "nope", "", "miguel-learning-s1"])), {"miguel-learning-s1"})
@@ -291,6 +306,9 @@ class McpHttpTest(McpCase):
         self.assertTrue(failed["isError"])
         self.assertIn("get and list still work", failed["content"][0]["text"])
         self.assertEqual(self.call(session, "get", document_id="miguel-learning-s1")["structuredContent"]["text"], "a note")
+        bad_time = self.call(session, "list", since="yesterday")
+        self.assertTrue(bad_time["isError"])
+        self.assertIn("ISO-8601", bad_time["content"][0]["text"])
         missing = self.call(session, "get", document_id="nope")
         self.assertTrue(missing["isError"])
         self.assertIn("no approved memory nope", missing["content"][0]["text"])
@@ -351,6 +369,16 @@ class McpAuthTest(McpCase):
         self.assertEqual(self.rpc("tools/list", session=session, token=self.writer).status_code, 403)
         self.store.revoke_token(self.reader_id)
         self.assertEqual(self.rpc("tools/list", session=session, token=self.reader).status_code, 401)
+
+    def test_a_session_answers_only_the_token_that_opened_it(self):
+        _, other = self.store.create_token("zed", "Acme", "Platform", ("read",))
+        session, _ = self.open_session(token=self.reader)
+        self.assertEqual(self.rpc("tools/list", session=session, token=other).status_code, 404)
+        ended = self.client.delete("/mcp", headers={"Mcp-Session-Id": session, "Authorization": f"Bearer {other}"})
+        self.assertEqual(ended.status_code, 404)
+        self.assertEqual(self.rpc("tools/list", session=session, token=self.reader).status_code, 200)
+        mine = self.client.delete("/mcp", headers={"Mcp-Session-Id": session, "Authorization": f"Bearer {self.reader}"})
+        self.assertEqual(mine.status_code, 200)
 
     def test_browser_rules_come_before_auth(self):
         headers = {"Authorization": f"Bearer {self.reader}", "Accept": "application/json, text/event-stream"}

@@ -183,6 +183,12 @@ class ReadRouteTest(AppCase):
         listed = self.client.get("/v1/memories", params={"team": "Infra", "limit": "5"})
         self.assertEqual([hit["document_id"] for hit in listed.json()["memories"]], ["tester-learning-s2"])
         self.assertEqual(self.client.get("/v1/memories", params={"q": "x"}).status_code, 400)
+        self.assertEqual(self.client.get("/v1/memories", params={"since": "yesterday"}).status_code, 400)
+        self.assertEqual(self.client.get("/v1/memories", params={"since": ""}).status_code, 400)
+        offset = self.client.get("/v1/memories", params={"since": "2026-11-20T10:30:00+01:00"}).json()["memories"]
+        self.assertEqual(len(offset), 2)
+        later = self.client.get("/v1/memories", params={"since": "2026-11-20T11:30:00+01:00"}).json()["memories"]
+        self.assertEqual(later, [])
         self.assertEqual(self.client.get("/v1/memories/nobody-learning-x").status_code, 404)
 
     def test_commit_status_matches_abbreviated_hashes_both_ways(self):

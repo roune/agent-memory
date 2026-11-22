@@ -18,6 +18,7 @@ import logging
 from embedder import EmbedderError
 from store_core import StoreError
 
+from agent_memory_server import rules
 from agent_memory_server.qdrant import QdrantError, QdrantUnavailable
 
 log = logging.getLogger("agent_memory_server")
@@ -156,12 +157,11 @@ def list_memories(store, since=None, until=None, limit=None, **given):
     """Metadata query, newest occurred_at first. No ranking."""
     filters = filters_from(**given)
     try:
-        hits = store.query_memories(
-            **filters,
-            since=_optional(since),
-            until=_optional(until),
-            limit=clamp_limit(limit, LIST_LIMIT),
-        )
+        bounds = {"since": rules.time_filter(since, "since"), "until": rules.time_filter(until, "until")}
+    except ValueError as error:
+        raise QueryError(str(error)) from None
+    try:
+        hits = store.query_memories(**filters, **bounds, limit=clamp_limit(limit, LIST_LIMIT))
     except (StoreError, ValueError) as error:
         raise QueryError(str(error)) from None
     return {"filter": filters, "memories": hits}
@@ -228,7 +228,8 @@ def build_server(store, embedding):
         name="list",
         description=(
             "List approved memories by metadata, newest first. No semantic ranking. since and "
-            "until are ISO-8601 times such as 2026-08-01T00:00:00+00:00. " + FILTER_HELP
+            "until are ISO-8601 times with a zone, such as 2026-08-01T00:00:00+00:00, or a date "
+            "such as 2026-08-01 (midnight UTC). " + FILTER_HELP
         ),
         annotations=read_only,
     )

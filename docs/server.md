@@ -44,7 +44,7 @@ The local `compose.yaml` turns auth off (`AGENT_MEMORY_AUTH=off`). That is safe 
 | --- | --- | --- |
 | `GET /v1/health` | none | Liveness, Qdrant readiness, auth on or off, the embedder and its collection, and the counts of memories and pending rows. |
 | `GET /v1/whoami` | any token | The token's id, label, person, org, team, the orgs and teams it may write as, and its scopes. With auth off, it says identity comes from the request body. |
-| `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | read | Metadata query. |
+| `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | read | Metadata query. `since` and `until` are ISO-8601 times with a zone, or a date; they are compared in UTC, and anything else is a 400. |
 | `GET /v1/memories/{id}` | read | One memory with its commits. 404 when missing. |
 | `POST /v1/memories` | write | Approve. The body has the fields of the document `approve()` builds, and nothing else: an unknown key, `transcript_path` included, gets a 400. With auth on, `person` comes from the token (see below). Returns `{id, updated_at, embedded}`: 201 when new, 200 for an identical resend, 409 with the stored text for different content under an existing id. |
 | `POST /v1/rejections` `{repo, shas}` | write | Remembers rejected commits. |
@@ -63,7 +63,7 @@ With auth off, every caller has every scope.
 | --- | --- | --- |
 | `search` | `query`, and optional `repo`, `domain`, `kind`, `org`, `team`, `person`, `limit` (10, at most 50) | `results`, best match first: each memory in `get`'s shape plus `score`. `not_yet_searchable` counts the rows still waiting to be embedded. |
 | `get` | `document_id` | One memory with its commits, as `GET /v1/memories/{id}` returns it. |
-| `list` | optional `repo`, `domain`, `kind`, `org`, `team`, `person`, `since`, `until`, `limit` (20, at most 100) | `memories`, newest `occurred_at` first. No ranking. |
+| `list` | optional `repo`, `domain`, `kind`, `org`, `team`, `person`, `since`, `until`, `limit` (20, at most 100) | `memories`, newest `occurred_at` first. No ranking. `since` and `until` are ISO-8601 times with a zone, or a date (midnight UTC); anything else is a tool error. |
 
 ```mermaid
 flowchart LR
@@ -76,7 +76,7 @@ flowchart LR
 - **Superseded memories are returned.** A memory with `superseded_by` has a newer one, and that one has `supersedes`. Nothing is hidden, because a supersede may come from another org: the reader sees both notes and decides. Ranking by the caller's org is a later option.
 - **The rows come from SQLite.** Qdrant only finds the ids. So `text` and `superseded_by` are current even when a point is still waiting for the retry loop.
 - **Failures are tool errors.** Qdrant down, the collection missing, or an embedder mismatch makes `search` answer with `isError` and a message. The server keeps running, and `get` and `list` still work.
-- **Auth.** With auth on, every request to `/mcp` needs a token with the `read` scope, checked before the SDK sees it. A session doesn't outlive its token: a revoked token gets a 401 on its next request.
+- **Auth.** With auth on, every request to `/mcp` needs a token with the `read` scope, checked before the SDK sees it. A session belongs to the token that opened it: another token gets a 404 for it, as if it didn't exist, and can't end it. A session doesn't outlive its token either: a revoked token gets a 401 on its next request.
 - **Sessions** are the SDK's, kept in memory. After a restart a client's old session gets a 404, and the client starts a new one.
 
 This repo's `.mcp.json` registers the local server for Claude Code as `agent-memory-dev`:

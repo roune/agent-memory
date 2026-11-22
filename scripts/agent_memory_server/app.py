@@ -57,6 +57,14 @@ def transport_security(settings):
     )
 
 
+def mcp_user(who):
+    """The caller as the SDK's AuthenticatedUser, keyed on the token id (never the secret)."""
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+    from mcp.server.auth.provider import AccessToken
+
+    return AuthenticatedUser(AccessToken(token=who.token_id, client_id=who.token_id, scopes=list(who.scopes)))
+
+
 async def _refuse(send, status, message):
     body = json.dumps({"error": message}).encode()
     await send(
@@ -158,7 +166,12 @@ def create_app(settings, store, embedding, retry_seconds=None):
     sessions = mcp_server.session_manager
 
     async def mcp_endpoint(scope, receive, send):
-        await caller(Request(scope, receive), "read")
+        who = await caller(Request(scope, receive), "read")
+        if who.auth:
+            # The SDK ties a session to the user that opened it, and answers 404
+            # to any other. Without this every session's owner is None, so any
+            # read token holding a session id could use or end it.
+            scope = {**scope, "user": mcp_user(who)}
         await sessions.handle_request(scope, receive, send)
 
     @contextlib.asynccontextmanager
