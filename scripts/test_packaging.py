@@ -176,6 +176,40 @@ class MoveTest(Temp):
         self.assertEqual((self.new / "outbox" / "20261122T100000Z-abc.json").stat().st_mode & 0o777, 0o600)
         self.assertFalse((self.old / "inbox").exists())
 
+    def test_a_cross_device_copy_cut_short_leaves_no_partial_file(self):
+        real_rename = os.rename
+
+        def rename(source, target):
+            if str(source).startswith(str(self.old)):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_rename(source, target)
+
+        def killed(handle, out, *args):
+            out.write(handle.read(3))
+            raise KeyboardInterrupt("the hook's timeout")
+
+        bundle = self.old / "inbox" / "claude-code" / "s1" / "bundle.json"
+        with mock.patch.object(local_state.os, "rename", rename), mock.patch.object(local_state.shutil, "copyfileobj", killed):
+            with self.assertRaises(KeyboardInterrupt):
+                local_state.move(self.old, self.new)
+        self.assertEqual(bundle.read_text(), '{"session_id": "s1"}\n', "the old file is whole")
+        self.assertEqual(list((self.new / "inbox").rglob("bundle.json")), [], "no partial file at a final name")
+
+        with mock.patch.object(local_state.os, "rename", rename):
+            moved, left = local_state.move(self.old, self.new)
+        self.assertEqual(left, [])
+        self.assertEqual((self.new / "inbox" / "claude-code" / "s1" / "bundle.json").read_text(), '{"session_id": "s1"}\n')
+        self.assertEqual((self.new / "inbox" / "git" / "g1" / "bundle.json").read_text(), '{"session_id": "g1"}\n')
+        self.assertFalse((self.old / "inbox").exists())
+
+    def test_the_old_root_is_recorded_once(self):
+        local_state.move(self.old, self.new)
+        old_layout(self.old)
+        local_state.move(self.old, self.new)
+        self.assertEqual(local_state.recorded(self.new), [self.old])
+        self.assertEqual(local_state.move(self.base / "nothing-here", self.new), ([], []))
+        self.assertEqual(local_state.recorded(self.new), [self.old])
+
     def test_in_place_under_agent_memory_dir(self):
         moved, left = local_state.move(self.old, self.old)
         self.assertEqual(left, [])
@@ -390,6 +424,27 @@ class InstallTest(CliTemp):
         # No terminal: install refuses before it asks, and nothing moves.
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue((self.old_clone / "inbox").is_dir())
+
+    def test_bundles_an_old_clone_files_later_are_moved_too(self):
+        # A git hook in a repo not set up again still runs the old clone, which
+        # files into its own inbox. The clone was recorded, so the next command moves it.
+        self.old_hooks()
+        old_layout(self.old_clone)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Git hooks set up from {self.old_clone} still run", result.stdout)
+        late = self.old_clone / "inbox" / "git" / "late" / "bundle.json"
+        late.parent.mkdir(parents=True)
+        late.write_text('{"session_id": "late"}\n')
+        (self.old_clone / "outbox").mkdir()
+        (self.old_clone / "outbox" / "20261123T090000Z-late.json").write_text('{"op": "memory"}\n')
+
+        again = self.run_cli(self.tool, "config", str(self.repo))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        new = self.xdg / "agent-memory"
+        self.assertTrue((new / "inbox" / "git" / "late" / "bundle.json").is_file())
+        self.assertTrue((new / "outbox" / "20261123T090000Z-late.json").is_file())
+        self.assertFalse((self.old_clone / "inbox").exists())
 
     def test_git_hooks_run_the_installed_command(self):
         subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", "https://github.com/example/p.git"], check=True)

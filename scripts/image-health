@@ -24,19 +24,22 @@ platform=${2:-}
 name="agent-memory-health-$$"
 tries=${HEALTH_TRIES:-180}
 
-if [ -n "${EXPECT_VERSION:-}" ]; then
-  label=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")
-  if [ "$label" != "$EXPECT_VERSION" ]; then
-    echo "$image is labelled version '$label', expected $EXPECT_VERSION" >&2
-    exit 1
-  fi
-fi
-
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
 if [ -n "$platform" ]; then
   docker run -d --name "$name" --platform "$platform" "$image" >/dev/null
 else
   docker run -d --name "$name" "$image" >/dev/null
+fi
+
+# From the container, not the image: with the containerd image store,
+# `docker image inspect` reads the host platform's manifest, which may not be
+# the one that was pulled.
+if [ -n "${EXPECT_VERSION:-}" ]; then
+  label=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$name")
+  if [ "$label" != "$EXPECT_VERSION" ]; then
+    echo "$image is labelled version '$label', expected $EXPECT_VERSION" >&2
+    exit 1
+  fi
 fi
 
 i=0

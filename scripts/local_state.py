@@ -16,6 +16,16 @@ pid and port of a review page) is dropped when a new one exists. An old file
 that is empty or the same as the new one is dropped too, such as `outbox/.lock`.
 
 Once the old paths are gone, a second run finds nothing and does nothing.
+
+Across file systems a file is copied to a temporary name next to its target,
+then renamed into place, then deleted at the old path. A move killed halfway
+(a hook's timeout) leaves the old file whole and no partial file at the new
+name, so the next run finishes it.
+
+Each old root that a move took something from is recorded in `.moved-from` in
+the new root. Every later command checks those roots again, because an older
+copy of the CLI may still be running from that clone (git hooks in a repo that
+wasn't set up again) and filing new bundles there.
 """
 
 import errno
@@ -56,6 +66,23 @@ def ensure_root():
     path = default_root()
     if not path.exists():
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+
+def recorded(new_root):
+    """The old roots a move took something from (the caller checks that each is still a clone)."""
+    try:
+        lines = (Path(new_root) / ".moved-from").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    return [Path(line) for line in dict.fromkeys(line.strip() for line in lines) if line]
+
+
+def record(old_root, new_root):
+    old_root = _absolute(old_root)
+    if old_root == _absolute(new_root) or old_root in recorded(new_root):
+        return
+    with (Path(new_root) / ".moved-from").open("a", encoding="utf-8") as handle:
+        handle.write(f"{old_root}\n")
 
 
 def is_clone(path):
@@ -112,6 +139,8 @@ def move(old_root, new_root):
             else:
                 left.append((source, f"{target} already exists"))
         _remove_if_empty(old_root / "data")
+        if moved or left:
+            record(old_root, new_root)
     return moved, left
 
 
@@ -147,8 +176,20 @@ def _rename(source, target):
         target.mkdir(mode=source.stat().st_mode & 0o777)
         _merge(source, target, [])
     else:
-        shutil.move(str(source), str(target))
+        _copy_then_rename(source, target)
     return True
+
+
+def _copy_then_rename(source, target):
+    """A file across file systems: never a partial file at target."""
+    temporary = target.with_name(f".{target.name}.moving")
+    with source.open("rb") as handle, open(temporary, "wb") as out:
+        shutil.copyfileobj(handle, out)
+        out.flush()
+        os.fsync(out.fileno())
+    shutil.copystat(source, temporary)
+    os.rename(temporary, target)
+    source.unlink()
 
 
 def _same_or_empty(source, target):

@@ -35,7 +35,10 @@ jobs:
       - id: version
         env:
           TAG: ${{ github.ref_name }}
-        run: echo "version=$(python3 scripts/release-check "$TAG")" >> "$GITHUB_OUTPUT"
+        # On its own line: a failing $(...) inside echo's argument wouldn't stop the step.
+        run: |
+          version=$(python3 scripts/release-check "$TAG")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   publish:
     needs: check

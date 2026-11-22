@@ -2531,6 +2531,10 @@ def install(args):
             if not os.environ.get("AGENT_MEMORY_DIR"):
                 for clone in hooked_clones(HOME):
                     move_state(clone)
+                    print(
+                        f"Git hooks set up from {clone} still run {clone / 'bin' / 'agent-memory'}. "
+                        "In each repo that has them, run `agent-memory config <repo> --git-hooks true`."
+                    )
             for tool in tools:
                 WRITERS[tool](HOME, command)
                 print(f"wrote {tool}")
@@ -3161,6 +3165,11 @@ def move_old_state():
         return
     if local_state.is_clone(ROOT):
         move_state(ROOT)
+    # Clones moved from before: an older CLI there (a git hook in a repo not
+    # set up again) may have filed new bundles since.
+    for old in local_state.recorded(store_root()):
+        if old != ROOT and local_state.is_clone(old):
+            move_state(old)
 
 
 def main():

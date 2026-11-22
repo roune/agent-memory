@@ -282,6 +282,8 @@ jobs:
           mkdir -p "$dir/data/server" "$dir/data/qdrant"
           cp compose.yaml "$dir/"
           cd "$dir"
+          # As docs/deploy.md says: the server runs as the owner of data/server.
+          printf 'AGENT_MEMORY_UID=%s\nAGENT_MEMORY_GID=%s\n' "$(id -u)" "$(id -g)" > .env
           export AGENT_MEMORY_IMAGE="$IMAGE:$VERSION"
           docker compose -p no-clone pull
           docker compose -p no-clone up -d
@@ -311,7 +313,7 @@ jobs:
             echo "compose.team.yaml started without AGENT_MEMORY_ALLOWED_HOSTS"; exit 1
           fi
           grep -q AGENT_MEMORY_ALLOWED_HOSTS missing.err
-          echo "AGENT_MEMORY_ALLOWED_HOSTS=memory.example.test" > .env
+          printf 'AGENT_MEMORY_ALLOWED_HOSTS=memory.example.test\nAGENT_MEMORY_UID=%s\nAGENT_MEMORY_GID=%s\n' "$(id -u)" "$(id -g)" > .env
           docker compose -p team -f compose.team.yaml up -d
           host="Host: memory.example.test"
           ready=""

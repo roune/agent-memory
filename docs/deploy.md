@@ -29,16 +29,18 @@ Before the tool install, these files lived in the clone: `inbox/`, `outbox/`, `d
 - appends an old `capture.log` to the new one, and drops an old `review.json` when a new one exists.
 - prints one line for each path it moved, and writes the same line to `capture.log`.
 - does nothing on the next run, because nothing is left at the old paths.
+- copies a file across file systems under a temporary name, then renames it, so a move cut short leaves no partial file.
+- remembers each clone it moved from, in `.moved-from`, and checks it again on every command. An older CLI still running from that clone, such as a git hook, may file new bundles there.
 
 The rest of the clone's `data/` stays where it is: the server's `data/server`, Qdrant's `data/qdrant`, and the old laptop store `data/memories.sqlite`, which `agent-memory migrate` reads.
 
 ## Upgrading the CLI to the tool install
 
 1. Install the CLI:
-   - From a clone, run `git pull`, then `./scripts/install`. It removes the old `~/.local/bin/agent-memory` link to the clone, then runs `uv tool install --editable .`.
+   - From a clone, run `git pull` first, so the clone's own code is the new one too, then `./scripts/install`. It removes the old `~/.local/bin/agent-memory` link to the clone, then runs `uv tool install --editable .`.
    - Without a clone, run `uv tool install git+https://github.com/roune/agent-memory`. If `~/.local/bin/agent-memory` is the old link into a clone, remove it first. uv won't replace a file it didn't write.
 2. Run `agent-memory install`. It updates the hooks it wrote, where they are, to run the installed command, and moves the old clone's state.
-3. In each repository with git hooks, run `agent-memory config <repo> --git-hooks true`, so those hooks run the installed command too. Until then they run `<clone>/bin/agent-memory`, which works as long as the clone is there.
+3. In each repository with git hooks, run `agent-memory config <repo> --git-hooks true`, so those hooks run the installed command too. `install` reminds you, naming the clone. Until then they run `<clone>/bin/agent-memory`. If that clone wasn't pulled, its old code files bundles in `<clone>/inbox` and auto-approved items in `<clone>/outbox`. The next `agent-memory` command moves them, because the clone is recorded, but do this step anyway.
 
 `agent-memory install` updates only the entries it wrote:
 
