@@ -1,0 +1,49 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  stdlib:
+    # The repo convention: the suite passes with a plain python3 and no packages.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Git identity for the throwaway repos the tests create
+        run: |
+          git config --global user.name "agent-memory CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  package:
+    # The lock matches pyproject.toml, the wheel builds, and both commands start.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv lock --check
+      - run: uv build --out-dir dist
+      - name: Install the wheel without the server extra
+        run: |
+          uv venv --python 3.12 /tmp/venv
+          uv pip install --python /tmp/venv/bin/python dist/*.whl
+          /tmp/venv/bin/agent-memory --help
+          set +e
+          /tmp/venv/bin/agent-memory-server 2> /tmp/server.err
+          code=$?
+          set -e
+          cat /tmp/server.err
+          test "$code" -eq 2
+          grep -q "needs the server extra" /tmp/server.err

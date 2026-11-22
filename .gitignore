@@ -11,6 +11,11 @@ transcripts/
 __pycache__/
 *.pyc
 
+# Package builds (uv build, uv tool install).
+build/
+dist/
+*.egg-info/
+
 # Local configuration and credentials.
 .env
 .env.*
