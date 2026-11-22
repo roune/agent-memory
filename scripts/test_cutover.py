@@ -225,6 +225,36 @@ class AuthOnApproveTest(Case):
         self.assertEqual(self.queued(), [])
 
 
+class IdentityRefusalTest(Case):
+    token = "am_laptop"
+
+    def test_an_org_the_token_may_not_write_goes_to_failed_and_the_queue_goes_on(self):
+        for text, org in (("wrong org", "Elsewhere"), ("fine", "")):
+            body = {
+                "kind": "learning", "domain": "code", "text": text, "repo": REPO, "tool": "git",
+                "session_id": text.replace(" ", "-"), "occurred_at": "2026-11-20T10:00:00+00:00",
+            }
+            if org:
+                body["org"] = org
+            outbox.add(self.state, self.server.url, "memory", body)
+        code, out = self.sync()
+        self.assertEqual(code, 1)
+        [item] = self.failed()
+        self.assertEqual((item["status"], item["body"]["text"]), (403, "wrong org"))
+        self.assertIn("can't write org", item["error"])
+        self.assertEqual(self.queued(), [])
+        self.assertIn("tester-learning-fine", self.server.rows)
+        result = agent_memory.approve(self.bundle(), "change", "code", "later", commit=A)
+        self.assertEqual(result["status"], "sent", "a later Approve isn't held back")
+
+    def test_a_403_for_the_token_still_keeps_the_queue(self):
+        self.server.fail_path["/v1/memories"] = (403, {"error": "this token lacks the write scope (it has read)"})
+        self.queue("one")
+        self.sync()
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.failed(), [])
+
+
 class RejectTest(Case):
     def test_reject_posts_the_commits_and_deletes_the_bundle(self):
         self.assertEqual(agent_memory.reject_bundle(self.bundle(shas=(A, B))), "sent")
@@ -343,6 +373,18 @@ class SyncTest(Case):
         self.assertEqual(sent, texts, "and in order")
         self.assertEqual(self.queued(), [])
 
+    def test_an_item_whose_commit_the_server_settled_is_dropped_unsent(self):
+        self.server.rejections.add((REPO, A))
+        body = {"kind": "change", "domain": "code", "text": "late", "repo": REPO, "tool": "cursor", "session_id": "x",
+                "org": "Org", "team": "Team", "person": "tester", "occurred_at": "2026-11-20T10:00:00+00:00", "commit": A}
+        outbox.add(self.state, self.server.url, "memory", body, unless_settled={"repo": REPO, "shas": [A]})
+        outbox.add(self.state, self.server.url, "memory", {**body, "session_id": "y", "commit": B}, unless_settled={"repo": REPO, "shas": [B]})
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)
+        self.assertIn("dropped 1", out)
+        self.assertEqual([body["commit"] for body in self.server.posts("/v1/memories")], [B])
+        self.assertEqual(self.queued(), [])
+
     def test_sync_with_an_empty_outbox_makes_no_call(self):
         code, out = self.sync()
         self.assertEqual((code, out.strip()), (0, "nothing to send"))
@@ -434,6 +476,47 @@ class LandTest(GitCase):
         self.assertEqual(paths[:2], ["/v1/memories", "/v1/commits/status"])
 
 
+class SessionEndTest(GitCase):
+    """capture's session-end auto-approve queues without a network call, and sync checks the commit."""
+
+    def capture(self, event):
+        payload = json.dumps({"session_id": "sess", "cwd": str(self.repo)})
+        result = subprocess.run(
+            CLI + ["capture", "--tool", "cursor", "--event", event], cwd=self.repo, env=self.env(),
+            input=payload, text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_commit_already_kept_on_the_server_is_not_kept_twice(self):
+        self.commit("first")
+        (self.repo / ".agent-memory.toml").write_text("auto_approve = true\n", encoding="utf-8")
+        self.capture("stop")
+        time.sleep(1.1)
+        head = self.commit("during")
+        self.server.rows["tester-change-other"] = {"id": "tester-change-other", "commits": [head], "updated_at": "1", "text": "k"}
+        self.capture("session-end")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and self.queued():
+            time.sleep(0.05)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.server.posts("/v1/memories"), [], "sync asked commits/status and dropped it")
+        [check] = self.server.posts("/v1/commits/status")
+        self.assertEqual(check, {"repo": REPO, "shas": [head]})
+
+    def test_a_new_commit_is_kept(self):
+        self.commit("first")
+        (self.repo / ".agent-memory.toml").write_text("auto_approve = true\n", encoding="utf-8")
+        self.capture("stop")
+        time.sleep(1.1)
+        head = self.commit("during")
+        self.capture("session-end")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not self.server.rows:
+            time.sleep(0.05)
+        [row] = self.server.rows.values()
+        self.assertEqual(row["commit"], head)
+
+
 class GitHookTest(GitCase):
     def install(self, auto_approve):
         result = self.cli(
@@ -510,7 +593,7 @@ class GitHookTest(GitCase):
         self.assertEqual(self.queued(), [])
 
 
-class ReviewPageTest(Case):
+class ReviewPageCase(Case):
     """The page from the review server itself, over HTTP on 127.0.0.1."""
 
     def setUp(self):
@@ -525,8 +608,10 @@ class ReviewPageTest(Case):
         with urlopen(self.base + path, timeout=10) as response:
             return response.read().decode()
 
-    def post(self, path, **form):
-        request = Request(self.base + path, data=urlencode(form).encode(), method="POST")
+    def post(self, path, headers=None, **form):
+        # What a browser sends from the page itself.
+        headers = {"Origin": self.base} if headers is None else headers
+        request = Request(self.base + path, data=urlencode(form).encode(), method="POST", headers=headers)
         try:
             with urlopen(request, timeout=10) as response:
                 return response.status, response.read().decode(), response.url
@@ -534,6 +619,8 @@ class ReviewPageTest(Case):
             with contextlib.closing(error):
                 return error.code, error.read().decode(), None
 
+
+class ReviewPageTest(ReviewPageCase):
     def test_auth_off_uses_the_identity_file_and_says_connected(self):
         self.bundle()
         page = self.get()
@@ -572,6 +659,26 @@ class ReviewPageTest(Case):
         self.assertIn("bad &lt;b&gt;one&lt;/b&gt;", page)
         self.assertIn("agent-memory sync --retry-failed", page)
 
+    def test_another_host_or_origin_is_refused(self):
+        self.bundle()
+        port = self.page.server_port
+        for host in (f"127.0.0.1.attacker.test:{port}", "127.0.0.1", f"localhost:{port}"):
+            with self.subTest(host=host):
+                request = Request(self.base + "/?all=1", headers={"Host": host})
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request, timeout=10)
+                raised.exception.close()
+                self.assertEqual(raised.exception.code, 403)
+        form = {"session_id": "s1", "tool": "git", "kind": "change", "domain": "code", "text": "planted", "commit": A}
+        for headers in ({"Origin": "http://attacker.test"}, {}, {"Referer": "http://attacker.test/"}, {"Origin": "null"}):
+            with self.subTest(headers=headers):
+                status, _, _ = self.post("/approve", headers=headers, **form)
+                self.assertEqual(status, 403)
+        self.assertEqual(self.server.posts("/v1/memories"), [])
+        self.assertTrue(self.bundle_exists())
+        status, _, _ = self.post("/approve", headers={"Referer": self.base + "/?all=1"}, **form)
+        self.assertEqual(status, 200, "a Referer from the page itself is enough")
+
     def test_reject_goes_through_the_server(self):
         self.bundle()
         status, page, url = self.post("/reject", session_id="s1", tool="git")
@@ -601,6 +708,36 @@ class AuthOnReviewPageTest(ReviewPageTest):
         page = self.get()
         self.assertIn('placeholder="set by your token" readonly', page)
         self.assertNotIn('value="tester"', page, "the identity file is only a hint with auth on")
+
+
+class TokenWithAuthOffTest(ReviewPageCase):
+    """A token in the server file doesn't mean auth is on: whoami decides."""
+
+    def test_connect_with_a_token_to_a_server_with_auth_off_saves_no_token(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("am_spare\n")), contextlib.redirect_stdout(out):
+            agent_memory.connect_cmd(argparse.Namespace(url=self.server.url, token_stdin=True, mode=None, repo=""))
+        self.assertIn("auth off, so the token is not saved", out.getvalue())
+        self.assertIsNone(server_client.read_config()["token"])
+        agent_memory.approve(self.bundle(), "change", "code", "why", commit=A)
+        self.assertEqual(self.server.posts("/v1/memories")[-1]["person"], "tester")
+
+    def test_the_page_uses_the_identity_file_when_whoami_says_auth_is_off(self):
+        self.connect(self.server.url, "am_left_over")
+        self.bundle()
+        page = self.get()
+        self.assertIn('name="person" type="text" value="tester">', page)
+        self.assertNotIn("set by your token", page)
+
+    def test_per_repo_mode_shows_each_bundle_the_identity_of_its_own_server(self):
+        team = self.stub(token="am_team", person="miguel", org="Acme", team="Platform")
+        server_client.write_config(self.server.url, None, "per-repo")
+        server_client.map_repo(REPO, team.url, "am_team")
+        self.bundle()
+        page = self.get()
+        self.assertIn('<select name="org"><option selected>Acme</option></select>', page)
+        self.assertIn('name="person" type="text" value="miguel" readonly>', page)
+        self.assertEqual([request["path"] for request in team.requests], ["/v1/whoami"])
 
 
 class EmbedWrapperTest(unittest.TestCase):

@@ -4,7 +4,7 @@ How someone installs capture into Cursor, Claude Code, Codex, and Pi, and how th
 
 ## The seam
 
-The hook never opens the database, and it never waits on the network. Approve sends the document to the agent-memory server, which writes the row in its `memories.sqlite` and embeds it into Qdrant. The server's rows are the source of truth, so the engine or the model can change without a new hook.
+The hook never opens the database. The editor hooks make no network call, and the git hook makes one, a `commits/status` check with a 1-second timeout. Approve sends the document to the agent-memory server, which writes the row in its `memories.sqlite` and embeds it into Qdrant. The server's rows are the source of truth, so the engine or the model can change without a new hook.
 
 ```
 user-level hook or Pi extension
@@ -16,7 +16,7 @@ review command
   -> outbox/ when the server doesn't answer; agent-memory sync sends it later
 ```
 
-The outbox holds approved documents and rejections only, never bundles or transcript paths. A git hook with `auto_approve` writes straight to the outbox, makes one `commits/status` call with a 1-second timeout, then starts `agent-memory sync` detached and returns.
+The outbox holds approved documents and rejections only, never bundles or transcript paths. A git hook with `auto_approve` writes straight to the outbox, makes one `commits/status` call with a 1-second timeout, then starts `agent-memory sync` detached and returns. A session-end auto-approve queues without any call; `sync` checks that commit with the server before it sends, and drops the item if the commit is already kept or rejected.
 
 Retrieval at the next session start is still out.
 

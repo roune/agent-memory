@@ -384,14 +384,14 @@ def draft_choice(bundle):
     return kind, domain, (draft.get("text") or "").strip(), (draft.get("commit") or "").strip()
 
 
-def try_auto_approve_bundle(bundle):
+def try_auto_approve_bundle(bundle, unless_settled=None):
     """Queue the bundle's draft as approved, and delete the bundle. Raises ValueError or ConfigError.
 
     Hooks never wait on the network: the document goes to the outbox, and a
     detached sync sends it.
     """
     kind, domain, text, commit = draft_choice(bundle)
-    return approve(bundle, kind, domain, text, commit=commit, queue_only=True)
+    return approve(bundle, kind, domain, text, commit=commit, queue_only=True, unless_settled=unless_settled)
 
 
 def is_merge_commit(repo, sha):
@@ -764,7 +764,7 @@ def client_for(url, timeout=server_client.TIMEOUT):
     return server_client.Client(url, token, timeout)
 
 
-def deliver(url, op, body, queue_only=False):
+def deliver(url, op, body, queue_only=False, unless_settled=None):
     """Send one request now, or queue it. Returns ("sent", answer) or ("queued", reason).
 
     Whatever is already queued for url goes first, so the order is kept. With
@@ -773,7 +773,7 @@ def deliver(url, op, body, queue_only=False):
     """
     root = store_root()
     if queue_only:
-        outbox.add(root, url, op, body)
+        outbox.add(root, url, op, body, unless_settled=unless_settled)
         return "queued", None
     with outbox.lock(root):
         report = outbox.drain(root, client_for)
@@ -1223,8 +1223,10 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     if not head:
         log("capture session-end: auto_approve left inbox; could not resolve HEAD")
         return
-    if settled_commits(git_remote_repo_id(repo), [head], timeout=HOOK_STATUS_TIMEOUT):
-        log("capture session-end: commit already kept or rejected; inbox left for review")
+    # No network here: Codex gives SessionEnd about a second. The outbox is
+    # checked now; the server is asked by sync, before it sends (unless_settled).
+    if waiting_settled(git_remote_repo_id(repo), [head]):
+        log("capture session-end: commit already waiting in the outbox; inbox left for review")
         return
     if is_merge_commit(repo, head):
         log("capture session-end: HEAD is a merge commit; inbox left for review")
@@ -1259,8 +1261,9 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     ]
     fresh["land"] = land_meta
     write_json(bundle_path, fresh)
+    check = {"repo": remote_id, "shas": [head]} if remote_id else None
     try:
-        try_auto_approve_bundle(read_json(bundle_path))
+        try_auto_approve_bundle(read_json(bundle_path), unless_settled=check)
     except (ValueError, OSError, server_client.ConfigError) as error:
         log(f"capture session-end auto_approve failed, inbox bundle kept: {error}")
         return
@@ -1557,11 +1560,13 @@ def approve(
     superseded_by="",
     updates="",
     queue_only=False,
+    unless_settled=None,
 ):
     """Send the approved document to the server, or queue it, then delete the bundle.
 
     Returns {"status": "sent" or "queued", "id", "reason"}. A refusal (a 4xx)
     raises Refused and keeps the bundle; so does any other ValueError.
+    queue_only and unless_settled are for the hooks: see outbox.add.
     """
     url, body = approved_request(
         bundle,
@@ -1582,7 +1587,7 @@ def approve(
         superseded_by=superseded_by,
         updates=updates,
     )
-    status, answer = deliver(url, "memory", body, queue_only=queue_only)
+    status, answer = deliver(url, "memory", body, queue_only=queue_only, unless_settled=unless_settled)
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     if status == "sent":
         return {"status": "sent", "id": (answer or {}).get("id"), "reason": None}
@@ -1782,7 +1787,7 @@ def page_status():
         "connected": False,
         "error": "",
         "who": None,
-        "pinned": False,
+        "config": None,
         "outbox": outbox.summary(root),
         "failed": outbox.failed(root),
     }
@@ -1794,15 +1799,42 @@ def page_status():
     if config is None:
         status["error"] = NO_SERVER
         return status
-    status.update(configured=True, url=config["url"], pinned=bool(config["token"]))
+    status.update(configured=True, url=config["url"], config=config, whos={})
     try:
         who = server_client.Client(config["url"], config["token"], PAGE_TIMEOUT).whoami()
     except (server_client.ServerError, server_client.ServerUnreachable) as error:
         status["error"] = server_client.explain(error)
+        status["whos"][config["url"]] = None
         return status
     if isinstance(who, dict):
         status.update(connected=True, who=who)
+        status["whos"][config["url"]] = who
     return status
+
+
+def server_view(status, remote):
+    """(pinned, whoami) for the server that keeps remote's memories, as the page shows it.
+
+    pinned means the server takes person from a token: there is a token, and
+    whoami says auth is on (or didn't answer). In per-repo mode each server is
+    asked once per page.
+    """
+    config = (status or {}).get("config")
+    if not config:
+        return False, None
+    try:
+        url, token = server_client.target(remote or None, config)
+    except server_client.ConfigError:
+        return False, None
+    whos = status.setdefault("whos", {})
+    if url not in whos:
+        try:
+            found = server_client.Client(url, token, PAGE_TIMEOUT).whoami()
+        except (server_client.ServerError, server_client.ServerUnreachable):
+            found = None
+        whos[url] = found if isinstance(found, dict) else None
+    who = whos[url]
+    return bool(token) and (who is None or who.get("auth") == "on"), who
 
 
 def _banner(kind, text):
@@ -1880,10 +1912,11 @@ def render_failed(failed):
     )
 
 
-def identity_fields(status, iden):
+def identity_fields(status, iden, remote=""):
     """Organization, team and person. With a token the server pins person, and org and team to its lists."""
-    if status and status.get("pinned"):
-        who = status.get("who") or {}
+    pinned, who = server_view(status, remote)
+    if pinned:
+        who = who or {}
         if who.get("auth") == "on":
             orgs = [value for value in who.get("allowed_orgs") or [who.get("org")] if value]
             teams = [value for value in who.get("allowed_teams") or [who.get("team")] if value]
@@ -1985,7 +2018,7 @@ def render_page(items, include_all, status=None, done=""):
                 + "</select></label>"
             )
             extra_fields = f"""
-{identity_fields(status, iden)}
+{identity_fields(status, iden, rr_default)}
 <label>Occurred at <input name="occurred_at" type="text" value="{occurred_default}"></label>
 <label>Remote repo id <input name="remote_repo" type="text" value="{remote_d}" placeholder="github.com/owner/repo"></label>
 {record_block}
@@ -2048,9 +2081,23 @@ class ReviewHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return {key: values[0] for key, values in parse_qs(raw).items()}
 
+    def _own_origin(self):
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def _host_ok(self):
+        """Exactly 127.0.0.1:<port>. A DNS-rebinding name such as 127.0.0.1.example.test is refused."""
+        return self.headers.get("Host", "") == self._own_origin()[len("http://") :]
+
+    def _same_origin(self):
+        """A POST must come from this page: Origin, or else Referer, names 127.0.0.1:<port>."""
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return origin == self._own_origin()
+        referer = self.headers.get("Referer") or ""
+        return referer == self._own_origin() or referer.startswith(self._own_origin() + "/")
+
     def do_GET(self):
-        host = self.headers.get("Host", "")
-        if not host.startswith("127.0.0.1"):
+        if not self._host_ok():
             self._send(403, "localhost only")
             return
         query = parse_qs(urlparse(self.path).query)
@@ -2059,9 +2106,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self._send(200, render_page(offered(include_all), include_all, page_status(), done))
 
     def do_POST(self):
-        host = self.headers.get("Host", "")
-        if not host.startswith("127.0.0.1"):
+        if not self._host_ok():
             self._send(403, "localhost only")
+            return
+        if not self._same_origin():
+            self._send(403, "only the review page itself can approve or reject")
             return
         form = self._form()
         session_id = form.get("session_id", "")
@@ -2584,6 +2633,10 @@ def connect_cmd(args):
         raise SystemExit(str(error)) from None
     except (server_client.ServerError, server_client.ServerUnreachable) as error:
         raise SystemExit(server_client.explain(error)) from None
+    if token and who.get("auth") == "off":
+        # Approve takes a token to mean the server pins person; with auth off it doesn't.
+        print("the server has auth off, so the token is not saved")
+        token = None
     remote = (args.repo or "").strip()
     if remote:
         if existing is None or existing["mode"] != "per-repo":

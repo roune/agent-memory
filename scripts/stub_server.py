@@ -120,7 +120,7 @@ class StubServer:
         try:
             document = rules.memory_from_body(self._pin(body))
         except PermissionError as error:
-            return 403, {"error": str(error)}
+            return 403, {"error": str(error), "code": "identity"}
         except ValueError as error:
             return 400, {"error": str(error)}
         current = self.rows.get(document["id"])

@@ -15,6 +15,8 @@ sync sends the queue in order. What each answer does:
   and record attempts and last_error. A server that is down costs one timeout.
 - 401, 403, or a redirect: stop for that server and keep its whole queue.
   `agent-memory connect` fixes the token or the URL; nothing approved is set aside.
+  A 403 with code "identity" is about that one item (a person, org or team the
+  token may not write as), so it goes to failed/ like another 4xx.
 - 409: move the item to outbox/failed/ with the stored text alongside.
 - Any other 4xx: move the item to outbox/failed/ with the error.
 
@@ -69,8 +71,13 @@ def write_private(path, value):
         raise
 
 
-def add(store_root, server_url, op, body):
-    """Queue one request. Returns the item's path."""
+def add(store_root, server_url, op, body, unless_settled=None):
+    """Queue one request. Returns the item's path.
+
+    unless_settled, {"repo", "shas"}, makes sync ask /v1/commits/status first
+    and drop the item when the server reports one of those commits kept or
+    rejected. A hook that must not wait on the network leaves that check to sync.
+    """
     if op not in OPS:
         raise ValueError(f"unknown outbox op {op!r}")
     item = {
@@ -81,6 +88,8 @@ def add(store_root, server_url, op, body):
         "attempts": 0,
         "last_error": None,
     }
+    if unless_settled:
+        item["unless_settled"] = {"repo": unless_settled["repo"], "shas": list(unless_settled["shas"])}
     path = root(store_root) / f"{_stamp()}-{uuid.uuid4().hex}.json"
     write_private(path, item)
     return path
@@ -155,6 +164,15 @@ def lock(store_root):
         handle.close()
 
 
+def settled_already(client, item):
+    """True when the item's unless_settled commits are kept or rejected on the server."""
+    check = item.get("unless_settled")
+    if not isinstance(check, dict) or not check.get("repo") or not check.get("shas"):
+        return False
+    answer = client.commits_status(check["repo"], check["shas"])
+    return any(isinstance(info, dict) and (info.get("kept") or info.get("rejected")) for info in answer.values())
+
+
 def send(client, item):
     """Send one item. Returns the server's JSON, or raises ServerError / ServerUnreachable."""
     return client.request("POST", OPS[item["op"]], item["body"])
@@ -165,6 +183,8 @@ def _keeps_queue(error):
     if isinstance(error, server_client.ServerUnreachable):
         return True
     status = error.status
+    if status == 403 and error.body.get("code") == "identity":
+        return False
     return status >= 500 or status in KEEP_QUEUE or 300 <= status < 400
 
 
@@ -185,6 +205,7 @@ class Report:
 
     def __init__(self):
         self.sent = 0
+        self.settled = 0  # dropped: the server had already settled their commits
         self.failed = []  # (item, status, message)
         self.stopped = {}  # server url -> the error that stopped it
 
@@ -192,6 +213,8 @@ class Report:
         out = []
         if self.sent:
             out.append(f"sent {self.sent}")
+        if self.settled:
+            out.append(f"dropped {self.settled}: the server already kept or rejected their commits")
         for item, status, message in self.failed:
             out.append(f"failed ({status}): {message}. Kept in {failed_root(store_root)}")
         for url, error in self.stopped.items():
@@ -224,7 +247,13 @@ def drain(store_root, client_for, report=None):
             if url in report.stopped:
                 continue
             try:
-                send(client_for(url), item)
+                client = client_for(url)
+                if settled_already(client, item):
+                    path.unlink()
+                    report.settled += 1
+                    progressed = True
+                    continue
+                send(client, item)
             except (server_client.ServerError, server_client.ServerUnreachable) as error:
                 if _keeps_queue(error):
                     item["attempts"] = int(item.get("attempts") or 0) + 1

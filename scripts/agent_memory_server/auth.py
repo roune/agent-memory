@@ -37,11 +37,16 @@ MAX_LABEL = 64
 
 
 class AuthError(Exception):
-    """A request the token can't make: 401 (no or bad token) or 403 (not allowed)."""
+    """A request the token can't make: 401 (no or bad token) or 403 (not allowed).
 
-    def __init__(self, status, message):
+    code "identity" marks a 403 about one body's person, org or team, not about
+    the token itself: a client can set that one request aside and send the rest.
+    """
+
+    def __init__(self, status, message, code=None):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 def new_secret():
@@ -159,7 +164,7 @@ def pin_identity(caller, body):
         return body
     person = body.get("person")
     if person not in (None, "") and person != caller.person:
-        raise AuthError(403, f"this token writes as {caller.person}, not {person!r}")
+        raise AuthError(403, f"this token writes as {caller.person}, not {person!r}", code="identity")
     chosen = {}
     for field, own, allowed in (
         ("org", caller.org, caller.allowed_orgs),
@@ -170,6 +175,6 @@ def pin_identity(caller, body):
             value = own
         if value != own and value not in allowed:
             listed = ", ".join([own, *allowed])
-            raise AuthError(403, f"this token can't write {field} {value!r} (allowed: {listed})")
+            raise AuthError(403, f"this token can't write {field} {value!r} (allowed: {listed})", code="identity")
         chosen[field] = value
     return {**body, "person": caller.person, **chosen}

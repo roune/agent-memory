@@ -82,6 +82,9 @@ Approve and Reject send right away. When the server doesn't answer, or answers w
 - Each item is one JSON file in `outbox/`, next to `inbox/`, named `<utc stamp>-<uuid>.json`, mode 0600. `outbox/` is gitignored.
 - An item is `{server_url, op, body, created_at, attempts, last_error}`. `op` is `memory` or `rejection`. `body` is the request exactly as it would have been sent: approved text and tags, never a transcript path.
 - The token isn't stored in the item. `sync` takes the one the config files hold for `server_url` when it sends.
+- A session-end auto-approve adds `unless_settled: {repo, shas}`. The editor hook gets about a second, so it makes no call; `sync` asks `/v1/commits/status` first, and drops the item when the server already kept or rejected that commit.
+- A 403 with `"code": "identity"` (a person, org or team the token may not write as) is about that one item, so it goes to `outbox/failed/`. Any other 403 is about the token and keeps the queue.
+- An item keeps the `server_url` it was queued for. After `connect` to another URL, items for the old one wait until that server answers; send them there, or delete them from `outbox/`.
 
 ```mermaid
 flowchart TD
@@ -89,6 +92,7 @@ flowchart TD
   send -- "2xx" --> gone["deleted"]
   send -- "no answer, 5xx" --> stop["stop for that server:<br/>keep it and the rest,<br/>record attempts, last_error"]
   send -- "401, 403, 3xx" --> keep["stop for that server:<br/>keep its whole queue"]
+  send -- "403, code identity" --> failed
   send -- "409" --> failed409["outbox/failed/,<br/>with the stored text"]
   send -- "other 4xx" --> failed["outbox/failed/,<br/>with the error"]
 ```
@@ -100,7 +104,7 @@ flowchart TD
 - `sync` exits 1 while anything waits or failed.
 - While something waits for a server, Approve queues behind it, so the order is kept.
 
-The review page shows a banner: connected (as whom), offline, or not configured; how many items wait, and the oldest one's age; and each failed item with its error, and the stored text for a 409. With auth on it fills org and team from `/v1/whoami`, offers only the values the token allows, and shows `person` read-only.
+The review page shows a banner: connected (as whom), offline, or not configured; how many items wait, and the oldest one's age; and each failed item with its error, and the stored text for a 409. With auth on it fills org and team from `/v1/whoami`, offers only the values the token allows, and shows `person` read-only. In per-repo mode each bundle shows the identity of the server its repo goes to. `connect` doesn't save a token for a server with auth off. The page answers only `Host: 127.0.0.1:<port>`, and takes a POST only when its `Origin` (or else `Referer`) is the page itself, so another web page can't approve or reject.
 
 `land` and the hooks skip a commit that the server reports kept or rejected (`/v1/commits/status`, one call per batch), or that an outbox item already covers. If the server can't be reached they offer it anyway: a duplicate costs one Reject, while a missed memory is lost. The git hook's call has a 1-second timeout and it makes no other network call, so it returns within about two seconds.
 
@@ -170,9 +174,9 @@ flowchart TD
   scope -- yes --> write{"POST /v1/memories?"}
   write -- no --> answer
   write -- yes --> person{"person absent or<br/>the token's own?"}
-  person -- no --> r403b["403"]
+  person -- no --> r403b["403<br/>code: identity"]
   person -- yes --> lists{"org and team the token's,<br/>or on its allowed lists?"}
-  lists -- no --> r403c["403"]
+  lists -- no --> r403c["403<br/>code: identity"]
   lists -- yes --> stored["stored as the token's person<br/>written_by = token id"]
 ```
 
