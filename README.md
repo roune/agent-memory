@@ -32,14 +32,18 @@ flowchart LR
 
 ## Install
 
-From a clone of this repo:
+You need [uv](https://docs.astral.sh/uv/) and Docker with Compose. From a clone of this repo:
 
 ```
 ./scripts/install
 ./scripts/setup
 ```
 
-`install` links `agent-memory` into `~/.local/bin`. `setup` starts the server and Qdrant with `docker compose`, waits for `/v1/health`, and writes `~/.config/agent-memory/server` with `url = http://127.0.0.1:8765` if that file is missing. Auth is off locally, and only loopback can reach the server.
+`install` runs `uv tool install --editable .`, so the `agent-memory` on your `PATH` runs this clone's code. `setup` builds the server image from the clone, starts it and Qdrant with `docker compose`, waits for `/v1/health`, and writes `~/.config/agent-memory/server` with `url = http://127.0.0.1:8765` if that file is missing. Auth is off locally, and only loopback can reach the server.
+
+Without a clone, install the CLI with `uv tool install git+https://github.com/roune/agent-memory`, and run the published image `ghcr.io/roune/agent-memory-server` with the release's `compose.yaml`. [docs/deploy.md](docs/deploy.md) has those steps, a team server with auth on (`compose.team.yaml`), and how a release is made.
+
+The CLI keeps its inbox, outbox, `review.json` and `capture.log` in `${XDG_DATA_HOME:-~/.local/share}/agent-memory/`, or in `AGENT_MEMORY_DIR` when that is set. An older install kept them in the clone. The first command after the upgrade moves them, and `agent-memory install` points the hooks it wrote at the installed command. See [Upgrading the CLI](docs/deploy.md#upgrading-the-cli-to-the-tool-install).
 
 `install` leaves Cursor, Claude Code, Codex, and Pi alone. Connecting those is a second command, and it asks before it writes:
 
@@ -63,7 +67,7 @@ With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. 
 - **Pointers, not diffs.** An approved change stores every commit it explains and its PR number next to the text. The diff stays in git, and a reader gets it with `git show --stat <sha>…` or `gh pr view <number>`. The review page shows those commands. A hook memory made on a feature branch can point at commits that a squash merge later removed, so check with `git cat-file -e <sha>` before reading one.
 - **Git hooks.** With `git_hooks` on, post-commit and post-merge run `agent-memory git-hook`. Each new commit becomes an inbox bundle whose draft is the commit message without its trailers. A merge or fast-forward files every new single-parent commit, not only the tip. With `auto_approve`, the draft is approved at once: it goes into the outbox, and a detached `agent-memory sync` sends it. The hook writes locally first and makes one short call to skip commits that are already kept or rejected, so it returns within about two seconds even when the server doesn't answer.
 - **Repo policy.** `.agent-memory.toml` holds `capture`, `repo`, `git_hooks`, and `auto_approve`. `agent-memory config` shows them and can turn the git hooks and auto-approve on or off without reinstalling editor hooks. `capture = false` skips capture, `land`, and the git hooks for that clone.
-- **Outbox.** When the server can't be reached, or answers with a 5xx, Approve and Reject queue the request in `outbox/` (next to `inbox/`, gitignored, files mode 0600) and delete the bundle. `agent-memory sync` sends the queue in order. It also runs at the start of `review`, `land` and `list`. The review page shows how many items wait and how old the oldest is.
+- **Outbox.** When the server can't be reached, or answers with a 5xx, Approve and Reject queue the request in `outbox/` (next to `inbox/`, files mode 0600) and delete the bundle. `agent-memory sync` sends the queue in order. It also runs at the start of `review`, `land` and `list`. The review page shows how many items wait and how old the oldest is.
 - **Index.** The server keeps approved memories in `data/server/memories.sqlite` and embeds each one on write with `BAAI/bge-small-en-v1.5`, into Qdrant on the compose network. Raw transcripts are never embedded.
 
 ## Use

@@ -42,7 +42,7 @@ Suggested first-run shape:
 agent-memory install
 ```
 
-`./scripts/install` links the command into `~/.local/bin`. `agent-memory install` lists the tools it found (`~/.cursor`, `~/.claude`, `~/.codex`, `~/.pi/agent`) and waits for a yes. That yes is the permission to turn capture on. After that, session hooks stay silent.
+`./scripts/install` runs `uv tool install --editable .`, which puts `agent-memory` in uv's tool bin folder, usually `~/.local/bin`. Without a clone, `uv tool install git+https://github.com/roune/agent-memory` does the same ([deploy.md](deploy.md)). The hooks run the command that ran `agent-memory install`, by its full path, because an editor started from the desktop may not have `~/.local/bin` on `PATH`. Running install again updates only the entries it wrote, where they are. `agent-memory install` lists the tools it found (`~/.cursor`, `~/.claude`, `~/.codex`, `~/.pi/agent`) and waits for a yes. That yes is the permission to turn capture on. After that, session hooks stay silent.
 
 ## Hook map
 
@@ -106,8 +106,10 @@ Review still approves every document. The landing rule chooses what is offered. 
 agent-memory          capture, review, install, uninstall
 adapters/             cursor, claude-code, codex shell snippets
 adapters/pi/          extension that shells out to capture
-inbox/                gitignored bundles
-outbox/               gitignored: approved requests waiting for the server
+~/.local/share/agent-memory/
+  inbox/              bundles (or under AGENT_MEMORY_DIR)
+  outbox/             approved requests waiting for the server
+  review.json, capture.log
 data/server/          gitignored: the server's memories.sqlite (the source of truth)
 data/qdrant/          gitignored: the vector index, which only the server reaches
 ```

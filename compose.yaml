@@ -1,8 +1,12 @@
-# The agent-memory server, and Qdrant next to it. `./scripts/setup` starts both.
+# The agent-memory server, and Qdrant next to it, for one person on one laptop.
+# In a clone, `./scripts/setup` starts both. Without one (docs/deploy.md):
 #
-# Only the server's port is published, and only on loopback. Qdrant has no
-# ports: the server reaches it as http://qdrant:6333 on the compose network,
-# and nothing on the laptop talks to it.
+#   docker compose pull && docker compose up -d
+#
+# Only the server's port is published, and only on loopback, because auth is
+# off. Qdrant has no ports: the server reaches it as http://qdrant:6333 on the
+# compose network, and nothing on the laptop talks to it. A server other
+# machines reach is compose.team.yaml, with auth on.
 
 services:
   qdrant:
@@ -14,8 +18,13 @@ services:
       - ./data/qdrant:/qdrant/storage
 
   server:
+    # The published image, pinned to this release (scripts/release-check keeps
+    # the tag equal to pyproject.toml's version). In a clone, setup runs
+    # `docker compose up --build`, which builds it from this checkout instead.
+    # Without a clone there is nothing to build, so pull first: with `build:`
+    # set, a plain `up` builds a missing image rather than pulling it.
+    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
     build: .
-    image: agent-memory-server:dev
     restart: unless-stopped
     depends_on:
       - qdrant

@@ -1,0 +1,100 @@
+name: release
+
+# On a v* tag: build ghcr.io/roune/agent-memory-server:<version> for amd64 and
+# arm64, push it, then pull it on an amd64 and an arm64 runner and check that
+# it answers /v1/health. Pushing the tag is the release step; see
+# docs/deploy.md, "Releasing". The same build and check run on every PR in
+# test.yml's release-image job, against a registry on the runner.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The name compose.yaml and compose.team.yaml pin (scripts/release-check).
+  IMAGE: ghcr.io/roune/agent-memory-server
+
+jobs:
+  check:
+    # The tag, pyproject.toml and both compose files name one version.
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=$(python3 scripts/release-check "$TAG")" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.check.outputs.version }}
+          # The source label links the package to this repo, so it shows on
+          # the repo page and the workflow's token can push later versions.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0
+            org.opencontainers.image.title=agent-memory-server
+            org.opencontainers.image.description=The agent-memory server: the write API and read-only MCP next to Qdrant.
+
+  verify:
+    # The published image, pulled as a user would, answers /v1/health on both
+    # architectures. The package is private until it is made public once
+    # (docs/deploy.md), so this logs in to pull it.
+    needs: [check, publish]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and check
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker pull --platform "$PLATFORM" "$IMAGE:$VERSION"
+          EXPECT_VERSION="$VERSION" scripts/image-health "$IMAGE:$VERSION" "$PLATFORM"

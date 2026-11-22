@@ -47,6 +47,59 @@ jobs:
           cat /tmp/server.err
           test "$code" -eq 2
           grep -q "needs the server extra" /tmp/server.err
+      - name: A fresh uv tool install from this commit on GitHub, as docs/deploy.md says
+        # The documented command, pinned to this commit. A temporary HOME, and
+        # uv's tool folders and the XDG data folder inside it.
+        env:
+          HOME: ${{ runner.temp }}/tool-home
+          XDG_DATA_HOME: ${{ runner.temp }}/tool-home/.local/share
+          UV_TOOL_DIR: ${{ runner.temp }}/tool-home/.local/share/uv/tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/tool-home/.local/bin
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p "$HOME/.claude"
+          uv tool install "git+https://github.com/$REPO@$SHA"
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          test "$(command -v agent-memory)" = "$UV_TOOL_BIN_DIR/agent-memory"
+          agent-memory --help
+          set +e
+          agent-memory-server 2> "$RUNNER_TEMP/server.err"
+          code=$?
+          set -e
+          test "$code" -eq 2
+          grep -q "needs the server extra" "$RUNNER_TEMP/server.err"
+          # install points the hooks at the installed command.
+          agent-memory install --yes
+          python3 -c "
+          import json, os, sys
+          hooks = json.load(open(os.path.expanduser('~/.claude/settings.json')))['hooks']
+          command = hooks['Stop'][0]['hooks'][0]['command']
+          expected = os.environ['UV_TOOL_BIN_DIR'] + '/agent-memory capture --tool claude-code --event stop'
+          assert command == expected, (command, expected)
+          print('hook:', command)
+          "
+          # A hook files its bundle in the XDG data folder, which is private.
+          mkdir -p "$RUNNER_TEMP/proj" && git init -q "$RUNNER_TEMP/proj" && echo '{}' > "$RUNNER_TEMP/proj/t.jsonl"
+          printf '{"session_id": "ci-1", "cwd": "%s", "transcript_path": "%s"}' "$RUNNER_TEMP/proj" "$RUNNER_TEMP/proj/t.jsonl" \
+            | agent-memory capture --tool claude-code --event stop
+          test -f "$XDG_DATA_HOME/agent-memory/inbox/claude-code/ci-1/bundle.json"
+          test "$(stat -c %a "$XDG_DATA_HOME/agent-memory")" = 700
+      - name: scripts/install, an editable tool install of this checkout
+        env:
+          HOME: ${{ runner.temp }}/editable-home
+          XDG_DATA_HOME: ${{ runner.temp }}/editable-home/.local/share
+          UV_TOOL_DIR: ${{ runner.temp }}/editable-home/.local/share/uv/tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/editable-home/.local/bin
+        run: |
+          mkdir -p "$UV_TOOL_BIN_DIR"
+          # What the old scripts/install left: a link to this clone's bin/agent-memory.
+          ln -s "$GITHUB_WORKSPACE/bin/agent-memory" "$UV_TOOL_BIN_DIR/agent-memory"
+          ./scripts/install | tee "$RUNNER_TEMP/install.out"
+          grep -q "Removed the old link" "$RUNNER_TEMP/install.out"
+          "$UV_TOOL_BIN_DIR/agent-memory" --help > /dev/null
+          "$UV_TOOL_DIR/agent-memory/bin/python" -c "import agent_memory; print(agent_memory.__file__)" \
+            | grep -qx "$GITHUB_WORKSPACE/scripts/agent_memory.py"
 
   server:
     # The whole suite with the server extra, so nothing is skipped.
@@ -172,3 +225,117 @@ jobs:
           assert {hit['occurred_at'] for hit in hits} == {'2026-11-20T10:00:00+00:00'}, 'the import converts occurred_at to UTC'
           print('list through the server:', len(hits))
           "
+
+  release-image:
+    # The release workflow's build (release.yml), without publishing: both
+    # platforms pushed to a registry on this runner instead of GHCR, then each
+    # one pulled and checked with scripts/image-health, the check release.yml
+    # runs on the published image. A tag-only workflow can't run in a PR, so
+    # this is the same build and check, one step short of GHCR. It also runs
+    # the no-clone setup and compose.team.yaml against that image.
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      IMAGE: localhost:5000/agent-memory-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The version the next tag must carry
+        id: version
+        run: |
+          version=$(python3 scripts/release-check --version)
+          python3 scripts/release-check "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Each platform answers /v1/health
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for platform in linux/arm64 linux/amd64; do
+            docker pull --platform "$platform" "$IMAGE:$VERSION"
+            EXPECT_VERSION="$VERSION" scripts/image-health "$IMAGE:$VERSION" "$platform"
+          done
+      - name: Without a clone, only compose.yaml, pull, then up
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dir="$RUNNER_TEMP/no-clone"
+          mkdir -p "$dir/data/server" "$dir/data/qdrant"
+          cp compose.yaml "$dir/"
+          cd "$dir"
+          export AGENT_MEMORY_IMAGE="$IMAGE:$VERSION"
+          docker compose -p no-clone pull
+          docker compose -p no-clone up -d
+          # Up once Qdrant is ready too.
+          ready=""
+          for i in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:8765/v1/health > health.json \
+              && python3 -c "import json, sys; h = json.load(open('health.json')); sys.exit(0 if h['qdrant']['ready'] else 1)"; then
+              ready=yes; break
+            fi
+            sleep 1
+          done
+          cat health.json
+          if [ -z "$ready" ]; then docker compose -p no-clone logs; exit 1; fi
+          python3 -c "import json; h = json.load(open('health.json')); assert h['auth'] == 'off', h"
+          docker compose -p no-clone down
+      - name: compose.team.yaml, auth on and only the team host
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dir="$RUNNER_TEMP/team"
+          mkdir -p "$dir/data/server" "$dir/data/qdrant"
+          cp compose.team.yaml "$dir/"
+          cd "$dir"
+          export AGENT_MEMORY_IMAGE="$IMAGE:$VERSION"
+          if docker compose -f compose.team.yaml config > /dev/null 2> missing.err; then
+            echo "compose.team.yaml started without AGENT_MEMORY_ALLOWED_HOSTS"; exit 1
+          fi
+          grep -q AGENT_MEMORY_ALLOWED_HOSTS missing.err
+          echo "AGENT_MEMORY_ALLOWED_HOSTS=memory.example.test" > .env
+          docker compose -p team -f compose.team.yaml up -d
+          host="Host: memory.example.test"
+          ready=""
+          for i in $(seq 1 120); do
+            if curl -sf -H "$host" http://127.0.0.1:8765/v1/health > health.json \
+              && python3 -c "import json, sys; h = json.load(open('health.json')); sys.exit(0 if h['qdrant']['ready'] else 1)"; then
+              ready=yes; break
+            fi
+            sleep 1
+          done
+          cat health.json
+          if [ -z "$ready" ]; then docker compose -p team -f compose.team.yaml logs; exit 1; fi
+          python3 -c "import json; h = json.load(open('health.json')); assert h['auth'] == 'on', h"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "$host" http://127.0.0.1:8765/v1/whoami)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.example.test' http://127.0.0.1:8765/v1/health)" = 421
+          secret=$(docker compose -p team -f compose.team.yaml exec -T server agent-memory-server token create --person ci --org CI --team CI --scopes read | sed -n 2p)
+          curl -sf -H "$host" -H "Authorization: Bearer $secret" http://127.0.0.1:8765/v1/whoami
+          # The image's own health check sends Host: 127.0.0.1:8765, which the file allows.
+          id=$(docker compose -p team -f compose.team.yaml ps -q server)
+          for i in $(seq 1 30); do
+            state=$(docker inspect --format '{{.State.Health.Status}}' "$id")
+            if [ "$state" = healthy ]; then break; fi
+            sleep 5
+          done
+          echo "health check: $state"
+          test "$state" = healthy
+          docker compose -p team -f compose.team.yaml down
