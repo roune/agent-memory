@@ -9,7 +9,8 @@ the request waits in the outbox and `sync` sends it later.
 install git hooks and repo policy under `.agent-memory.toml`.
 Use `config` to change git hook policy and auto-approve without reinstalling.
 `migrate` copies the old local memories.sqlite to the server, and `list` reads
-from the server.
+from the server. `connect --editor` registers the server's read-only MCP
+endpoint in Claude Code, Cursor and Codex, with a read token for each.
 """
 
 import argparse
@@ -31,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+import editors
 import memory_migrate
 import memory_rules
 import memory_store
@@ -2544,6 +2546,15 @@ def uninstall(args):
     if extension.is_file() and MARKER in extension.read_text(encoding="utf-8"):
         shutil.rmtree(extension.parent)
     print("removed agent-memory hooks")
+
+    try:
+        removed = editors.remove_all(HOME)
+    except (editors.EditorError, server_client.ConfigError) as error:
+        raise SystemExit(f"MCP entries left in place: {error}") from None
+    for tool, path, names, ids in removed:
+        print(f"removed MCP {', '.join(names)} from {tool} ({path})")
+        for server, token_id in ids:
+            print(f"  its read token stays valid until revoked, on {server}: agent-memory-server token revoke {token_id}")
     return 0
 
 
@@ -2622,8 +2633,170 @@ def describe_caller(who):
     return f"{who.get('person')} in {who.get('org')}/{who.get('team')}, scopes: {scopes}{label}"
 
 
+def editor_servers(config):
+    """[(name, url, token, auth on)] for every distinct server, checked with /v1/whoami first."""
+    urls = editors.server_urls(config)
+    names = editors.entry_names(urls)
+    found = []
+    for url in urls:
+        token = server_client.token_for(url, config)
+        try:
+            who = server_client.Client(url, token).whoami()
+        except (server_client.ServerError, server_client.ServerUnreachable) as error:
+            raise SystemExit(f"{url}: {server_client.explain(error)}") from None
+        auth_on = who.get("auth") == "on"
+        if auth_on and not {"read", "write"} <= set(who.get("scopes") or []):
+            raise SystemExit(
+                f"{url}: an editor token is minted from a token with the read and write scopes, and this one has "
+                f"{', '.join(who.get('scopes') or []) or 'none'}. Connect with your laptop's token, then run this again."
+            )
+        found.append((names[url], url, token if auth_on else None, auth_on))
+    return found
+
+
+def connect_editors(args):
+    """Register the server's /mcp in each editor, with a read token minted for it. Writes only after a yes."""
+    for flag, value in (("--url", args.url), ("--token-stdin", args.token_stdin), ("--mode", args.mode), ("--repo", args.repo)):
+        if value:
+            raise SystemExit(f"--editor uses the servers connect already wrote; run connect {flag} on its own first")
+    try:
+        tools, notes = editors.parse_editors(args.editor)
+        config = server_client.read_config()
+        record = editors.read_record()
+    except server_client.ConfigError as error:
+        raise SystemExit(str(error)) from None
+    for line in notes:
+        print(line)
+    if not tools:
+        return 0
+    if config is None:
+        raise SystemExit("no server is configured: run agent-memory connect --url <server> first")
+    servers = editor_servers(config)
+    names = [name for name, *_ in servers]
+
+    # What each file holds now, so the preview says what changes and nothing is read twice.
+    plan = []
+    try:
+        for tool in tools:
+            present = editors.current(tool, HOME)
+            owned = editors.ours(tool, HOME, record)
+            stale = [name for name in owned if name not in names]
+            editors.check(tool, HOME, names, stale)
+            plan.append((tool, present, owned, stale))
+    except editors.EditorError as error:
+        raise SystemExit(str(error)) from None
+
+    if args.print:
+        auth_on = {name for name, *_rest, on in servers if on}
+        written = [tool for tool, _present, owned, _stale in plan if auth_on & set(owned)]
+        if written:
+            raise SystemExit(
+                f"connect --editor already wrote {', '.join(written)}, and --print would mint a new token that "
+                "revokes the one in that file. Run it without --print to replace the entry, or run "
+                "agent-memory uninstall first."
+            )
+        return print_editor_lines(tools, servers, config)
+
+    print("This will write MCP entries for agent-memory:")
+    for tool, present, owned, stale in plan:
+        print(f"  {tool}: {editors.display(tool, HOME)}")
+        for name, url, _token, auth_on in servers:
+            how = f"a new read token, label {editors.label(tool)}" if auth_on else "auth is off, so no header"
+            note = " (replaces an entry you added)" if name in present and name not in owned else ""
+            print(f"    {name} -> {editors.mcp_url(url)} ({how}){note}")
+        for name in stale:
+            print(f"    {name}: removed, its server is no longer configured")
+    print("Other MCP servers in those files are left in place.")
+    if any(auth_on for *_, auth_on in servers):
+        print("Running this again replaces each editor's token; the old one stops working.")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise SystemExit("re-run in a terminal, or pass --yes (or --print to only print the lines)")
+        answer = input("Write these entries? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("editor configs left unchanged; no token was minted")
+            return 0
+
+    failures = []
+    for tool, _present, _owned, stale in plan:
+        # A server whose mint failed keeps its old entry: the old token wasn't replaced.
+        add, ids, failed = mint_for(tool, servers, config)
+        failures += failed
+        if not add and not stale:
+            print(f"{tool}: nothing written")
+            continue
+        try:
+            path = editors.apply(tool, HOME, add, stale)
+        except editors.EditorError as error:
+            raise SystemExit(str(error)) from None
+        entries = record.setdefault(tool, {})
+        for name in stale:
+            entries.pop(name, None)
+        for name, (url, _token) in add.items():
+            entries[name] = {"url": editors.mcp_url(url), "token_id": ids.get(name)}
+        editors.write_record(record)
+        print(f"wrote {tool}: {path} ({', '.join(add) or 'removed ' + ', '.join(stale)})")
+    print("Restart the editors to pick up the change. Pi keeps capture through its extension and has no MCP entry.")
+    if failures:
+        for line in failures:
+            print(line)
+        print("Those entries were left as they were. Fix the cause, then run this again.")
+        return 1
+    return 0
+
+
+def mint_for(tool, servers, config):
+    """{name: (url, read token or None)}, {name: token id}, and a line for each server that failed.
+
+    Every server is tried, so one that fails doesn't keep the others from
+    being written. Never the caller's own token.
+    """
+    add, ids, failed = {}, {}, []
+    own = {config.get("token")} | set(server_client.read_tokens().values())
+    for name, url, token, auth_on in servers:
+        if not auth_on:
+            add[name] = (url, None)
+            continue
+        try:
+            minted = server_client.Client(url, token).mint_token(editors.label(tool))
+        except (server_client.ServerError, server_client.ServerUnreachable, server_client.ConfigError) as error:
+            message = server_client.explain(error) if not isinstance(error, server_client.ConfigError) else str(error)
+            failed.append(f"{url}: minting the {tool} token failed: {message}")
+            continue
+        if minted["token"] in own:
+            failed.append(f"{url}: the server answered with the CLI's own token, which never goes in an editor file")
+            continue
+        add[name] = (url, minted["token"])
+        ids[name] = minted.get("id")
+    return add, ids, failed
+
+
+def print_editor_lines(tools, servers, config):
+    """--print: mint the tokens and print the commands and file lines. No file is written."""
+    if any(auth_on for *_, auth_on in servers):
+        print("Each line holds a new read token, and the earlier token with that label stops working.")
+    failures = []
+    for tool in tools:
+        add, _ids, failed = mint_for(tool, servers, config)
+        failures += failed
+        print(f"{tool}:")
+        for name, (url, token) in add.items():
+            for line in editors.shown(tool, name, url, token).splitlines():
+                print(f"  {line}")
+    for line in failures:
+        print(line)
+    print("Nothing was written.")
+    return 1 if failures else 0
+
+
 def connect_cmd(args):
     """Check the server with /v1/whoami, then write the config. Nothing is written when the check fails."""
+    if getattr(args, "editor", ""):
+        return connect_editors(args)
+    if getattr(args, "print", False) or getattr(args, "yes", False):
+        raise SystemExit("--print and --yes go with --editor")
+    if not args.url:
+        raise SystemExit("connect needs --url <server>, or --editor <tools>")
     try:
         url = server_client.clean_url(args.url)
         token = server_client.check_token(sys.stdin.readline()) if args.token_stdin else None
@@ -2699,7 +2872,7 @@ def build_parser():
     )
     install_parser.set_defaults(func=install)
 
-    uninstall_parser = sub.add_parser("uninstall", help="remove only the hooks this tool added")
+    uninstall_parser = sub.add_parser("uninstall", help="remove only the hooks and MCP entries this tool added")
     uninstall_parser.set_defaults(func=uninstall)
 
     note_parser = sub.add_parser("note", help="pin a draft memory so review can approve it")
@@ -2780,12 +2953,21 @@ def build_parser():
     list_parser.set_defaults(func=list_memories)
 
     connect_parser = sub.add_parser("connect", help="point the CLI at an agent-memory server")
-    connect_parser.add_argument("--url", required=True, help="server URL, for example http://127.0.0.1:8765")
+    connect_parser.add_argument("--url", default="", help="server URL, for example http://127.0.0.1:8765")
     connect_parser.add_argument(
         "--token-stdin", action="store_true", help="read the bearer token from the first line of stdin"
     )
     connect_parser.add_argument("--mode", choices=server_client.MODES, default=None, help="default: keep the current mode")
     connect_parser.add_argument("--repo", default="", help="per-repo mode: send this remote id to --url")
+    connect_parser.add_argument(
+        "--editor",
+        default="",
+        metavar="TOOLS",
+        help="register the server's MCP endpoint in these editors: claude-code,cursor,codex (Pi has none)",
+    )
+    shown = connect_parser.add_mutually_exclusive_group()
+    shown.add_argument("--print", action="store_true", help="with --editor: print the lines and write nothing")
+    shown.add_argument("--yes", action="store_true", help="with --editor: write without prompting")
     connect_parser.set_defaults(func=connect_cmd)
 
     migrate_parser = sub.add_parser("migrate", help="copy the local memories.sqlite to the connected server")

@@ -293,6 +293,14 @@ class Client:
             raise ServerUnreachable(f"{self.url}/v1/commits/status answered without commits; is that the agent-memory server?")
         return commits
 
+    def mint_token(self, label):
+        """A read-only child of this client's token, for an editor: {id, token, ...}. The same label replaces the earlier one."""
+        answer = self.request("POST", "/v1/tokens", {"label": label})
+        if not isinstance(answer, dict) or not isinstance(answer.get("token"), str) or not answer["token"]:
+            raise ServerUnreachable(f"{self.url}/v1/tokens answered without a token; is that the agent-memory server?")
+        check_token(answer["token"])
+        return answer
+
     def import_rows(self, memories, rejections):
         return self.request("POST", "/v1/admin/import", {"memories": list(memories), "rejections": list(rejections)})
 

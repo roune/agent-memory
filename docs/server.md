@@ -1,6 +1,6 @@
 # The agent-memory server
 
-Status: in use since the cutover (PR 5 of [server-plan.md](server-plan.md)). `./scripts/setup` starts it next to Qdrant. Approve, Reject, `land`, the git hooks and `list` go through it, and editors query it through MCP. When it doesn't answer, Approve and Reject wait in the laptop's outbox. PR 6 (editor setup) and PR 7 (packaging and the published image) are still to come.
+Status: in use since the cutover (PR 5 of [server-plan.md](server-plan.md)). `./scripts/setup` starts it next to Qdrant. Approve, Reject, `land`, the git hooks and `list` go through it, and editors query it through MCP. When it doesn't answer, Approve and Reject wait in the laptop's outbox. `agent-memory connect --editor` registers it in Claude Code, Cursor and Codex (PR 6). PR 7 (packaging and the published image) is still to come.
 
 ## The shape
 
@@ -155,7 +155,32 @@ This repo's `.mcp.json` registers the local server for Claude Code as `agent-mem
 {"mcpServers": {"agent-memory-dev": {"type": "http", "url": "http://127.0.0.1:8765/mcp"}}}
 ```
 
-The local compose file has auth off, so it needs no token. The name keeps this project's entry from hiding a team server you register as `agent-memory`. For a server with auth on, add `"headers": {"Authorization": "Bearer am_…"}` with a read token, for example one from `POST /v1/tokens`. `agent-memory connect --editor` writes that for you in PR 6.
+The local compose file has auth off, so it needs no token. The name keeps this project's entry from hiding a team server you register as `agent-memory`. For a server with auth on, add `"headers": {"Authorization": "Bearer am_…"}` with a read token. `agent-memory connect --editor` does that for your user config: see [Connecting editors](#connecting-editors).
+
+## Connecting editors
+
+```
+agent-memory connect --editor claude-code,cursor,codex           # shows what changes, writes after a yes
+agent-memory connect --editor claude-code,cursor,codex --yes     # writes without asking
+agent-memory connect --editor cursor --print                     # prints the lines, writes nothing
+```
+
+It uses the servers that `connect --url` already wrote. Each editor gets an entry for the server's `/mcp`, in its user config:
+
+| Editor | File | Entry |
+| --- | --- | --- |
+| Claude Code | `~/.claude.json` | `mcpServers.agent-memory = {"type": "http", "url": "<url>/mcp", "headers": {"Authorization": "Bearer <read token>"}}`, what `claude mcp add --transport http --scope user agent-memory <url>/mcp --header "Authorization: Bearer <read token>"` writes |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers.agent-memory = {"url": "<url>/mcp", "headers": {"Authorization": "Bearer <read token>"}}` |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.agent-memory]` with `url = "<url>/mcp"` and `http_headers = { "Authorization" = "Bearer <read token>" }` |
+| Pi | none | Pi keeps capture through its extension, and gets no MCP entry. |
+
+- **Tokens.** With auth on, each editor gets its own read-only token from `POST /v1/tokens`, labelled `editor-claude-code`, `editor-cursor` or `editor-codex`, minted with your laptop's token (which needs read and write). The laptop's token never goes in an editor file. Running it again mints a new token and the old one stops working. With auth off there is no token and no header.
+- **Consent.** It prints what each file gets and asks first, like `install`. No token is minted before the yes. `--print` mints the tokens and prints the command for Claude Code and the lines for Cursor and Codex, and writes no file; the earlier tokens with those labels stop working. So `--print` refuses an editor whose entry `connect --editor` already wrote with a token: run it without `--print`, or `uninstall` first. The printed `claude mcp add` command puts the token in your shell history.
+- **A server that fails.** Each server is tried. One that can't mint a token keeps its old entry, and its old token isn't replaced; the others are written, and the command exits 1 naming the failure.
+- **Other entries stay.** Every other MCP server and setting in those files is kept, and so are comments around the `agent-memory` tables in `config.toml`. A file that isn't valid JSON or TOML, or a Codex entry for `agent-memory` that isn't its own `[mcp_servers.agent-memory]` table, is refused before anything is minted. A symlinked file stays a symlink. A file that holds a token loses its group and other read bits.
+- **Per-repo mode.** One entry for each distinct server URL in `server` and `servers`: `agent-memory` for the `server` file's URL, `agent-memory-<host>` for each other one (with the port, or a number, when two share a host). A server that is no longer configured loses the entry this command added for it.
+- **Uninstall.** What it added is recorded in `~/.config/agent-memory/editors`. `agent-memory uninstall` removes those entries, and only while they still point where they were written: an entry you added or re-pointed by hand stays. The read tokens stay valid until revoked, so it prints one `agent-memory-server token revoke <id>` for each, with the server that minted it.
+- Restart the editor after a change. This repo's `.mcp.json` keeps its `agent-memory-dev` entry, so it never hides the user entry named `agent-memory`.
 
 ## Auth and tokens
 

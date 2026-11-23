@@ -32,6 +32,7 @@ agent-memory-server = "agent_memory_server:main"
 package-dir = { "" = "scripts" }
 py-modules = [
     "agent_memory",
+    "editors",
     "embed",
     "embedder",
     "memory_migrate",
