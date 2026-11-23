@@ -82,7 +82,7 @@ Approve and Reject send right away. When the server doesn't answer, or answers w
 - Each item is one JSON file in `outbox/`, next to `inbox/`, named `<utc stamp>-<uuid>.json`, mode 0600. `outbox/` is gitignored.
 - An item is `{server_url, op, body, created_at, attempts, last_error}`. `op` is `memory` or `rejection`. `body` is the request exactly as it would have been sent: approved text and tags, never a transcript path.
 - The token isn't stored in the item. `sync` takes the one the config files hold for `server_url` when it sends.
-- A session-end auto-approve adds `unless_settled: {repo, shas}`. The editor hook gets about a second, so it makes no call; `sync` asks `/v1/commits/status` first, and drops the item when the server already kept or rejected that commit.
+- A session-end or git-hook auto-approve adds `unless_settled: {repo, shas}`. The editor hook gets about a second, so it makes no call. The git hook makes one status call, which may time out. Either way `sync` asks `/v1/commits/status` first, and drops the item when the server already kept or rejected that commit, so a commit someone else explained gets no second memory.
 - A 403 with `"code": "identity"` (a person, org or team the token may not write as) is about that one item, so it goes to `outbox/failed/`. Any other 403 is about the token and keeps the queue.
 - An item keeps the `server_url` it was queued for. After `connect` to another URL, items for the old one wait until that server answers; send them there, or delete them from `outbox/`.
 

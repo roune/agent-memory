@@ -466,7 +466,10 @@ def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_app
         try:
             kind, domain, text, commit = draft_choice(bundle)
             url, body = approved_request(bundle, kind, domain, text, commit=commit)
-            return outbox.add(store_root(), url, "memory", body)
+            # The hook's own status call may time out, so sync asks again before
+            # it sends: a commit someone else already explained gets no second memory.
+            check = {"repo": remote_id, "shas": [sha]} if remote_id else None
+            return outbox.add(store_root(), url, "memory", body, unless_settled=check)
         except (ValueError, OSError, server_client.ConfigError) as error:
             log(f"git-hook: auto_approve failed, inbox bundle kept for review: {error}")
     write_json(bundle_path, bundle)
