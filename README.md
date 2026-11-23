@@ -6,7 +6,7 @@ Agent memory files a coding-agent session, or a slice of git history, and lets y
 
 ## How it works
 
-Hooks file each session or commit into a local inbox. Nothing is kept until you approve it on the review page, where you can also edit the text. Only approved notes reach the store and the search index. Transcripts stay on your laptop.
+Hooks file each session or commit into a local inbox. Nothing is kept until you approve it on the review page, where you can also edit the text. Approve sends the note to the agent-memory server in Docker, which stores it and embeds it. Only approved notes reach the server. Transcripts stay on your laptop. Editors read the kept notes through MCP at `/mcp` (`search`, `get`, `list`; this repo's `.mcp.json` registers it).
 
 ```mermaid
 flowchart LR
@@ -14,35 +14,23 @@ flowchart LR
     hooks["Editor hooks<br/>Cursor · Claude Code · Codex · Pi"] --> inbox[("inbox/<br/>bundles + transcript pointers")]
     githooks["git hooks<br/>agent-memory land"] --> inbox
     inbox --> review["agent-memory review<br/>127.0.0.1:4173"]
-    review -- "Approve<br/>(edited text)" --> db[("data/memories.sqlite<br/>approved notes only")]
-    review -- "Reject" --> rejected["bundle dropped<br/>commits remembered"]
-    db --> embed["scripts/embed<br/>bge-small-en-v1.5"]
-  end
-  embed --> qdrant[("Qdrant<br/>127.0.0.1:6333")]
-```
-
-### Where it is heading
-
-[docs/server-plan.md](docs/server-plan.md) moves the store into one server in Docker. Approve sends the note to the server, which embeds it on write. Editors read through MCP at `/mcp` (`search`, `get`, `list`; this repo's `.mcp.json` registers it). The server exists as a preview behind a compose profile ([docs/server.md](docs/server.md)). `agent-memory connect` points the CLI at it, and `agent-memory migrate` copies the local store into it. Otherwise the laptop flow above is unchanged until the cutover.
-
-```mermaid
-flowchart LR
-  subgraph laptop["Your laptop"]
-    cli["agent-memory review<br/>Approve / Reject"]
+    review -- "Reject" --> rejected["bundle dropped"]
     outbox[("outbox/<br/>when offline")]
     editors["Editors<br/>(MCP)"]
   end
-  subgraph docker["Docker"]
-    server["agent-memory-server :8765<br/>/v1 write API · /mcp read"]
-    sqlite[("memories.sqlite<br/>source of truth")]
-    qdrant[("Qdrant<br/>internal only")]
+  subgraph docker["Docker (compose.yaml)"]
+    server["agent-memory-server<br/>127.0.0.1:8765<br/>/v1 write API · /mcp read"]
+    sqlite[("data/server/memories.sqlite<br/>source of truth")]
+    qdrant[("Qdrant<br/>no published port")]
   end
-  cli -- "POST /v1/memories" --> server
-  cli -. "server down" .-> outbox -. "agent-memory sync" .-> server
+  review -- "Approve (edited text)<br/>POST /v1/memories" --> server
+  review -. "server down" .-> outbox -. "agent-memory sync" .-> server
   editors -. "search · get · list" .-> server
   server --> sqlite
-  server -- "embed on write" --> qdrant
+  server -- "embed on write<br/>bge-small-en-v1.5" --> qdrant
 ```
+
+[docs/server.md](docs/server.md) describes the server: routes, auth, browser rules and `reindex`. [docs/server-plan.md](docs/server-plan.md) is the plan it was built from.
 
 ## Install
 
@@ -50,9 +38,12 @@ From a clone of this repo:
 
 ```
 ./scripts/install
+./scripts/setup
 ```
 
-That links `agent-memory` into `~/.local/bin`. It leaves Cursor, Claude Code, Codex, and Pi alone. Connecting those is a second command, and it asks before it writes:
+`install` links `agent-memory` into `~/.local/bin`. `setup` starts the server and Qdrant with `docker compose`, waits for `/v1/health`, and writes `~/.config/agent-memory/server` with `url = http://127.0.0.1:8765` if that file is missing. Auth is off locally, and only loopback can reach the server.
+
+`install` leaves Cursor, Claude Code, Codex, and Pi alone. Connecting those is a second command, and it asks before it writes:
 
 ```
 agent-memory install
@@ -72,9 +63,10 @@ With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. 
 - **Review.** `agent-memory review` opens an approve/reject page on `127.0.0.1`, starting at port 4173. You keep one note per bundle: a `change`, a `learning`, or a `decision`, in the domain `code`, `architecture`, or `operations`. Edit the text before you approve. Reject drops the bundle. For a git bundle it also remembers the commits, so `land` and the git hooks do not offer them again.
 - **Land.** `agent-memory land` files recent commits on a clone’s local default branch, grouped by pull request when it can tell the PR: from a `Merge pull request #N` commit, a subject ending in `(#N)`, or `gh` when it is installed. It skips the merge commits themselves. The draft is the PR title and description, then each commit message, with trailers and template comments removed. These bundles always wait for review.
 - **Pointers, not diffs.** An approved change stores every commit it explains and its PR number next to the text. The diff stays in git, and a reader gets it with `git show --stat <sha>…` or `gh pr view <number>`. The review page shows those commands. A hook memory made on a feature branch can point at commits that a squash merge later removed, so check with `git cat-file -e <sha>` before reading one.
-- **Git hooks.** With `git_hooks` on, post-commit and post-merge run `agent-memory git-hook`. Each new commit becomes an inbox bundle whose draft is the commit message without its trailers. A merge or fast-forward files every new single-parent commit, not only the tip. `auto_approve` keeps that draft when `~/.config/agent-memory/identity` has org, team, and person.
+- **Git hooks.** With `git_hooks` on, post-commit and post-merge run `agent-memory git-hook`. Each new commit becomes an inbox bundle whose draft is the commit message without its trailers. A merge or fast-forward files every new single-parent commit, not only the tip. With `auto_approve`, the draft is approved at once: it goes into the outbox, and a detached `agent-memory sync` sends it. The hook writes locally first and makes one short call to skip commits that are already kept or rejected, so it returns within about two seconds even when the server doesn't answer.
 - **Repo policy.** `.agent-memory.toml` holds `capture`, `repo`, `git_hooks`, and `auto_approve`. `agent-memory config` shows them and can turn the git hooks and auto-approve on or off without reinstalling editor hooks. `capture = false` skips capture, `land`, and the git hooks for that clone.
-- **Index.** Approved memories live in a local SQLite file, `data/memories.sqlite`. `scripts/setup` starts Qdrant, which is only the vector index. `scripts/embed` reads that SQLite file and embeds with `BAAI/bge-small-en-v1.5`. Raw transcripts are never embedded. An older SQLite file is upgraded in place the first time it is opened. Run `./scripts/embed --rebuild` once after that upgrade so existing points carry `commits`, and `pull_request` when the change has one.
+- **Outbox.** When the server can't be reached, or answers with a 5xx, Approve and Reject queue the request in `outbox/` (next to `inbox/`, gitignored, files mode 0600) and delete the bundle. `agent-memory sync` sends the queue in order. It also runs at the start of `review`, `land` and `list`. The review page shows how many items wait and how old the oldest is.
+- **Index.** The server keeps approved memories in `data/server/memories.sqlite` and embeds each one on write with `BAAI/bge-small-en-v1.5`, into Qdrant on the compose network. Raw transcripts are never embedded.
 
 ## Use
 
@@ -86,20 +78,25 @@ agent-memory review
 
 The page lists sessions whose work is on the default branch, plus anything you pinned. A link on the page shows the rest of the inbox. If the server is already running, the command only opens its URL.
 
-Approve writes a row in the local SQLite database and removes the inbox folder. It needs org, team, and person, from the form or from `~/.config/agent-memory/identity`, and a remote repo id from `origin` or from `repo` in `.agent-memory.toml`. A change also needs the commit it explains. Capture, review, and land do not need Qdrant.
+Approve sends the note to the server and removes the inbox folder. It needs a remote repo id from `origin` or from `repo` in `.agent-memory.toml`, and a change also needs the commit it explains. With auth off (the local setup), org, team, and person come from the form or from `~/.config/agent-memory/identity`. With auth on, your token sets person, and the page offers the orgs and teams the token allows (from `/v1/whoami`).
 
-`~/.config/agent-memory/database` sets `mode` (`shared` or `per-repo`) and `qdrant_url`. The default is shared mode and `http://127.0.0.1:6333`, so a laptop works with no company host. A company deployment sets `qdrant_url` to its own container. Embed and flush use that URL. In per-repo mode, `~/.config/agent-memory/databases` maps each remote id to that remote's URL, and each remote has its own SQLite file.
+What the server answers decides what happens to the bundle:
+
+- **Stored** (201, or 200 for an identical resend): the bundle is deleted.
+- **No answer, or a 5xx:** the request waits in the outbox, the bundle is deleted, and the page says it is queued.
+- **A 4xx:** the page shows the error and keeps the bundle. A 409 means that id is already kept with other text; the page shows that text, and a newer note replaces it through Supersedes. A 401 or 403 means the token needs `agent-memory connect` again.
 
 ```
+agent-memory sync                  # send the outbox now
+agent-memory sync --retry-failed   # send again what the server refused, after a fix
 agent-memory list --team platform --since 2026-11-01T00:00:00+00:00
 agent-memory list --org acme --since 2026-11-01T00:00:00+00:00
 agent-memory list --repo github.com/owner/name
-agent-memory flush
 ```
 
-`flush` copies pending rows into the SQLite file mounted in the container when that URL answers `/readyz`, and leaves the laptop file unchanged when it does not.
+`sync` stops at the first item the server doesn't take, so a server that is down costs one timeout and the order is kept. A 401 or 403 keeps the whole queue until you connect again. A 409 or another 4xx moves that item to `outbox/failed/`, where the review page lists it with its error. `flush` is retired: it prints "use `agent-memory sync`".
 
-Once `agent-memory connect` has written `~/.config/agent-memory/server`, `list` asks the server instead of the local file. See [Connecting the CLI](docs/server.md#connecting-the-cli).
+`list` asks the server. To use another server, or a token, see [Connecting the CLI](docs/server.md#connecting-the-cli). `~/.config/agent-memory/database` and `databases` are no longer read, except by `agent-memory migrate`, which copies an old `data/memories.sqlite` into the server.
 
 File commits that are already on the local default branch. The window defaults to the last 24 hours. `--since` takes an ISO-8601 time or a number of hours ago. The branch name comes from `origin/HEAD` when that local branch exists, otherwise `main` or `master`, and unpushed local commits are included:
 
@@ -124,12 +121,19 @@ agent-memory drop <session-id>
 agent-memory uninstall
 ```
 
-After you approve, index what you kept:
+There is no embed step: Approve embeds. To embed every row again, or to drop the collections of other models, `scripts/embed --rebuild` and `scripts/embed --prune` stop the server, run `agent-memory-server reindex`, and start it again.
 
-```
-./scripts/setup
-./scripts/embed
-```
+## Upgrading from the laptop store
+
+Before the server, Approve wrote `data/memories.sqlite` and `scripts/embed` filled a `memories` collection on `127.0.0.1:6333`. To move that store:
+
+1. Back it up: `sqlite3 data/memories.sqlite ".backup data/backups/memories-pre-server.sqlite"`.
+2. `./scripts/setup`. It starts the server, and Qdrant without a published port.
+3. `agent-memory migrate --dry-run`, then `agent-memory migrate`. A rerun is safe, so run it again if you approved anything before this upgrade.
+4. `scripts/embed --prune` drops the legacy `memories` collection.
+5. Check that `curl 127.0.0.1:6333` now fails: Qdrant is reachable only from the server.
+
+The laptop file stays in place as a backup. The CLI no longer opens it, apart from `migrate`. See [docs/server.md](docs/server.md#connecting-the-cli).
 
 ## License
 
@@ -141,9 +145,9 @@ Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agen
 
 - [docs/context.md](docs/context.md) — decisions already made.
 - [docs/harnesses.md](docs/harnesses.md) — where each tool’s hook will live, and the capture constraints.
-- [docs/integration.md](docs/integration.md) — how a person installs capture, and where the vector index stays out of the hook.
-- [docs/vector-engine.md](docs/vector-engine.md) — why the engine is Qdrant server, and how `scripts/setup` starts it.
-- [docs/embedding-model.md](docs/embedding-model.md) — the model `scripts/embed` runs, and the pinned checkpoint.
+- [docs/integration.md](docs/integration.md) — how a person installs capture, and how the hooks stay off the network.
+- [docs/vector-engine.md](docs/vector-engine.md) — why the engine is Qdrant server.
+- [docs/embedding-model.md](docs/embedding-model.md) — the model the server runs, and the pinned checkpoint.
 - [docs/research.md](docs/research.md) — the “what already does this” question, still open.
 - [docs/server-plan.md](docs/server-plan.md) — the approved plan for moving to one server in Docker, in ordered PRs.
-- [docs/server.md](docs/server.md) — the server preview: routes, browser rules, `reindex`, and how to try it before the cutover.
+- [docs/server.md](docs/server.md) — the server: routes, auth, browser rules, the outbox, and `reindex`.

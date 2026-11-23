@@ -306,6 +306,10 @@ class AuthOnTest(AppCase):
         as_ana = self.client.post("/v1/memories", json=body(person="ana"), headers=self.as_(self.writer))
         self.assertEqual(as_ana.status_code, 403)
         self.assertIn("writes as miguel", as_ana.json()["error"])
+        self.assertEqual(as_ana.json()["code"], "identity", "about this body, not the token")
+        no_scope = self.client.post("/v1/memories", json=self.anonymous_body(session_id="s9"), headers=self.as_(self.reader))
+        self.assertEqual(no_scope.status_code, 403)
+        self.assertNotIn("code", no_scope.json())
 
     def test_org_and_team_only_from_the_tokens_lists(self):
         infra = self.client.post(

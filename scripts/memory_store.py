@@ -1,14 +1,14 @@
-"""Laptop side of the approved-memory store.
+"""The laptop's old approved-memory store, from before the server.
 
-The laptop file is the source of truth. Qdrant is only the vector index.
-A second file on the container volume is the shared copy flush writes.
+Since the cutover the agent-memory server is the source of truth, and the CLI
+no longer opens this file, apart from agent-memory migrate, which reads it to
+copy it to the server. scripts/embed.py still reads it until it is removed.
 
 This module decides which SQLite file to open, from ~/.config/agent-memory and
 AGENT_MEMORY_DIR, and hands it to store_core.Store. The schema and the queries
 live in store_core.py.
 """
 
-import sqlite3
 import sys
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -32,13 +32,9 @@ from store_core import (  # noqa: F401  re-exported for callers of memory_store
     hit_from_row,
     normalize_document,
     utc_now,
-    _commits_by_id,
-    _content,
-    _pending_flush,
     _reject_blank,
     _sha,
     _text,
-    _upsert_shared,
     _write_commits,
 )
 
@@ -121,16 +117,8 @@ def local_db_path(remote_id=None):
     return per_repo_root(remote_id) / "memories.sqlite"
 
 
-def shared_db_path(remote_id=None):
-    if database_config()["mode"] == "shared":
-        return store_root() / "data" / "shared" / "memories.sqlite"
-    if not remote_id:
-        raise StoreError("per-repo mode needs a remote id")
-    return per_repo_root(remote_id) / "shared" / "memories.sqlite"
-
-
 def qdrant_url(remote_id=None):
-    """URL embed and flush use. Loopback when no company host is configured."""
+    """URL embed.py uses. Loopback when no company host is configured."""
     config = database_config()
     if config["mode"] == "shared":
         return config["qdrant_url"]
@@ -206,81 +194,10 @@ def mark_embedded(pairs, remote_id=None):
 
 
 def container_ready(url):
+    """True when Qdrant at url answers /readyz. embed.py checks it before it writes."""
     target = url.rstrip("/") + "/readyz"
     try:
         with urlopen(target, timeout=3) as response:
             return 200 <= response.status < 300
     except (HTTPError, URLError, TimeoutError, OSError):
         return False
-
-
-def flush(remote_id=None):
-    """Copy pending rows into the container SQLite file when /readyz answers.
-
-    The laptop file is unchanged when the container is down.
-    """
-    mode = database_config()["mode"]
-    selected = remote_id if mode == "per-repo" else None
-    try:
-        url = qdrant_url(selected)
-        local_path = local_db_path(selected)
-        shared_path = shared_db_path(selected)
-    except StoreError as error:
-        print(str(error))
-        return 1
-    if not container_ready(url):
-        print(f"container unreachable at {url}")
-        return 0
-    if not local_path.is_file():
-        print("no local memories")
-        return 0
-    local = connect(local_path)
-    try:
-        pending = _pending_flush(local)
-        if not pending:
-            print("nothing to flush")
-            return 0
-        shared = connect(shared_path)
-        applied = []
-        conflicts = []
-        try:
-            shared.execute("BEGIN IMMEDIATE")
-            for row in pending:
-                current = shared.execute(
-                    f"SELECT {', '.join(COPY_COLUMNS)} FROM memory WHERE id = ?",
-                    (row["id"],),
-                ).fetchone()
-                if current is None or current["updated_at"] < row["updated_at"]:
-                    _upsert_shared(shared, row, _commits_by_id(local, [row["id"]])[row["id"]])
-                    applied.append(row)
-                elif _content(current) == _content(row):
-                    applied.append(row)
-                else:
-                    conflicts.append(row["id"])
-            shared.execute("COMMIT")
-        except sqlite3.Error as error:
-            if shared.in_transaction:
-                shared.execute("ROLLBACK")
-            raise StoreError(f"could not flush: {error}") from error
-        finally:
-            shared.close()
-        local.execute("BEGIN IMMEDIATE")
-        for row in applied:
-            local.execute(
-                """
-                UPDATE memory
-                SET flushed_at = updated_at
-                WHERE id = ? AND updated_at = ?
-                """,
-                (row["id"], row["updated_at"]),
-            )
-        local.execute("COMMIT")
-    except StoreError:
-        raise
-    finally:
-        local.close()
-    for document_id in conflicts:
-        print(document_id)
-    print(f"flushed {len(applied)}")
-    return 0
-

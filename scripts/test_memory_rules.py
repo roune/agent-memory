@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import agent_memory_server
 import memory_rules
+from stub_server import StubServer
 
 A = "a" * 40
 B = "b" * 40
@@ -139,6 +140,9 @@ class ApproveUsesTheRulesTest(unittest.TestCase):
         config = home / ".config" / "agent-memory"
         config.mkdir(parents=True)
         (config / "identity").write_text("org = Org\nteam = Team\nperson = tester\n", encoding="utf-8")
+        self.server = StubServer()
+        self.addCleanup(self.server.close)
+        (config / "server").write_text(f"url = {self.server.url}\n", encoding="utf-8")
         os.environ["HOME"] = str(home)
         os.environ["AGENT_MEMORY_DIR"] = str(Path(self.tmp.name) / "store")
         spec = importlib.util.spec_from_file_location("agent_memory_rules_under_test", SCRIPTS / "agent_memory.py")
@@ -166,12 +170,18 @@ class ApproveUsesTheRulesTest(unittest.TestCase):
             },
         }
 
+    def sent(self, approved, expected):
+        """approve() sent build_document's document without its id, and the server built the same id."""
+        self.assertEqual(approved["status"], "sent")
+        self.assertEqual(approved["id"], expected["id"])
+        self.assertEqual(self.server.posts("/v1/memories")[-1], {k: v for k, v in expected.items() if k != "id"})
+
     def test_a_change_matches_build_document(self):
         approved = self.cli.approve(self.bundle(), "change", "code", "why\r\nit changed", commit=B, subject="x")
         expected = memory_rules.build_document(
             **fields(kind="change", text="why\nit changed", commit=B, commits=[A, B], pull_request=4, subject="x")
         )
-        self.assertEqual(approved, expected)
+        self.sent(approved, expected)
         self.assertFalse(self.cli.session_dir("git", "s1").exists())
 
     def test_a_learning_matches_build_document(self):
@@ -179,7 +189,7 @@ class ApproveUsesTheRulesTest(unittest.TestCase):
         expected = memory_rules.build_document(
             **fields(domain="operations", text="watch the queue", record="runbook")
         )
-        self.assertEqual(approved, expected)
+        self.sent(approved, expected)
 
     def test_approve_reports_the_shared_messages(self):
         bundle = self.bundle()
@@ -193,6 +203,7 @@ class ApproveUsesTheRulesTest(unittest.TestCase):
                 self.cli.approve(bundle, *args, **kwargs)
             self.assertEqual(str(raised.exception), message)
         self.assertTrue(self.cli.session_dir("git", "s1").exists())
+        self.assertEqual(self.server.posts("/v1/memories"), [], "a rule the CLI checks never reaches the server")
 
     def test_cli_lists_are_the_shared_lists(self):
         self.assertIs(self.cli.KINDS, memory_rules.KINDS)

@@ -1,17 +1,17 @@
 #!/bin/sh
-# Create data/qdrant and data/server, and start the Qdrant server. No account, no client library.
-# The embed step talks to http://127.0.0.1:6333. It does not open this directory.
-#
-# The agent-memory server is behind the compose profile `server` until the
-# cutover, so this doesn't start it. Try it with:
-#   docker compose --profile server up -d --build
+# Start Qdrant and the agent-memory server, wait for /v1/health, and point the
+# CLI at the server: ~/.config/agent-memory/server, if it is missing.
+# No account, no client library. Only the server's port is published, on
+# 127.0.0.1:8765; Qdrant is reachable only from the server.
 
 set -eu
 
 cd "$(dirname "$0")/.."
 
+URL="http://127.0.0.1:8765"
+
 if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required to start Qdrant" >&2
+  echo "docker is required to start the server and Qdrant" >&2
   exit 1
 fi
 
@@ -24,18 +24,35 @@ touch .env
 grep -q '^AGENT_MEMORY_UID=' .env || echo "AGENT_MEMORY_UID=$(id -u)" >> .env
 grep -q '^AGENT_MEMORY_GID=' .env || echo "AGENT_MEMORY_GID=$(id -g)" >> .env
 
-docker compose up -d
+# --build, so an upgrade of this clone runs its own server code.
+docker compose up -d --build
 
+ready=""
 i=0
-while [ "$i" -lt 60 ]; do
-  if curl -fsS "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; then
-    echo "Qdrant is ready at http://127.0.0.1:6333"
-    exit 0
+while [ "$i" -lt 120 ]; do
+  if curl -fsS "$URL/v1/health" >/dev/null 2>&1; then
+    ready=yes
+    break
   fi
   i=$((i + 1))
   sleep 1
 done
+if [ -z "$ready" ]; then
+  echo "The server did not answer $URL/v1/health. Recent logs:" >&2
+  docker compose logs --tail 40 server qdrant >&2
+  exit 1
+fi
+echo "The agent-memory server is ready at $URL"
 
-echo "Qdrant did not become ready. Recent logs:" >&2
-docker compose logs --tail 40 qdrant >&2
-exit 1
+config="$HOME/.config/agent-memory/server"
+if [ -f "$config" ]; then
+  echo "Left $config as it is."
+else
+  # Mode 0600, and the mode the legacy database file had (shared by default).
+  python3 -c '
+import sys
+sys.path.insert(0, "scripts")
+import server_client
+print("Wrote", server_client.write_config(sys.argv[1], None, server_client.legacy_mode()))
+' "$URL"
+fi

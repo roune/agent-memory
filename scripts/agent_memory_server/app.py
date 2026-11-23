@@ -298,7 +298,10 @@ def create_app(settings, store, embedding, retry_seconds=None):
 
     async def refused(request, error):
         headers = {"WWW-Authenticate": "Bearer"} if error.status == 401 else None
-        return JSONResponse({"error": str(error)}, status_code=error.status, headers=headers)
+        body = {"error": str(error)}
+        if error.code:
+            body["code"] = error.code
+        return JSONResponse(body, status_code=error.status, headers=headers)
 
     async def bad_request(request, error):
         return JSONResponse({"error": str(error)}, status_code=400)

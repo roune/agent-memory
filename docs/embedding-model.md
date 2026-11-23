@@ -2,7 +2,7 @@
 
 Checked 5 November 2026. This answers section 3 of [research.md](research.md).
 
-Default model: **BAAI/bge-small-en-v1.5**, embedded from the quantized ONNX checkpoint `Qdrant/bge-small-en-v1.5-onnx-Q` at revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55`. The upstream weights are `BAAI/bge-small-en-v1.5` at `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. FastEmbed 0.9.1 runs that ONNX file. `scripts/embed` downloads the pinned revision into `data/models/bge-small-en-v1.5-onnx-q/` and upserts the approved rows of `data/memories.sqlite`.
+Default model: **BAAI/bge-small-en-v1.5**, embedded from the quantized ONNX checkpoint `Qdrant/bge-small-en-v1.5-onnx-Q` at revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55`. The upstream weights are `BAAI/bge-small-en-v1.5` at `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. FastEmbed 0.9.1 runs that ONNX file. The server image bakes the pinned revision in at `/opt/agent-memory/models`, and the server embeds each approved row when it keeps it.
 
 | | |
 | --- | --- |
@@ -13,20 +13,20 @@ Default model: **BAAI/bge-small-en-v1.5**, embedded from the quantized ONNX chec
 | Size | About 67 MB quantized. 33.4 million parameters. 512 token input |
 | CPU cost | On this machine, loading the ONNX file took 0.13s and embedding the one-sentence decision took 0.01s |
 
-Documents are embedded with no query instruction. BGE v1.5 still suggests prepending `Represent this sentence for searching relevant passages: ` to a short query at retrieval time. Passages do not get that prefix. Retrieval is not built yet. A later query path has to use the same checkpoint and that split, or the scores will not match these vectors.
+Documents are embedded with no query instruction. BGE v1.5 still suggests prepending `Represent this sentence for searching relevant passages: ` to a short query at retrieval time. Passages do not get that prefix. The server's MCP `search` embeds the query with that prefix, through `embed_query`, with the same checkpoint.
 
-A second machine gets the same vectors by running `scripts/embed`, which fetches revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55` and FastEmbed 0.9.1. The collection is `memories`. Switching checkpoints means deleting that collection and embedding the documents again.
+A second machine gets the same vectors from the same image, which holds revision `aa8f8b060edb00e03bfdd08813a2949946c8ba55` and FastEmbed 0.9.1. The collection is `memories-fastembed-384-2d705fdd`; the legacy `memories` collection from before the server is dropped by `scripts/embed --prune`. Switching checkpoints means a new collection and a reindex.
 
 A hosted model is a different vector space, so switching to it means embedding every row again. Its vectors are never mixed into an index built with this one. A later cloud deploy runs this same ONNX file next to Qdrant. Approved documents stay the source of truth either way.
 
 ## Choosing the embedder
 
-[`scripts/embedder.py`](../scripts/embedder.py) holds the interface. `scripts/embed` asks it for the configured embedder, and a query path asks for the same one. Two environment variables choose it:
+[`scripts/embedder.py`](../scripts/embedder.py) holds the interface. The server asks it for the configured embedder, for writes and for queries alike. Two environment variables choose it:
 
 | Variable | Default | Today |
 | --- | --- | --- |
-| `AGENT_MEMORY_EMBEDDER` | `fastembed` | Only `fastembed` is implemented. Any other value stops `scripts/embed` with an error that points to "Adding a provider" below. |
-| `AGENT_MEMORY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed runs only this model, at the pinned revision above. Any other name stops `scripts/embed` with an error that names the model and revision it runs. |
+| `AGENT_MEMORY_EMBEDDER` | `fastembed` | Only `fastembed` is implemented. Any other value stops the server at startup with an error that points to "Adding a provider" below. |
+| `AGENT_MEMORY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed runs only this model, at the pinned revision above. Any other name stops the server at startup with an error that names the model and revision it runs. |
 
 An embedder names its `provider`, `model`, `revision`, `dimension`, and `distance`. Each point's payload records `embedding_model` and `embedding_revision`. The vector length is checked against `dimension` before anything is written, and an existing collection of another size is refused.
 
@@ -47,6 +47,6 @@ OpenAI and AWS Bedrock are not implemented. They are left for a later plan PR, a
 
 A hosted provider sends the approved text to that provider. Review is still the redaction step, and nothing else leaves the machine: no transcript, and no draft that was never approved. Whether a deployment may send approved text to that provider is the deployment's decision to make.
 
-Switching an existing index to another model means embedding every approved row again. Today that is `scripts/embed --rebuild` with the new `AGENT_MEMORY_EMBEDDER`, which deletes the `memories` collection and builds it again at the new size. In shared mode it refuses `--repo`, because it would delete every repo's points but embed only one. [server-plan.md](server-plan.md) moves this to the server's `reindex`, which keeps one collection per model and refuses to start on a mismatch.
+Switching an existing index to another model means embedding every approved row again, into that model's own collection: stop the server, set the new `AGENT_MEMORY_EMBEDDER` in `.env`, run `agent-memory-server reindex`, and start it again ([server.md](server.md#commands)). The server refuses to start on a mismatch between the configured embedder and the active collection.
 
 Sources: [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), [Qdrant/bge-small-en-v1.5-onnx-Q](https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q), [FastEmbed 0.9.1 model list](https://qdrant.tech/documentation/embeddings/fastembed/).

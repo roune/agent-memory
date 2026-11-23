@@ -145,6 +145,15 @@ def target(remote_id=None, config=None):
     return url, token
 
 
+def token_for(url, config=None):
+    """The token for a server url: the server file's for its own url, else the tokens file's."""
+    config = config if config is not None else read_config()
+    url = clean_url(url)
+    if config is not None and url == config["url"]:
+        return config["token"]
+    return read_tokens().get(url)
+
+
 def _write_private(path, text):
     """Write text with mode 0600, also when the file already exists with looser bits."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,7 +287,11 @@ class Client:
             raise
 
     def commits_status(self, repo, shas):
-        return self.request("POST", "/v1/commits/status", {"repo": repo, "shas": list(shas)})["commits"]
+        answer = self.request("POST", "/v1/commits/status", {"repo": repo, "shas": list(shas)})
+        commits = answer.get("commits") if isinstance(answer, dict) else None
+        if not isinstance(commits, dict):
+            raise ServerUnreachable(f"{self.url}/v1/commits/status answered without commits; is that the agent-memory server?")
+        return commits
 
     def import_rows(self, memories, rejections):
         return self.request("POST", "/v1/admin/import", {"memories": list(memories), "rejections": list(rejections)})

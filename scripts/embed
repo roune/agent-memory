@@ -1,10 +1,49 @@
 #!/bin/sh
-# Embed pending SQLite rows into Qdrant.
-# The URL comes from ~/.config/agent-memory/database.
-# The default is http://127.0.0.1:6333. Fetches the pinned ONNX checkpoint on first run.
+# Approve embeds now: the server embeds each memory when it keeps it. This
+# wrapper is for the two jobs left, and goes away one release after the cutover:
+#
+#   scripts/embed --rebuild   embed every row again (reindex --rebuild)
+#   scripts/embed --prune     drop the collections of other models and the
+#                             legacy `memories` one (reindex --prune --yes --include-legacy)
+#
+# reindex takes the server's lock, so the server is stopped first and started
+# again afterwards, whatever reindex answers. Every other flag is refused,
+# --repo among them: the server embeds all repos into one collection.
 
 set -eu
 
 cd "$(dirname "$0")/.."
 
-exec uv run --python 3.12 --with "fastembed==0.9.1" python scripts/embed.py "$@"
+rebuild=""
+prune=""
+for arg in "$@"; do
+  case $arg in
+    --rebuild) rebuild=yes ;;
+    --prune) prune=yes ;;
+    *)
+      echo "scripts/embed: $arg is not supported any more. The server embeds on Approve;" >&2
+      echo "scripts/embed takes only --rebuild and --prune (docs/server.md, \"Commands\")." >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$rebuild" ] && [ -z "$prune" ]; then
+  echo "Nothing to do: Approve embeds now, on the server."
+  echo "scripts/embed --rebuild embeds every row again; --prune drops the collections of other models."
+  exit 0
+fi
+
+set --
+if [ -n "$rebuild" ]; then
+  set -- "$@" --rebuild
+fi
+if [ -n "$prune" ]; then
+  set -- "$@" --prune --yes --include-legacy
+fi
+
+docker compose stop server
+status=0
+docker compose run --rm server agent-memory-server reindex "$@" || status=$?
+docker compose start server
+exit "$status"

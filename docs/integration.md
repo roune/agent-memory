@@ -1,10 +1,10 @@
 # Integration plan
 
-How someone installs capture into Cursor, Claude Code, Codex, and Pi, and how that stays separate from the vector index. Decisions in [context.md](context.md) stay as they are. Hook payloads are in [harnesses.md](harnesses.md). The engine is Qdrant server, started by `scripts/setup`. The embedding model is `BAAI/bge-small-en-v1.5`, run by `scripts/embed`. See [embedding-model.md](embedding-model.md).
+How someone installs capture into Cursor, Claude Code, Codex, and Pi, and how that stays separate from the vector index. Decisions in [context.md](context.md) stay as they are. Hook payloads are in [harnesses.md](harnesses.md). The store is the agent-memory server in Docker, started with Qdrant by `scripts/setup`. The server embeds with `BAAI/bge-small-en-v1.5`. See [server.md](server.md) and [embedding-model.md](embedding-model.md).
 
 ## The seam
 
-The hook never opens the database. Approve writes a row in `data/memories.sqlite`, and the embed script reads those rows into Qdrant. The rows are the source of truth, so the engine chosen in the other session can change without a new hook.
+The hook never opens the database. The editor hooks make no network call, and the git hook makes one, a `commits/status` check with a 1-second timeout. Approve sends the document to the agent-memory server, which writes the row in its `memories.sqlite` and embeds it into Qdrant. The server's rows are the source of truth, so the engine or the model can change without a new hook.
 
 ```
 user-level hook or Pi extension
@@ -12,9 +12,11 @@ user-level hook or Pi extension
   -> inbox bundle on disk
 review command
   -> keep nothing, or change / learning / decision documents
-embed script, after the engine is chosen
-  -> vectors in data/
+  -> POST /v1/memories to the server, which embeds on write
+  -> outbox/ when the server doesn't answer; agent-memory sync sends it later
 ```
+
+The outbox holds approved documents and rejections only, never bundles or transcript paths. A git hook with `auto_approve` writes straight to the outbox, makes one `commits/status` call with a 1-second timeout, then starts `agent-memory sync` detached and returns. A session-end auto-approve queues without any call. For both, `sync` checks that commit with the server before it sends, and drops the item if the commit is already kept or rejected, so a status call that timed out never leads to a second memory.
 
 Retrieval at the next session start is still out.
 
@@ -67,7 +69,7 @@ The hook does not ask. Cursor `sessionEnd` ignores the response. Claude Code `Se
 
 Review opens in the browser. `agent-memory review` starts a process bound to `127.0.0.1` and a chosen port, then opens `http://127.0.0.1:<port>`. If that process is already running, the command only opens the URL. Cursor, Claude Code, Codex, and Pi do the same: a command or a link to that address. They do not each draw their own form.
 
-The page lists each offered session. A `change` asks for the context of one commit and stores that commit. The diff stays in git. A `learning` or `decision` asks for the note itself. The text can be edited before approval, which is the redaction step. Approve writes that document. Reject drops the bundle, and for a git bundle it remembers the commits so `land` and the git hooks do not offer them again. The transcript stays out of the index either way.
+The page lists each offered session. A `change` asks for the context of one commit and stores that commit. The diff stays in git. A `learning` or `decision` asks for the note itself. The text can be edited before approval, which is the redaction step. Approve sends that document to the server, or queues it in the outbox when the server can't be reached. Reject drops the bundle, and for a git bundle the server remembers the commits so `land` and the git hooks do not offer them again. The page says whether the server is connected or offline, how many items wait in the outbox, and lists the ones the server refused. The transcript stays out of the index either way.
 
 The end hook does not start this process and does not open the browser. Capture still writes the inbox and returns.
 
@@ -105,15 +107,17 @@ agent-memory          capture, review, install, uninstall
 adapters/             cursor, claude-code, codex shell snippets
 adapters/pi/          extension that shells out to capture
 inbox/                gitignored bundles
-data/                 gitignored: memories.sqlite (approved documents, the source of truth) and the vector index
+outbox/               gitignored: approved requests waiting for the server
+data/server/          gitignored: the server's memories.sqlite (the source of truth)
+data/qdrant/          gitignored: the vector index, which only the server reaches
 ```
 
-`capture` and `review` can land on their own. `scripts/embed` writes vectors for approved documents to the Qdrant server `scripts/setup` starts. Hooks stay pointed at `capture` either way.
+`capture` and `review` can land on their own. The server embeds approved documents into the Qdrant that `scripts/setup` starts next to it. Hooks stay pointed at `capture` either way.
 
 ## Out of this plan
 
 - No retrieval hook at session start.
 - No embedding inside the hook.
 - No per-repo index.
-- No cloud sync. A later sync step pushes approved documents only.
+- No cloud deploy. `agent-memory sync` sends approved documents only, to the server you connected.
 - No fifth product. Another agent is a new adapter on the same command.

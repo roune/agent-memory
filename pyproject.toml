@@ -38,6 +38,7 @@ py-modules = [
     "memory_points",
     "memory_rules",
     "memory_store",
+    "outbox",
     "server_client",
     "store_core",
 ]

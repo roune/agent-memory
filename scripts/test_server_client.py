@@ -22,7 +22,6 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
-from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -33,121 +32,12 @@ import agent_memory
 import memory_migrate
 import server_client
 import store_core
+from stub_server import StubServer
 
 HAVE_STARLETTE = all(importlib.util.find_spec(name) for name in ("starlette", "httpx"))
 
 REPO = "github.com/example/proj"
 OTHER = "github.com/example/other"
-
-
-class StubServer:
-    """The /v1 routes migrate, connect and list call, in memory. Newer updated_at wins on import."""
-
-    def __init__(self, token=None, person="tester", scopes=("read", "write", "admin")):
-        self.token = token
-        self.person = person
-        self.scopes = list(scopes)
-        self.rows = {}
-        self.rejections = set()
-        self.requests = []
-        self.fail_next = None
-        self.redirect_to = None
-        stub = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def _answer(self, status, payload):
-                raw = json.dumps(payload).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
-            def _handle(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b""
-                parts = urlsplit(self.path)
-                body = json.loads(raw) if raw else None
-                stub.requests.append(
-                    {"method": self.command, "path": parts.path, "query": parse_qs(parts.query), "headers": dict(self.headers), "body": body}
-                )
-                if stub.fail_next:
-                    status, payload = stub.fail_next
-                    stub.fail_next = None
-                    return self._answer(status, payload)
-                if parts.path == "/v1/health":
-                    return self._answer(200, {"status": "ok", "memories": len(stub.rows)})
-                if stub.token and self.headers.get("Authorization") != f"Bearer {stub.token}":
-                    return self._answer(401, {"error": "unknown or revoked token"})
-                return self._answer(*stub.route(self.command, parts.path, parse_qs(parts.query), body))
-
-            do_GET = do_POST = _handle
-
-            def handle_one_request(self):
-                if stub.redirect_to:
-                    self.raw_requestline = self.rfile.readline(65537)
-                    if not self.parse_request():
-                        return
-                    stub.requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers)})
-                    self.send_response(302)
-                    self.send_header("Location", stub.redirect_to + self.path)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                super().handle_one_request()
-
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_port}"
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-
-    def close(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-    def hit(self, document):
-        return memory_migrate.expected_hit(document)
-
-    def route(self, method, path, query, body):
-        if path == "/v1/whoami":
-            if self.token:
-                return 200, {"auth": "on", "person": self.person, "org": "Org", "team": "Team", "scopes": self.scopes, "label": None}
-            return 200, {"auth": "off", "person": "", "org": "", "team": "", "scopes": ["read", "write", "admin"]}
-        if path == "/v1/admin/import" and method == "POST":
-            written = 0
-            newer = []
-            for document in body["memories"]:
-                current = self.rows.get(document["id"])
-                if current is None or document["updated_at"] > current["updated_at"]:
-                    self.rows[document["id"]] = document
-                    written += 1
-                elif current["updated_at"] > document["updated_at"]:
-                    newer.append(document["id"])
-            added = 0
-            for rejection in body["rejections"]:
-                key = (rejection["repo"], rejection["sha"])
-                if key not in self.rejections:
-                    self.rejections.add(key)
-                    added += 1
-            return 200, {"written": written, "skipped": len(body["memories"]) - written, "rejections": added, "newer": newer}
-        if path == "/v1/memories" and method == "GET":
-            if "since" in query and query["since"][0] == "yesterday":
-                return 400, {"error": "since must be an ISO-8601 time, e.g. 2026-11-01T00:00:00+00:00"}
-            hits = [self.hit(row) for row in self.rows.values()]
-            if "repo" in query:
-                hits = [hit for hit in hits if hit["repo"] == query["repo"][0]]
-            return 200, {"memories": hits[: int(query.get("limit", ["20"])[0])]}
-        if path.startswith("/v1/memories/") and method == "GET":
-            found = self.rows.get(unquote(path[len("/v1/memories/") :]))
-            return (200, self.hit(found)) if found else (404, {"error": "no memory with that id"})
-        if path == "/v1/commits/status" and method == "POST":
-            return 200, {
-                "commits": {sha: {"kept": False, "rejected": (body["repo"], sha) in self.rejections} for sha in body["shas"]}
-            }
-        return 404, {"error": "not found"}
 
 
 def sha(number):
@@ -603,10 +493,10 @@ class ListTest(HomeCase):
         with self.assertRaisesRegex(SystemExit, "only used in per-repo mode"):
             run_cli(agent_memory.list_memories, **self.list_args(database=OTHER))
 
-    def test_without_a_server_list_reads_the_local_file(self):
+    def test_without_a_server_list_says_how_to_connect_and_never_reads_the_local_file(self):
         write_store(self.state / "data" / "memories.sqlite", fixture_rows(2))
-        code, out = run_cli(agent_memory.list_memories, **self.list_args())
-        self.assertEqual(len(json.loads(out)), 2)
+        with self.assertRaisesRegex(SystemExit, "agent-memory connect --url"):
+            run_cli(agent_memory.list_memories, **self.list_args())
 
 
 @unittest.skipUnless(HAVE_STARLETTE, "needs the server extra (scripts/test-server)")

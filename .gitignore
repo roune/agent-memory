@@ -1,5 +1,5 @@
-# Approved memories (data/memories.sqlite, the source of truth), the
-# vector index rebuilt from them, and local captures. They stay on this machine.
+# The server's store (data/server), Qdrant's (data/qdrant), the old laptop
+# store that migrate reads (data/memories.sqlite), and local captures.
 data/
 
 # Session captures and transcripts. These can contain secrets and
@@ -20,3 +20,6 @@ dist/
 .env
 .env.*
 !.env.example
+
+# Approved requests waiting for the server (agent-memory sync sends them).
+outbox/

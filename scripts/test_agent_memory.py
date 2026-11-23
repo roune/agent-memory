@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Integration tests: use a temp HOME and temp repo (subprocess)."""
+"""Integration tests: a temp HOME, a temp repo, and a stub server (the CLI runs as a subprocess)."""
 
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENT_MEMORY = ["python3", str(ROOT / "scripts" / "agent_memory.py")]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+
+from stub_server import StubServer
 
 
 def run_agent_memory(env, args, cwd=None, stdin=None):
@@ -25,20 +31,6 @@ def run_agent_memory(env, args, cwd=None, stdin=None):
     )
 
 
-def memory_rows(store):
-    import sqlite3
-
-    path = Path(store) / "data" / "memories.sqlite"
-    if not path.is_file():
-        return []
-    connection = sqlite3.connect(path)
-    connection.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in connection.execute("SELECT * FROM memory")]
-    finally:
-        connection.close()
-
-
 class AgentMemoryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -50,6 +42,10 @@ class AgentMemoryTest(unittest.TestCase):
         (cfg / "identity").write_text(
             "org = TestOrg\nteam = TestTeam\nperson = tester\n", encoding="utf-8"
         )
+        # The server Approve and Reject send to. Auth is off, as in the local compose file.
+        self.server = StubServer()
+        self.addCleanup(self.server.close)
+        (cfg / "server").write_text(f"url = {self.server.url}\n", encoding="utf-8")
 
         # A gh that always fails, first on PATH, so no test reaches GitHub.
         self.stub_bin = Path(self.tmp.name) / "stub-bin"
@@ -76,6 +72,19 @@ class AgentMemoryTest(unittest.TestCase):
         e = self._env(store)
         e["PATH"] = str(bare)
         return e
+
+    def rows(self):
+        """The memories the server keeps, oldest first."""
+        return sorted(self.server.rows.values(), key=lambda row: row["updated_at"] + row["id"])
+
+    def wait_for_rows(self, count, timeout=15):
+        """The hooks queue in the outbox and start a detached sync: wait for it to deliver."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if len(self.server.rows) >= count:
+                return self.rows()
+            time.sleep(0.05)
+        self.fail(f"expected {count} memories on the server, got {len(self.server.rows)}")
 
     def _land_bundles(self, store):
         return [
@@ -135,7 +144,7 @@ class AgentMemoryTest(unittest.TestCase):
         data = json.loads(bundles[0].read_text(encoding="utf-8"))
         self.assertEqual(data.get("tool"), "git")
         self.assertEqual((data.get("draft") or {}).get("text"), "add a file\n\nBody line.")
-        self.assertEqual(memory_rows(store), [])
+        self.assertEqual(self.rows(), [])
 
     def test_git_hook_auto_approve_writes_memory(self):
         store = Path(self.tmp.name) / "store2"
@@ -161,7 +170,7 @@ class AgentMemoryTest(unittest.TestCase):
         subprocess.run(["git", "add", "b.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "second commit"], cwd=repo, env=env, check=True)
 
-        rows = memory_rows(store)
+        rows = self.wait_for_rows(1)
         self.assertEqual(len(rows), 1)
         self.assertEqual(self._commit_rows(store), [(rows[0]["id"], self._head(repo))])
         inbox = store / "inbox" / "git"
@@ -191,7 +200,7 @@ class AgentMemoryTest(unittest.TestCase):
         (repo / "c.txt").write_text("z\n", encoding="utf-8")
         subprocess.run(["git", "add", "c.txt"], cwd=repo, env=env, check=True)
         subprocess.run(["git", "commit", "-m", "third"], cwd=repo, env=env, check=True)
-        self.assertEqual(len(memory_rows(store)), 1)
+        self.assertEqual(len(self.wait_for_rows(1)), 1)
 
     def _install(self, env, repo, hooks="true", auto="false"):
         result = run_agent_memory(
@@ -301,7 +310,7 @@ class AgentMemoryTest(unittest.TestCase):
             stdin=payload,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(memory_rows(store), [])
+        self.assertEqual(self.rows(), [])
         bundles = list((store / "inbox").glob("**/bundle.json"))
         self.assertEqual(len(bundles), 1)
 
@@ -334,7 +343,7 @@ class AgentMemoryTest(unittest.TestCase):
             stdin=end,
         )
         self.assertEqual(ended.returncode, 0, ended.stderr)
-        rows = memory_rows(store)
+        rows = self.wait_for_rows(1)
         self.assertEqual(len(rows), 1)
         document = rows[0]
         self.assertIn("session commit", document["text"])
@@ -346,7 +355,7 @@ class AgentMemoryTest(unittest.TestCase):
             capture_output=True,
             check=True,
         ).stdout.strip()
-        self.assertEqual(document["commit_sha"], head)
+        self.assertEqual(document["commit"], head)
 
     def test_land_includes_unpushed_local_commits(self):
         store = Path(self.tmp.name) / "store-land"
@@ -457,7 +466,7 @@ class AgentMemoryTest(unittest.TestCase):
         )
         result = subprocess.run(["python3", "-c", script], env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        texts = [row["text"] for row in memory_rows(store)]
+        texts = [row["text"] for row in self.rows()]
         self.assertEqual(texts, ["line one\n\nline two\nthree"])
 
     def _reject_bundles(self, env):
@@ -483,7 +492,7 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(len(self._land_bundles(store)), 2)
         self._reject_bundles(env)
         self.assertEqual(self._land_bundles(store), [])
-        self.assertEqual(memory_rows(store), [])
+        self.assertEqual(self.rows(), [])
 
         result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -516,23 +525,16 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(len([b for b in self._land_bundles(store) if b["land"]["pull_request"] == 5]), 1)
         self._approve_bundles(env)
-        kept = len(memory_rows(store))
+        kept = len(self.rows())
         result = run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("no new bundles", result.stdout)
         self.assertEqual(self._land_bundles(store), [])
-        self.assertEqual(len(memory_rows(store)), kept)
+        self.assertEqual(len(self.rows()), kept)
 
     def _commit_rows(self, store):
-        import sqlite3
-
-        connection = sqlite3.connect(Path(store) / "data" / "memories.sqlite")
-        try:
-            return connection.execute(
-                "SELECT memory_id, sha FROM memory_commit ORDER BY memory_id, position"
-            ).fetchall()
-        finally:
-            connection.close()
+        """(memory id, sha) for every commit each kept memory stores, in its order."""
+        return [(row["id"], sha) for row in sorted(self.rows(), key=lambda row: row["id"]) for sha in row.get("commits") or []]
 
     def _head(self, repo):
         return subprocess.run(
@@ -552,7 +554,7 @@ class AgentMemoryTest(unittest.TestCase):
         second = self._head(repo)
         run_agent_memory(env, ["land", str(repo), "--since", "48"], cwd=repo)
         self._approve_bundles(env)
-        rows = {row["commit_sha"]: row for row in memory_rows(store)}
+        rows = {row["commit"]: row for row in self.rows()}
         self.assertEqual(rows[second]["pull_request"], 5)
         pr_id = rows[second]["id"]
         self.assertEqual(
@@ -729,49 +731,6 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertNotIn("False>", page)
         self.assertIn(f'value="{first}" checked>', page)
         self.assertIn(f'value="{second}">', page)
-
-    def test_embed_loads_memories_without_new_stamps(self):
-        store = Path(self.tmp.name) / "embed-store"
-        store.mkdir(parents=True)
-        old = {
-            "id": "old-change-1",
-            "kind": "change",
-            "domain": "code",
-            "repo": "github.com/example/proj",
-            "tool": "git",
-            "session_id": "1",
-            "text": "older note",
-            "commit": "abc1234def",
-        }
-        previous = os.environ.get("AGENT_MEMORY_DIR")
-        previous_home = os.environ.get("HOME")
-        os.environ["AGENT_MEMORY_DIR"] = str(store)
-        os.environ["HOME"] = str(self.home)
-        try:
-            spec = importlib.util.spec_from_file_location(
-                "embed_under_test",
-                ROOT / "scripts" / "embed.py",
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            module.memory_store.save_approved(old)
-            loaded = module.load_memories()
-        finally:
-            if previous is None:
-                os.environ.pop("AGENT_MEMORY_DIR", None)
-            else:
-                os.environ["AGENT_MEMORY_DIR"] = previous
-            if previous_home is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = previous_home
-        self.assertEqual(loaded[0]["id"], "old-change-1")
-        payload = {
-            "org": loaded[0].get("org") or "",
-            "team": loaded[0].get("team") or "",
-            "person": loaded[0].get("person") or "",
-        }
-        self.assertEqual(payload, {"org": "", "team": "", "person": ""})
 
 
 if __name__ == "__main__":

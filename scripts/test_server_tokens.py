@@ -137,15 +137,16 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(auth.pin_identity(self.caller, {"person": "miguel"})["person"], "miguel")
         with self.assertRaises(auth.AuthError) as raised:
             auth.pin_identity(self.caller, {"person": "ana"})
-        self.assertEqual(raised.exception.status, 403)
+        self.assertEqual((raised.exception.status, raised.exception.code), (403, "identity"))
         self.assertIn("writes as miguel", str(raised.exception))
 
     def test_org_and_team_only_from_the_tokens_lists(self):
         allowed = auth.pin_identity(self.caller, {"org": "Acme EU", "team": "Infra"})
         self.assertEqual((allowed["org"], allowed["team"]), ("Acme EU", "Infra"))
         for body, message in (({"org": "Other"}, "org 'Other'"), ({"team": "Sales"}, "team 'Sales'")):
-            with self.assertRaisesRegex(auth.AuthError, message):
+            with self.assertRaisesRegex(auth.AuthError, message) as raised:
                 auth.pin_identity(self.caller, body)
+            self.assertEqual(raised.exception.code, "identity")
 
     def test_with_auth_off_the_body_is_used(self):
         body = {"person": "anyone", "org": "Any", "team": "Any"}
