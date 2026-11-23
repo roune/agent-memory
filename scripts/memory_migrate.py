@@ -179,24 +179,21 @@ def migrate(dry_run=False, out=None, client_for=None):
     out = out or sys.stdout
     client_for = client_for or (lambda url, token: server_client.Client(url, token))
     config = server_client.read_config()
-    # Where the laptop kept its files is the legacy database file's mode. The
-    # server file's mode only decides where each row goes.
+    # The laptop may hold files in both layouts, for example after a mode
+    # change, so both are read and nothing local is left behind. The legacy
+    # database file's mode names the one in use; the server file's mode only
+    # decides where each row goes. An id in both is refused by gather.
     mode = server_client.legacy_mode()
     paths = sources(mode)
-    if not paths:
-        elsewhere = sources(other_mode(mode))
-        if elsewhere:
-            print(
-                f"no local memories.sqlite in {mode} mode, but {elsewhere[0]} is a {other_mode(mode)} store; "
-                f"set mode = {other_mode(mode)} in ~/.config/agent-memory/database and rerun",
-                file=out,
-            )
-            return 1
+    other = sources(other_mode(mode))
+    if not paths and not other:
         print(f"no local memories.sqlite to migrate ({mode} mode)", file=out)
         return 0
     for path in paths:
         print(f"reading {path}", file=out)
-    groups = gather(paths, config)
+    for path in other:
+        print(f"reading {path} (a {other_mode(mode)} store; ~/.config/agent-memory/database says {mode})", file=out)
+    groups = gather(paths + other, config)
     if dry_run:
         for group in groups.values():
             print_counts(group, out)

@@ -550,6 +550,8 @@ class GitHookTest(GitCase):
         self.assertEqual(len(first_seen), 1, "the outbox was written before the first connection")
         [item] = self.queued()
         self.assertEqual((item["op"], item["body"]["commit"], item["server_url"]), ("memory", head, silent.url))
+        # The status call timed out, so sync must ask again before it sends.
+        self.assertEqual(item["unless_settled"], {"repo": REPO, "shas": [head]})
         self.assertEqual(self.bundles(), [])
         # The detached sync is waiting on the silent server too. Close it, so
         # that sync fails fast, records its try, and is done before cleanup.
@@ -568,6 +570,29 @@ class GitHookTest(GitCase):
         [row] = self.server.rows.values()
         self.assertEqual(row["commits"], [head])
         self.assertEqual(self.queued(), [])
+
+    def test_a_commit_kept_while_the_hooks_status_call_timed_out_gets_no_second_memory(self):
+        self.install(auto_approve=True)
+        original = StubServer.route
+        calls = []
+
+        def slow_first_status(stub, method, path, query, body):
+            if path == "/v1/commits/status" and not calls:
+                calls.append(body)
+                # A teammate keeps the commit meanwhile, and the hook's call times out.
+                stub.rows["mate-change-x"] = {"id": "mate-change-x", "commits": list(body["shas"]), "updated_at": "1", "text": "k"}
+                time.sleep(1.5)
+            return original(stub, method, path, query, body)
+
+        with mock.patch.object(StubServer, "route", slow_first_status):
+            self.commit("first")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and self.queued():
+                time.sleep(0.05)
+        self.assertEqual(len(calls), 1, "the hook made its status call")
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.server.posts("/v1/memories"), [], "sync asked again and dropped the item")
+        self.assertEqual(list(self.server.rows), ["mate-change-x"])
 
     def test_without_auto_approve_a_bundle_is_filed_and_nothing_is_queued(self):
         self.install(auto_approve=False)

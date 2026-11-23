@@ -1,6 +1,6 @@
 # Server plan
 
-Status: approved by Miguel on 21 November 2026, and amended on 22 November after an Opus review of PR 0 and PR 1. Each PR below says what it builds. The `context.md` wording changes near the end still need their own yes before PR 5.
+Status: approved by Miguel on 21 November 2026, and amended on 22 November after an Opus review of PR 0 and PR 1. Each PR below says what it builds. Miguel approved the `context.md` wording changes near the end on 22 November 2026.
 
 This plan moves agent-memory from laptop scripts to one server in Docker. It covers three things together, because each one shapes the others:
 

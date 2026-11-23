@@ -16,7 +16,7 @@ review command
   -> outbox/ when the server doesn't answer; agent-memory sync sends it later
 ```
 
-The outbox holds approved documents and rejections only, never bundles or transcript paths. A git hook with `auto_approve` writes straight to the outbox, makes one `commits/status` call with a 1-second timeout, then starts `agent-memory sync` detached and returns. A session-end auto-approve queues without any call; `sync` checks that commit with the server before it sends, and drops the item if the commit is already kept or rejected.
+The outbox holds approved documents and rejections only, never bundles or transcript paths. A git hook with `auto_approve` writes straight to the outbox, makes one `commits/status` call with a 1-second timeout, then starts `agent-memory sync` detached and returns. A session-end auto-approve queues without any call. For both, `sync` checks that commit with the server before it sends, and drops the item if the commit is already kept or rejected, so a status call that timed out never leads to a second memory.
 
 Retrieval at the next session start is still out.
 

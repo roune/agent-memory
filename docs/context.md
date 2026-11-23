@@ -31,7 +31,7 @@ Optional **linked-record** fields (for standing explanations, architecture histo
 - `look_at` — short names of signals or places to check (often for operations)
 - `supersedes`, `superseded_by`, `updates` — links between documents (when you file a newer explanation or runbook, stamp `superseded_by` on the old file; `approve` can also set `supersedes` to patch the old file in place)
 
-Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept. All three domains share the one `memories` collection. Search filters on `domain`. A second collection is for a different embedding model only.
+Approved memory documents are the source of truth. The vector index is derived from them, so the engine can change after research without losing what was kept. All three domains share one collection. Each embedding model gets its own, named after it, such as `memories-fastembed-384-2d705fdd`. Search filters on `domain`.
 
 ## Repo policy file (`.agent-memory.toml`)
 
@@ -87,7 +87,7 @@ post-commit / post-merge
 agent-memory land <path-to-repo> [--since …]
   -> inbox bundles under inbox/git/ (one per PR group or orphan commit), draft prefilled
 agent-memory review
-  -> same approve/reject flow; nothing is written to data/memories.sqlite until Approve
+  -> same approve/reject flow; nothing is written to the server's memories.sqlite until Approve
 ```
 
 `land` lists commits on that clone’s local default branch since `--since` (default: 24 hours before now). The branch name comes from `origin/HEAD` when that local branch exists; otherwise `main` or `master`. It does not read the remote-tracking ref, so unpushed local commits are included. It skips merge commits and groups single-parent commits by pull request when it can tell the PR (merge/squash message lines, or `gh pr list` when `gh` is available and authenticated). It does not store diffs. PR title/body and each commit message seed `draft.text`. Bundles use `tool` `git` and a stable `session_id` derived from the group.
