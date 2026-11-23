@@ -182,6 +182,17 @@ class RulesTest(unittest.TestCase):
         )
         self.assertEqual(memories[0]["updated_at"], "2026-11-01T01:30:00+00:00")
         self.assertEqual(rejections[0]["rejected_at"], "2026-11-01T01:00:00+00:00")
+        offsets = rules.import_from_body(
+            {
+                "memories": [
+                    {**row, "updated_at": "2026-11-01T01:30:00Z", "occurred_at": "2026-11-01T02:00:00+01:00"},
+                    {**row, "id": "tester-learning-s2", "session_id": "s2", "updated_at": "2026-11-01T01:30:00Z", "occurred_at": None},
+                ]
+            }
+        )[0]
+        self.assertEqual([item["occurred_at"] for item in offsets], ["2026-11-01T01:00:00+00:00", None])
+        with self.assertRaisesRegex(ValueError, "tester-learning-s1: occurred_at needs a time zone"):
+            rules.import_from_body({"memories": [{**row, "updated_at": "2026-11-01T01:30:00Z", "occurred_at": "2026-11-01T02:00:00"}]})
         for bad, message in (
             ("not-a-time", "tester-learning-s1: updated_at must be an ISO-8601 time"),
             ("2026-11-01T00:00:00", "tester-learning-s1: updated_at needs a time zone"),
@@ -222,11 +233,16 @@ class WriteTest(ServerCase):
     def test_import_keeps_ids_and_the_newer_row_wins(self):
         old = {**body(text="old"), "id": "someone-learning-x", "person": "someone", "updated_at": "2026-11-01T00:00:00+00:00"}
         result = self.store.import_rows([old], [{"repo": REPO, "sha": A, "rejected_at": ""}], "local")
-        self.assertEqual(result, {"written": 1, "skipped": 0, "rejections": 1})
+        self.assertEqual(result, {"written": 1, "skipped": 0, "rejections": 1, "newer": []})
         newer = {**old, "text": "newer", "updated_at": "2026-11-02T00:00:00+00:00"}
         older = {**old, "text": "older", "updated_at": "2026-10-01T00:00:00+00:00"}
         self.assertEqual(self.store.import_rows([newer], [], "local")["written"], 1)
-        self.assertEqual(self.store.import_rows([older, newer], [], "local"), {"written": 0, "skipped": 2, "rejections": 0})
+        self.assertEqual(
+            self.store.import_rows([older, newer], [], "local"),
+            {"written": 0, "skipped": 2, "rejections": 0, "newer": ["someone-learning-x"]},
+            "the older one is reported as newer on the server; the same updated_at is not",
+        )
+        self.assertEqual(self.store.import_rows([newer], [], "local")["newer"], [])
         kept = self.store.get_memory("someone-learning-x")
         self.assertEqual((kept["text"], kept["person"]), ("newer", "someone"))
         self.assertTrue(self.store.commit_rejected(A[:9], REPO))

@@ -6,6 +6,8 @@ Review is a page on 127.0.0.1. Approve writes the local SQLite database.
 `install` writes editor hooks only after a yes; with `--git-repo` it can also
 install git hooks and repo policy under `.agent-memory.toml`.
 Use `config` to change git hook policy and auto-approve without reinstalling.
+`connect` points the CLI at an agent-memory server, `migrate` copies the local
+store to it, and `list` reads from it once one is connected.
 """
 
 import argparse
@@ -27,8 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+import memory_migrate
 import memory_rules
 import memory_store
+import server_client
 HOME = Path.home()
 BIN = ROOT / "bin" / "agent-memory"
 PORT_START = 4173
@@ -2074,7 +2078,38 @@ def uninstall(args):
     return 0
 
 
+LIST_FILTERS = ("team", "org", "repo", "person", "since", "until", "kind", "domain", "tool", "session_id", "limit", "offset")
+
+
+def _server_config():
+    try:
+        return server_client.read_config()
+    except server_client.ConfigError as error:
+        raise SystemExit(str(error)) from None
+
+
+def list_from_server(args, config):
+    remote = (args.database or "").strip()
+    if config["mode"] == "shared" and remote:
+        raise SystemExit("database is only used in per-repo mode")
+    if config["mode"] == "per-repo" and not remote:
+        remote = git_remote_repo_id(os.getcwd())
+        if not remote:
+            raise SystemExit("per-repo list needs --database <remote id>")
+    try:
+        url, token = server_client.target(remote or None, config)
+        filters = {name: getattr(args, name) for name in LIST_FILTERS}
+        hits = server_client.Client(url, token).list_memories(**filters)
+    except (server_client.ConfigError, server_client.ServerError, server_client.ServerUnreachable) as error:
+        raise SystemExit(server_client.explain(error)) from None
+    print(json.dumps(hits, indent=2))
+    return 0
+
+
 def list_memories(args):
+    config = _server_config()
+    if config is not None:
+        return list_from_server(args, config)
     mode = memory_store.database_config()["mode"]
     remote = (args.database or "").strip()
     if mode == "shared" and remote:
@@ -2121,6 +2156,52 @@ def flush_cmd(args):
         return memory_store.flush(remote)
     except memory_store.StoreError as error:
         raise SystemExit(str(error)) from error
+
+
+def describe_caller(who):
+    if who.get("auth") == "off":
+        return "auth is off, so identity comes from ~/.config/agent-memory/identity"
+    scopes = ", ".join(who.get("scopes") or []) or "none"
+    label = f" (token {who.get('label')})" if who.get("label") else ""
+    return f"{who.get('person')} in {who.get('org')}/{who.get('team')}, scopes: {scopes}{label}"
+
+
+def connect_cmd(args):
+    """Check the server with /v1/whoami, then write the config. Nothing is written when the check fails."""
+    try:
+        url = server_client.clean_url(args.url)
+        token = server_client.check_token(sys.stdin.readline()) if args.token_stdin else None
+        if args.token_stdin and not token:
+            raise server_client.ConfigError("--token-stdin read an empty line")
+        existing = server_client.read_config()
+        mode = args.mode or (existing["mode"] if existing else server_client.legacy_mode())
+        who = server_client.Client(url, token).whoami()
+    except server_client.ConfigError as error:
+        raise SystemExit(str(error)) from None
+    except (server_client.ServerError, server_client.ServerUnreachable) as error:
+        raise SystemExit(server_client.explain(error)) from None
+    remote = (args.repo or "").strip()
+    if remote:
+        if existing is None or existing["mode"] != "per-repo":
+            raise SystemExit("--repo maps a remote in per-repo mode: connect the default server with --mode per-repo first")
+        servers, tokens = server_client.map_repo(remote, url, token)
+        print(f"{remote} now goes to {url} ({servers}, {tokens})")
+    else:
+        path = server_client.write_config(url, token, mode)
+        print(f"wrote {path} ({mode} mode)")
+    print(f"connected to {url} as {describe_caller(who)}")
+    if who.get("auth") == "on" and "write" not in (who.get("scopes") or []):
+        print("this token can't write: after the cutover, Approve needs a token with the write scope")
+    return 0
+
+
+def migrate_cmd(args):
+    try:
+        return memory_migrate.migrate(dry_run=args.dry_run)
+    except (server_client.ConfigError, memory_store.StoreError, FileNotFoundError) as error:
+        raise SystemExit(str(error)) from None
+    except (server_client.ServerError, server_client.ServerUnreachable) as error:
+        raise SystemExit(server_client.explain(error)) from None
 
 
 def build_parser():
@@ -2237,6 +2318,19 @@ def build_parser():
     list_parser.add_argument("--limit", type=int, default=20)
     list_parser.add_argument("--offset", type=int, default=0)
     list_parser.set_defaults(func=list_memories)
+
+    connect_parser = sub.add_parser("connect", help="point the CLI at an agent-memory server")
+    connect_parser.add_argument("--url", required=True, help="server URL, for example http://127.0.0.1:8765")
+    connect_parser.add_argument(
+        "--token-stdin", action="store_true", help="read the bearer token from the first line of stdin"
+    )
+    connect_parser.add_argument("--mode", choices=server_client.MODES, default=None, help="default: keep the current mode")
+    connect_parser.add_argument("--repo", default="", help="per-repo mode: send this remote id to --url")
+    connect_parser.set_defaults(func=connect_cmd)
+
+    migrate_parser = sub.add_parser("migrate", help="copy the local memories.sqlite to the connected server")
+    migrate_parser.add_argument("--dry-run", action="store_true", help="print the counts and send nothing")
+    migrate_parser.set_defaults(func=migrate_cmd)
 
     flush_parser = sub.add_parser("flush", help="copy pending rows to the container when it is reachable")
     flush_parser.add_argument(

@@ -5,8 +5,6 @@ only the fields of an approved document: any other key, transcript_path
 included, is refused, so nothing but reviewed text reaches the server.
 """
 
-from datetime import date, datetime, timezone
-
 import memory_rules
 
 # The fields of the document approve() builds.
@@ -62,40 +60,22 @@ def memory_from_body(body):
 
 
 def utc_timestamp(value, name):
-    """An ISO-8601 time with a zone, as UTC in the store's own format.
-
-    The store compares timestamps as text, so "newer wins" holds only when
-    every one is written the same way: 2026-11-01T00:00:00+00:00 (plus
-    microseconds when there are any). A Z suffix or another offset is
-    converted; a time without a zone, or not a time, is refused.
-    """
-    try:
-        parsed = datetime.fromisoformat(value.strip())
-    except (AttributeError, ValueError):
-        raise ValueError(f"{name} must be an ISO-8601 time, e.g. 2026-11-01T00:00:00+00:00") from None
-    if parsed.tzinfo is None:
-        raise ValueError(f"{name} needs a time zone, e.g. +00:00")
-    return parsed.astimezone(timezone.utc).isoformat()
+    """An ISO-8601 time with a zone, as UTC in the store's own format. See memory_rules.utc_time."""
+    return memory_rules.utc_time(value, name)
 
 
 def time_filter(value, name):
     """A since or until bound as UTC text, or None when blank. Refuses anything else.
 
-    The store compares occurred_at as text, so a bound must be written the way
-    the review flow writes it: UTC, 2026-11-01T00:00:00+00:00. A bare date means
-    its midnight in UTC. Without this, "yesterday" matched nothing and an offset
-    such as +01:00 compared wrongly, both with no error.
+    The store compares occurred_at as text, and every stored occurred_at is UTC
+    (memory_rules.build_document and the import convert it), so a bound must be
+    UTC too. A bare date means its midnight in UTC. Without this, "yesterday"
+    matched nothing and an offset such as +01:00 compared wrongly, both with no
+    error.
     """
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
-    if isinstance(value, str) and len(value.strip()) == 10:
-        try:
-            day = date.fromisoformat(value.strip())
-        except ValueError:
-            pass
-        else:
-            return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).isoformat()
-    return utc_timestamp(value, name)
+    return memory_rules.utc_time(value, name, allow_date=True)
 
 
 def _shas(value):
@@ -143,9 +123,15 @@ def _import_memory(item):
             memory_rules.check_commit(item["commit"])
         memory_rules.check_pull_request(item.get("pull_request"))
         updated_at = utc_timestamp(item["updated_at"], "updated_at")
+        # Rows from before the review flow converted it may hold another offset.
+        occurred_at = item.get("occurred_at")
+        if isinstance(occurred_at, str) and occurred_at.strip():
+            occurred_at = memory_rules.utc_time(occurred_at, "occurred_at", allow_date=True)
+        else:
+            occurred_at = None
     except ValueError as error:
         raise ValueError(f"{item['id']}: {error}") from None
-    return {**item, "updated_at": updated_at}
+    return {**item, "updated_at": updated_at, "occurred_at": occurred_at}
 
 
 def _import_rejection(item):

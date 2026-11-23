@@ -23,7 +23,7 @@ flowchart LR
 
 ### Where it is heading
 
-[docs/server-plan.md](docs/server-plan.md) moves the store into one server in Docker. Approve sends the note to the server, which embeds it on write. Editors read through MCP at `/mcp` (`search`, `get`, `list`; this repo's `.mcp.json` registers it). The server exists as a preview behind a compose profile ([docs/server.md](docs/server.md)), and the laptop flow above is unchanged until the cutover.
+[docs/server-plan.md](docs/server-plan.md) moves the store into one server in Docker. Approve sends the note to the server, which embeds it on write. Editors read through MCP at `/mcp` (`search`, `get`, `list`; this repo's `.mcp.json` registers it). The server exists as a preview behind a compose profile ([docs/server.md](docs/server.md)). `agent-memory connect` points the CLI at it, and `agent-memory migrate` copies the local store into it. Otherwise the laptop flow above is unchanged until the cutover.
 
 ```mermaid
 flowchart LR
@@ -98,6 +98,8 @@ agent-memory flush
 ```
 
 `flush` copies pending rows into the SQLite file mounted in the container when that URL answers `/readyz`, and leaves the laptop file unchanged when it does not.
+
+Once `agent-memory connect` has written `~/.config/agent-memory/server`, `list` asks the server instead of the local file. See [Connecting the CLI](docs/server.md#connecting-the-cli).
 
 File commits that are already on the local default branch. The window defaults to the last 24 hours. `--since` takes an ISO-8601 time or a number of hours ago. The branch name comes from `origin/HEAD` when that local branch exists, otherwise `main` or `master`, and unpushed local commits are included:
 
