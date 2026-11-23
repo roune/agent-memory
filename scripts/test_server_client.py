@@ -428,9 +428,22 @@ class MigrateTest(HomeCase):
     def test_files_in_the_other_mode_are_not_silently_skipped(self):
         self.write_config("database", "mode = per-repo\n")
         code, out = migrate()
-        self.assertEqual(code, 1)
-        self.assertIn("is a shared store; set mode = shared in ~/.config/agent-memory/database", out)
-        self.assertEqual(self.stub_server.requests, [])
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"reading {self.local} (a shared store; ~/.config/agent-memory/database says per-repo)", out)
+        self.assertEqual(len(self.stub_server.rows), 86)
+
+    def test_both_layouts_are_read_when_both_hold_files(self):
+        base = self.home / ".local" / "share" / "agent-memory" / "databases"
+        extra = fixture_rows(1, repo="github.com/acme/other", people=("ana",))
+        extra[0][0]["id"] = "ana-change-other"
+        write_store(base / "acme-other" / "memories.sqlite", extra)
+        code, out = migrate()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"reading {self.local}\n", out)
+        self.assertIn("databases/acme-other/memories.sqlite (a per-repo store", out)
+        self.assertEqual(len(self.stub_server.rows), 87)
+        self.assertIn("ana-change-other", self.stub_server.rows)
+        self.assertIn("verified: all 87 memories and 2 rejections are there", out)
 
     def test_an_id_in_two_local_files_is_refused(self):
         self.local.unlink()
