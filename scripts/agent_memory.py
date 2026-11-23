@@ -18,6 +18,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,12 +34,15 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 import editors
+import local_state
 import memory_migrate
 import memory_rules
 import memory_store
 import outbox
 import server_client
 HOME = Path.home()
+# The clone's own wrapper. Hooks point here only when install runs from a clone
+# without a tool install; see hook_bin().
 BIN = ROOT / "bin" / "agent-memory"
 PORT_START = 4173
 KINDS = memory_rules.KINDS
@@ -52,8 +56,8 @@ _CONFIG_BOOL_KEYS = frozenset({"capture", "git_hooks", "auto_approve"})
 
 
 def store_root():
-    override = os.environ.get("AGENT_MEMORY_DIR")
-    return Path(override) if override else ROOT
+    """inbox/, outbox/, review.json and capture.log: the XDG data directory, or AGENT_MEMORY_DIR."""
+    return local_state.root()
 
 
 def inbox_root():
@@ -65,7 +69,7 @@ def now():
 
 
 def log(message):
-    path = store_root() / "data" / "capture.log"
+    path = store_root() / "capture.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"{now()} {message}\n")
@@ -237,12 +241,14 @@ def git_hooks_installed(repo):
     return True
 
 
-def write_git_hooks(repo):
+def write_git_hooks(repo, command=None):
     """Install post-commit and post-merge hooks in the directory git will run.
 
     A hook we did not write is moved aside and called after ours. Reinstall
-    rewrites only our script and leaves that saved hook in place.
+    rewrites only our script and leaves that saved hook in place. The hooks run
+    command, by default the agent-memory running now (hook_bin()).
     """
+    command = command or hook_bin()
     repo = str(Path(repo).resolve())
     hooks_dir = git_hooks_dir(repo)
     if hooks_dir is None:
@@ -250,7 +256,7 @@ def write_git_hooks(repo):
     if hooks_dir.exists() and not hooks_dir.is_dir():
         raise SystemExit(f"git hooks path is not a directory: {hooks_dir}")
     hooks_dir.mkdir(parents=True, exist_ok=True)
-    bin_quoted = sh_quote(BIN)
+    bin_quoted = sh_quote(command)
     for name in ("post-commit", "post-merge"):
         path = hooks_dir / name
         user_path = hooks_dir / f"{name}.agent-memory-user"
@@ -2170,7 +2176,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
 
 def review_state_path():
-    return store_root() / "data" / "review.json"
+    return store_root() / "review.json"
 
 
 def review_alive(state):
@@ -2234,54 +2240,137 @@ def present_tools():
     return found
 
 
-def hook_command(tool, event):
-    return f"{BIN} capture --tool {tool} --event {event}"
+def hook_bin():
+    """The command the hooks run: the agent-memory that is running install.
+
+    A tool install (uv tool install) runs as a console script named
+    agent-memory, so the hooks get that path as it was called, without
+    resolving links: ~/.local/bin/agent-memory stays put across upgrades. Run
+    from a clone (bin/agent-memory, or python3 scripts/agent_memory.py), they
+    get the clone's bin/agent-memory, as before.
+    """
+    called = Path(sys.argv[0])
+    if called.name == "agent-memory" and called.is_file():
+        return Path(os.path.abspath(called))
+    if BIN.is_file():
+        return BIN
+    found = shutil.which("agent-memory")
+    if found:
+        return Path(os.path.abspath(found))
+    raise SystemExit(
+        "could not find the agent-memory command for the hooks to run. Install it with "
+        "`uv tool install git+https://github.com/roune/agent-memory`, then run `agent-memory install` again."
+    )
 
 
-def cursor_script():
+# A Claude Code or Codex hook entry is ours when its command runs
+# `agent-memory capture`, quoted or not. Files we write carry MARKER.
+_OURS_RE = re.compile(r"agent-memory['\"]? capture\b")
+
+
+def ours(command):
+    return isinstance(command, str) and (MARKER in command or bool(_OURS_RE.search(command)))
+
+
+def hook_command(tool, event, command):
+    return f"{shlex.quote(str(command))} capture --tool {tool} --event {event}"
+
+
+def cursor_script(command):
     return f"""#!/bin/sh
 # {MARKER}
-exec {BIN} capture --tool cursor
+exec {shlex.quote(str(command))} capture --tool cursor
 """
 
 
-def write_cursor(home):
-    hooks_dir = home / ".cursor" / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    script = hooks_dir / "agent-memory.sh"
-    script.write_text(cursor_script(), encoding="utf-8")
+def cursor_script_path(home):
+    return home / ".cursor" / "hooks" / "agent-memory.sh"
+
+
+def pi_extension_path(home):
+    return home / ".pi" / "agent" / "extensions" / "agent-memory" / "index.ts"
+
+
+def refuse_unmarked(path):
+    """A file at our path that we didn't write is someone else's: leave it."""
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise SystemExit(f"could not read {path}: {error}. Nothing was written.") from None
+    if MARKER not in text:
+        raise SystemExit(
+            f"{path} was not written by agent-memory (it has no {MARKER} line). "
+            "Move it aside, then run install again. Nothing was written."
+        )
+
+
+def check_writable(tool, home):
+    """Refuse before anything is written, so install changes all of the tools or none."""
+    if tool == "cursor":
+        refuse_unmarked(cursor_script_path(home))
+    elif tool == "pi":
+        refuse_unmarked(pi_extension_path(home))
+    elif tool == "codex" and codex_hooks_in_toml(home):
+        raise SystemExit(
+            "Codex already has [hooks] in ~/.codex/config.toml. Remove that table, then run install again. "
+            "This tool writes ~/.codex/hooks.json only. Nothing was written."
+        )
+
+
+def write_cursor(home, command):
+    script = cursor_script_path(home)
+    refuse_unmarked(script)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(cursor_script(command), encoding="utf-8")
     script.chmod(0o755)
     path = home / ".cursor" / "hooks.json"
     data = read_json(path) if path.is_file() else {"version": 1, "hooks": {}}
     hooks = data.setdefault("hooks", {})
     for event in ("stop", "sessionEnd"):
-        entries = [item for item in hooks.get(event, []) if "agent-memory.sh" not in item.get("command", "")]
-        entries.append({"command": "./hooks/agent-memory.sh"})
+        entries = list(hooks.get(event, []))
+        if not any("agent-memory.sh" in str(item.get("command", "")) for item in entries):
+            entries.append({"command": "./hooks/agent-memory.sh"})
         hooks[event] = entries
     write_json(path, data)
 
 
 def command_entries(existing, command):
+    """Point our entry at command where it is, keeping its other keys. Other entries stay as they are.
+
+    A second entry of ours is dropped. With none, a new group goes at the end.
+    """
+    placed = False
     kept = []
     for group in existing:
-        inner = [item for item in group.get("hooks", []) if MARKER not in item.get("command", "") and "agent-memory capture" not in item.get("command", "")]
+        inner = []
+        for item in group.get("hooks", []):
+            if ours(item.get("command", "")):
+                if placed:
+                    continue
+                item = dict(item)
+                item["command"] = command
+                placed = True
+            inner.append(item)
         if inner:
             group = dict(group)
             group["hooks"] = inner
             kept.append(group)
-    kept.append({"hooks": [{"type": "command", "command": command}]})
+    if not placed:
+        kept.append({"hooks": [{"type": "command", "command": command}]})
     return kept
 
 
-def write_claude(home):
+def write_claude(home, command):
     path = home / ".claude" / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = read_json(path) if path.is_file() else {}
     hooks = data.setdefault("hooks", {})
-    hooks["Stop"] = command_entries(hooks.get("Stop", []), hook_command("claude-code", "stop"))
+    hooks["Stop"] = command_entries(hooks.get("Stop", []), hook_command("claude-code", "stop", command))
     hooks["SessionEnd"] = command_entries(
         hooks.get("SessionEnd", []),
-        hook_command("claude-code", "session-end"),
+        hook_command("claude-code", "session-end", command),
     )
     write_json(path, data)
 
@@ -2296,7 +2385,7 @@ def codex_hooks_in_toml(home):
     return False
 
 
-def write_codex(home):
+def write_codex(home, command):
     if codex_hooks_in_toml(home):
         raise SystemExit("Codex already has [hooks] in ~/.codex/config.toml. Remove that table, then run install again. This tool writes ~/.codex/hooks.json only.")
     directory = home / ".codex"
@@ -2304,18 +2393,18 @@ def write_codex(home):
     path = directory / "hooks.json"
     data = read_json(path) if path.is_file() else {"hooks": {}}
     hooks = data.setdefault("hooks", {})
-    hooks["Stop"] = command_entries(hooks.get("Stop", []), hook_command("codex", "stop"))
+    hooks["Stop"] = command_entries(hooks.get("Stop", []), hook_command("codex", "stop", command))
     hooks["SessionEnd"] = command_entries(
         hooks.get("SessionEnd", []),
-        hook_command("codex", "session-end"),
+        hook_command("codex", "session-end", command),
     )
     write_json(path, data)
 
 
-def write_pi(home):
-    directory = home / ".pi" / "agent" / "extensions" / "agent-memory"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "index.ts"
+def write_pi(home, command):
+    path = pi_extension_path(home)
+    refuse_unmarked(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"""// {MARKER}
 import {{ spawn }} from "node:child_process";
@@ -2329,7 +2418,7 @@ function send(eventName: string, event: {{ reason?: string; aborted?: boolean }}
     reason: event?.reason,
     aborted: event?.aborted,
   }});
-  const child = spawn("{BIN}", ["capture", "--tool", "pi", "--event", eventName], {{
+  const child = spawn({json.dumps(str(command))}, ["capture", "--tool", "pi", "--event", eventName], {{
     stdio: ["pipe", "ignore", "ignore"],
   }});
   child.stdin.write(payload);
@@ -2347,6 +2436,55 @@ export default function (pi: any) {{
 """,
         encoding="utf-8",
     )
+
+
+def hooked_commands(home):
+    """The executables the hooks we marked run today, from each tool's files."""
+    found = []
+    for path in (home / ".claude" / "settings.json", home / ".codex" / "hooks.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        events = data.get("hooks") if isinstance(data, dict) else None
+        for groups in (events.values() if isinstance(events, dict) else []):
+            for group in groups if isinstance(groups, list) else []:
+                for item in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                    command = item.get("command") if isinstance(item, dict) else None
+                    if ours(command):
+                        found.append(_first_word(command))
+    try:
+        for line in cursor_script_path(home).read_text(encoding="utf-8").splitlines():
+            if line.startswith("exec "):
+                found.append(_first_word(line[len("exec "):]))
+    except (OSError, UnicodeDecodeError):
+        pass
+    try:
+        match = re.search(r'spawn\(("(?:[^"\\]|\\.)*")', pi_extension_path(home).read_text(encoding="utf-8"))
+        if match:
+            found.append(json.loads(match.group(1)))
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    return [Path(item) for item in found if item]
+
+
+def _first_word(command):
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return ""
+    return words[0] if words else ""
+
+
+def hooked_clones(home):
+    """Clones whose bin/agent-memory the hooks still run: where the old state may be."""
+    clones = []
+    for command in hooked_commands(home):
+        if command.name == "agent-memory" and command.parent.name == "bin":
+            clone = command.parent.parent
+            if local_state.is_clone(clone) and clone not in clones:
+                clones.append(clone)
+    return clones
 
 
 WRITERS = {
@@ -2372,24 +2510,36 @@ def install(args):
     if not tools and not args.git_repo:
         raise SystemExit("no Cursor, Claude Code, Codex, or Pi install was found (pass --git-repo for repo-only setup)")
 
+    command = hook_bin()
     if tools:
+        for tool in tools:
+            check_writable(tool, HOME)
         print("This will write capture hooks for:")
         for tool in tools:
             print(f"  {tool}")
-        print("Other hooks already in those files are left in place.")
+        print(f"They run {command}.")
+        print("Hooks this tool wrote are updated where they are. Other hooks in those files are left in place.")
         if not args.yes:
             if not sys.stdin.isatty():
                 raise SystemExit("re-run in a terminal, or pass --yes")
             answer = input("Write these hooks? [y/N] ").strip().lower()
-            if answer not in {"y", "yes"}:
+            write = answer in {"y", "yes"}
+            if not write:
                 print("editor hooks left unchanged")
-            else:
-                for tool in tools:
-                    WRITERS[tool](HOME)
-                    print(f"wrote {tool}")
         else:
+            write = True
+        if write:
+            # The hooks may still run an old clone's bin/agent-memory. Its
+            # inbox and outbox move here before the hooks stop pointing at it.
+            if not os.environ.get("AGENT_MEMORY_DIR"):
+                for clone in hooked_clones(HOME):
+                    move_state(clone)
+                    print(
+                        f"Git hooks set up from {clone} still run {clone / 'bin' / 'agent-memory'}. "
+                        "In each repo that has them, run `agent-memory config <repo> --git-hooks true`."
+                    )
             for tool in tools:
-                WRITERS[tool](HOME)
+                WRITERS[tool](HOME, command)
                 print(f"wrote {tool}")
 
     if args.git_repo:
@@ -2425,7 +2575,7 @@ def install(args):
                 auto_ap = False
 
         if want_git:
-            hooks_dir = write_git_hooks(str(repo))
+            hooks_dir = write_git_hooks(str(repo), command)
             print(f"wrote git hooks in {hooks_dir}")
         else:
             remove_git_hooks(str(repo))
@@ -2499,7 +2649,7 @@ def strip_commands(groups):
         inner = [
             item
             for item in group.get("hooks", [])
-            if MARKER not in item.get("command", "") and "agent-memory capture" not in item.get("command", "")
+            if not ours(item.get("command", ""))
         ]
         if inner:
             group = dict(group)
@@ -2518,7 +2668,7 @@ def uninstall(args):
             if not hooks[event]:
                 hooks.pop(event, None)
         write_json(cursor_hooks, data)
-    script = HOME / ".cursor" / "hooks" / "agent-memory.sh"
+    script = cursor_script_path(HOME)
     if script.is_file() and MARKER in script.read_text(encoding="utf-8"):
         script.unlink()
 
@@ -2542,7 +2692,7 @@ def uninstall(args):
                 hooks.pop(event, None)
         write_json(codex, data)
 
-    extension = HOME / ".pi" / "agent" / "extensions" / "agent-memory" / "index.ts"
+    extension = pi_extension_path(HOME)
     if extension.is_file() and MARKER in extension.read_text(encoding="utf-8"):
         shutil.rmtree(extension.parent)
     print("removed agent-memory hooks")
@@ -2987,9 +3137,48 @@ def build_parser():
     return parser
 
 
+def move_state(old_root):
+    """The one-time move of old_root's inbox/, outbox/ and the rest (local_state). It never stops a command."""
+    new_root = store_root()
+    try:
+        moved, left = local_state.move(old_root, new_root)
+    except OSError as error:
+        print(f"agent-memory: could not move the state in {old_root} to {new_root}: {error}", file=sys.stderr)
+        return
+    lines = [f"moved {source} to {target}" for source, target in moved]
+    lines += [f"left {source} where it is: {reason}" for source, reason in left]
+    for line in lines:
+        print(f"agent-memory: {line}", file=sys.stderr)
+        try:
+            log(line)
+        except OSError:
+            pass
+
+
+def move_old_state():
+    """State that sits where it was before the move: in this clone, or in AGENT_MEMORY_DIR's data/."""
+    override = os.environ.get("AGENT_MEMORY_DIR")
+    if override:
+        move_state(Path(override))
+        return
+    try:
+        local_state.ensure_root()
+    except OSError as error:
+        print(f"agent-memory: could not create {store_root()}: {error}", file=sys.stderr)
+        return
+    if local_state.is_clone(ROOT):
+        move_state(ROOT)
+    # Clones moved from before: an older CLI there (a git hook in a repo not
+    # set up again) may have filed new bundles since.
+    for old in local_state.recorded(store_root()):
+        if old != ROOT and local_state.is_clone(old):
+            move_state(old)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    move_old_state()
     result = args.func(args)
     raise SystemExit(0 if result is None else result)
 

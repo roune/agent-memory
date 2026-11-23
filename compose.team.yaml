@@ -1,0 +1,51 @@
+# A team server: the agent-memory server and Qdrant, with auth on, for people
+# who reach it from other machines through a reverse proxy that adds HTTPS.
+# docs/deploy.md has the steps. In .env next to this file, set at least:
+#
+#   AGENT_MEMORY_ALLOWED_HOSTS=memory.acme.internal    # the names people use
+#
+# then:
+#
+#   docker compose -f compose.team.yaml pull
+#   docker compose -f compose.team.yaml up -d
+#
+# Qdrant has no ports: only the server reaches it, on the compose network.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+
+  server:
+    # The published image, pinned to this release, as in compose.yaml. There is
+    # no `build:` here: a team server runs the published image.
+    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    # The ids that own data/server on this host (docs/deploy.md).
+    user: "${AGENT_MEMORY_UID:-1000}:${AGENT_MEMORY_GID:-1000}"
+    environment:
+      # Auth is on: AGENT_MEMORY_AUTH is not set, so every route but
+      # /v1/health needs a bearer token. Mint them with
+      # `docker compose -f compose.team.yaml exec server agent-memory-server token create`.
+      AGENT_MEMORY_QDRANT_URL: http://qdrant:6333
+      # The Host names the proxy passes on, from .env. 127.0.0.1:8765 comes
+      # first because the image's health check sends it.
+      AGENT_MEMORY_ALLOWED_HOSTS: "127.0.0.1:8765,${AGENT_MEMORY_ALLOWED_HOSTS:?set AGENT_MEMORY_ALLOWED_HOSTS in .env to the team host names, for example memory.acme.internal}"
+      AGENT_MEMORY_ALLOWED_ORIGINS: ${AGENT_MEMORY_ALLOWED_ORIGINS:-}
+      # Switching the embedder also needs a reindex (docs/server.md, "Commands").
+      AGENT_MEMORY_EMBEDDER: ${AGENT_MEMORY_EMBEDDER:-fastembed}
+      AGENT_MEMORY_EMBED_MODEL: ${AGENT_MEMORY_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      AGENT_MEMORY_QDRANT_API_KEY: ${AGENT_MEMORY_QDRANT_API_KEY:-}
+    ports:
+      # Loopback, for a reverse proxy on this host. Set AGENT_MEMORY_BIND to
+      # publish on another address, and only behind TLS: tokens are sent on
+      # every request.
+      - "${AGENT_MEMORY_BIND:-127.0.0.1}:8765:8765"
+    volumes:
+      - ./data/server:/data

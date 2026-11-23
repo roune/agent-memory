@@ -1,0 +1,80 @@
+#!/bin/sh
+# Start an agent-memory-server image, wait for /v1/health, check it, and remove it.
+#
+#   scripts/image-health <image> [<platform>]
+#
+# The container gets a throwaway name and no published port, and Qdrant is
+# absent, so this never touches a running stack. It checks that /v1/health
+# answers with auth on (the image's default) and that /v1/whoami needs a token.
+# With EXPECT_VERSION set, the image's org.opencontainers.image.version label
+# must equal it. With a platform, the container must run that architecture.
+#
+# The release workflow runs it on the published image, on an amd64 and an
+# arm64 runner. CI runs it on every PR against the same build, pushed to a
+# registry on the runner instead of GHCR.
+
+set -eu
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: scripts/image-health <image> [<platform>]" >&2
+  exit 2
+fi
+image=$1
+platform=${2:-}
+name="agent-memory-health-$$"
+tries=${HEALTH_TRIES:-180}
+
+trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+if [ -n "$platform" ]; then
+  docker run -d --name "$name" --platform "$platform" "$image" >/dev/null
+else
+  docker run -d --name "$name" "$image" >/dev/null
+fi
+
+# From the container, not the image: with the containerd image store,
+# `docker image inspect` reads the host platform's manifest, which may not be
+# the one that was pulled.
+if [ -n "${EXPECT_VERSION:-}" ]; then
+  label=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$name")
+  if [ "$label" != "$EXPECT_VERSION" ]; then
+    echo "$image is labelled version '$label', expected $EXPECT_VERSION" >&2
+    exit 1
+  fi
+fi
+
+i=0
+until docker exec "$name" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=4)" >/dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "$i" -ge "$tries" ]; then
+    echo "$image did not answer /v1/health. Its logs:" >&2
+    docker logs "$name" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+docker exec "$name" python -c "
+import json, platform, urllib.error, urllib.request
+health = json.load(urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=4))
+assert health['status'] == 'ok' and health['auth'] == 'on', health
+try:
+    urllib.request.urlopen('http://127.0.0.1:8765/v1/whoami', timeout=4)
+    raise SystemExit('/v1/whoami answered without a token')
+except urllib.error.HTTPError as error:
+    assert error.code == 401, error.code
+print('health:', json.dumps(health))
+print('machine:', platform.machine())
+"
+
+if [ -n "$platform" ]; then
+  want=${platform#linux/}
+  got=$(docker exec "$name" uname -m)
+  case "$want:$got" in
+    amd64:x86_64 | arm64:aarch64 | arm64:arm64) ;;
+    *)
+      echo "$image ran as $got, expected $platform" >&2
+      exit 1
+      ;;
+  esac
+fi
+echo "$image answers /v1/health${platform:+ on $platform}"

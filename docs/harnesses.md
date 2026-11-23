@@ -1,6 +1,6 @@
 # Harnesses
 
-One capture command, called from user-level hooks. `./scripts/install` puts `agent-memory` on `PATH`. `agent-memory install` writes the hooks, and it asks first. Facts below were checked on 2026-11-05 against current docs. Sources are linked on each tool.
+One capture command, called from user-level hooks. `./scripts/install` (or `uv tool install git+https://github.com/roune/agent-memory`) puts `agent-memory` on `PATH`. `agent-memory install` writes the hooks, and it asks first. Facts below were checked on 2026-11-05 against current docs. Sources are linked on each tool.
 
 The capture command copies what it needs into the local inbox and returns. It does not prompt, and it does not embed. It exits 0 and does not ask the agent to continue.
 

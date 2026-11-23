@@ -1,6 +1,10 @@
 #!/bin/sh
-# Put the agent-memory command on PATH. Does not write editor hooks.
-# Hook setup is a second step: agent-memory install, which asks first.
+# Put the agent-memory command on PATH from this clone: uv tool install --editable.
+# Changes in the clone take effect without installing again. Extra arguments
+# go to uv, for example --force.
+#
+# Does not write editor hooks. Hook setup is a second step: agent-memory
+# install, which asks first.
 
 set -eu
 
@@ -14,28 +18,48 @@ while [ -L "$self" ]; do
 done
 
 root=$(CDPATH= cd -- "$(dirname "$self")/.." && pwd)
-source="$root/bin/agent-memory"
-dest="${HOME}/.local/bin/agent-memory"
 
-if [ ! -x "$source" ]; then
-  echo "missing executable: $source" >&2
+if ! command -v uv >/dev/null 2>&1; then
+  echo "scripts/install needs uv: https://docs.astral.sh/uv/getting-started/installation/" >&2
   exit 1
 fi
 
-mkdir -p "${HOME}/.local/bin"
-ln -sfn "$source" "$dest"
+bin_dir=$(uv tool dir --bin)
+dest="$bin_dir/agent-memory"
 
-echo "Installed $dest"
-echo "It points at $source"
+# Before the tool install, this script linked $dest to a clone's
+# bin/agent-memory. uv won't replace a file it didn't write, so that old link
+# goes first. Anything else at $dest is left for uv to report.
+if [ -L "$dest" ]; then
+  target=$(readlink "$dest")
+  case $target in
+    /*) resolved=$target ;;
+    *) resolved="$bin_dir/$target" ;;
+  esac
+  case $resolved in
+    */bin/agent-memory)
+      clone=$(dirname "$(dirname "$resolved")")
+      if [ -f "$clone/scripts/agent_memory.py" ]; then
+        rm "$dest"
+        echo "Removed the old link $dest -> $target"
+      fi
+      ;;
+  esac
+fi
+
+uv tool install --editable "$root" "$@"
+
 echo
-echo "Next, connect the editors you want. This asks before it writes anything:"
+echo "agent-memory now runs this clone's code: $root"
+echo "Next, connect the editors you want. This asks before it writes anything,"
+echo "and points hooks an older install wrote at the new command:"
 echo "  agent-memory install"
 
 case ":$PATH:" in
-  *":${HOME}/.local/bin:"*) ;;
+  *":$bin_dir:"*) ;;
   *)
     echo
-    echo "${HOME}/.local/bin is not on PATH in this shell. Open a new terminal, or add it:"
-    echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    echo "$bin_dir is not on PATH in this shell. Run \`uv tool update-shell\`, or add it:"
+    echo "  export PATH=\"$bin_dir:\$PATH\""
     ;;
 esac
