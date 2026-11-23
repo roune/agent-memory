@@ -66,7 +66,7 @@ agent-memory migrate
 - It then reads every id back and compares it with what it sent. It checks every rejection with `/v1/commits/status`, prints the server's own count, and exits 1 if anything is missing or different.
 - A rerun is safe. The server keeps a row only when its `updated_at` is newer, so a second run writes nothing. A row the server holds at a later `updated_at`, such as one superseded there since the last run, is listed as "newer on the server" and kept. It doesn't count as a difference.
 - `--dry-run` prints the counts for each server (memories, rejected commits, repos, people) and sends nothing.
-- Which local files it reads depends on the legacy `database` file's mode, because that is where the laptop wrote: `data/memories.sqlite` in shared mode, or every file under `~/.local/share/agent-memory/databases/` in per-repo mode. The `server` file's mode decides only where each row goes. If no file is found in that mode but the other mode's location has one, migrate says so and exits 1.
+- It reads both local layouts: `data/memories.sqlite` (shared mode) and every file under `~/.local/share/agent-memory/databases/` (per-repo mode). The legacy `database` file's mode names the one in use, and a file in the other layout, left from a mode change, is read too and named in the output, so nothing on the laptop is left behind. An id found in two files is refused. The `server` file's mode decides only where each row goes.
 - The client never follows a redirect. urllib would send the token to whatever host the redirect names, so a 3xx is reported as an error.
 
 Since the cutover, Approve sends to the server. Run `migrate` once more after upgrading, so anything approved into the laptop file before the upgrade is copied too. Then `scripts/embed --prune` drops the legacy `memories` collection.
@@ -82,7 +82,7 @@ Approve and Reject send right away. When the server doesn't answer, or answers w
 - Each item is one JSON file in `outbox/`, next to `inbox/` in the CLI's state folder ([deploy.md](deploy.md#where-the-cli-keeps-its-state)), named `<utc stamp>-<uuid>.json`, mode 0600.
 - An item is `{server_url, op, body, created_at, attempts, last_error}`. `op` is `memory` or `rejection`. `body` is the request exactly as it would have been sent: approved text and tags, never a transcript path.
 - The token isn't stored in the item. `sync` takes the one the config files hold for `server_url` when it sends.
-- A session-end auto-approve adds `unless_settled: {repo, shas}`. The editor hook gets about a second, so it makes no call; `sync` asks `/v1/commits/status` first, and drops the item when the server already kept or rejected that commit.
+- A session-end or git-hook auto-approve adds `unless_settled: {repo, shas}`. The editor hook gets about a second, so it makes no call. The git hook makes one status call, which may time out. Either way `sync` asks `/v1/commits/status` first, and drops the item when the server already kept or rejected that commit, so a commit someone else explained gets no second memory.
 - A 403 with `"code": "identity"` (a person, org or team the token may not write as) is about that one item, so it goes to `outbox/failed/`. Any other 403 is about the token and keeps the queue.
 - An item keeps the `server_url` it was queued for. After `connect` to another URL, items for the old one wait until that server answers; send them there, or delete them from `outbox/`.
 
