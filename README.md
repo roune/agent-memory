@@ -131,7 +131,7 @@ agent-memory drop <session-id>
 agent-memory uninstall
 ```
 
-`note` files its draft under the tool `note`, in the repo you run it from. It stops if it can't find a remote repo id there (`origin`, or `repo` in `.agent-memory.toml`), because Approve would refuse it later. Notes kept before v0.1.0 stay on the server with the tool `cursor`.
+`note` files its draft under the tool `note`, in the repo you run it from. It stops if it can't find a remote repo id there (`repo` in `.agent-memory.toml`, else `origin`), because Approve would refuse it later. Notes kept before v0.1.0 stay on the server with the tool `cursor`, and so does an older note still in the inbox unless you pin its id again.
 
 There is no embed step: Approve embeds. To embed every row again, or to drop the collections of other models, `scripts/embed --rebuild` and `scripts/embed --prune` stop the server, run `agent-memory-server reindex`, and start it again.
 

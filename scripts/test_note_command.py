@@ -137,6 +137,16 @@ class NoteCommandTest(unittest.TestCase):
         self.assertNotEqual(self.note(repo).returncode, 0)
         self.assertTrue((legacy / "bundle.json").is_file())
 
+    def test_pinning_skips_an_unreadable_cursor_bundle_with_the_same_id(self):
+        repo = self.make_repo()
+        session = self.store / "inbox" / "cursor" / "my-note"
+        session.mkdir(parents=True)
+        (session / "bundle.json").write_text('{"tool": "cursor", "sess', encoding="utf-8")
+        result = self.note(repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((session / "bundle.json").is_file())
+        self.assertEqual(self.bundle("note")["tool"], "note")
+
     def test_pinning_keeps_a_cursor_session_with_the_same_id(self):
         repo = self.make_repo()
         session = self.store / "inbox" / "cursor" / "my-note"

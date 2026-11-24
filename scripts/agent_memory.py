@@ -1511,9 +1511,13 @@ def note(args):
     legacy_path = legacy / "bundle.json"
     replaces_legacy = False
     if legacy_path.is_file():
+        # Read it directly: read_json exits on bad JSON, and an unreadable
+        # cursor bundle is not a note to replace.
         try:
-            old = read_json(legacy_path)
-        except json.JSONDecodeError:
+            old = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old = {}
+        if not isinstance(old, dict):
             old = {}
         if old.get("event") == "note":
             previous = previous or old
