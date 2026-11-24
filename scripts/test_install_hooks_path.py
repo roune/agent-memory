@@ -234,6 +234,32 @@ class CursorFolderTest(Case):
         self.assertEqual(tree(folder), before)
         self.assertFalse((repo / ".git" / "hooks" / "post-commit").exists())
 
+    def test_config_false_from_a_subfolder_or_worktree_removes_the_links(self):
+        repo = self.repo()
+        self.commit(repo, "init")
+        folder = self.cursor_folder(repo)
+        before = tree(folder)
+        (repo / "sub").mkdir()
+        worktree = self.base / "wt"
+        git(repo, "worktree", "add", "-q", "-b", "wt", str(worktree))
+        for where in (repo / "sub", worktree):
+            self.assertEqual(self.install_git(repo)[0], 0)
+            code, out = self.run_cli("config", str(where), "--git-hooks", "false")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(tree(folder), before, where)
+            self.assertFalse(agent_memory.git_hooks_record_path().exists(), where)
+
+    def test_a_broken_record_does_not_stop_uninstall(self):
+        repo = self.repo()
+        self.cursor_folder(repo)
+        self.assertEqual(self.install_git(repo)[0], 0)
+        agent_memory.git_hooks_record_path().write_text("{not json", encoding="utf-8")
+        with mock.patch.object(agent_memory.editors, "remove_all", return_value=[]) as remove_all:
+            code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertIn("git hooks left in place", out)
+        remove_all.assert_called_once()
+
     def test_no_original_path_is_refused_and_nothing_is_written(self):
         repo = self.repo()
         folder = self.cursor_folder(repo, original="")

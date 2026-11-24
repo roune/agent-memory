@@ -320,6 +320,16 @@ def read_git_hooks_record():
     return data if isinstance(data, dict) else {}
 
 
+def git_hooks_record_key(repo):
+    """One key per repository: the main worktree's root, whichever subfolder or linked worktree names it."""
+    resolved = Path(repo).resolve()
+    common = run(["git", "rev-parse", "--git-common-dir"], str(resolved)) if resolved.is_dir() else ""
+    if not common:
+        return str(resolved)
+    common_dir = Path(os.path.realpath(resolved / common))
+    return str(common_dir.parent if common_dir.name == ".git" else common_dir)
+
+
 def write_git_hooks_record(record):
     path = git_hooks_record_path()
     record = {repo: entry for repo, entry in record.items() if entry.get("dirs") or entry.get("links")}
@@ -435,12 +445,13 @@ def write_git_hooks(repo, command=None):
         raise SystemExit(f"could not locate the git hooks directory for {repo}")
     _write_hook_scripts(scripts_dir, command)
 
+    key = git_hooks_record_key(repo)
     record = read_git_hooks_record()
-    entry = record.get(repo) or {}
+    entry = record.get(key) or {}
     dirs = [d for d in entry.get("dirs", []) if os.path.realpath(d) != os.path.realpath(scripts_dir)]
     dirs.append(str(scripts_dir))
     links = [link for link in entry.get("links", []) if Path(link).is_symlink()]
-    record[repo] = {"dirs": dirs, "links": links}
+    record[key] = {"dirs": dirs, "links": links}
     if cursor_dir is not None:
         try:
             for name in GIT_HOOK_NAMES:
@@ -487,7 +498,7 @@ def remove_git_hooks(repo):
     """
     repo = str(Path(repo).resolve())
     record = read_git_hooks_record()
-    entry = record.pop(repo, None) or {}
+    entry = record.pop(git_hooks_record_key(repo), None) or {}
     for link in entry.get("links", []):
         path = Path(link)
         if _dispatches(path, path.parent):
@@ -2930,9 +2941,13 @@ def uninstall(args):
         shutil.rmtree(extension.parent)
     print("removed agent-memory hooks")
 
-    for repo_s in list(read_git_hooks_record()):
-        remove_git_hooks(repo_s)
-        print(f"removed agent-memory git hooks (post-commit, post-merge) for {repo_s}")
+    try:
+        for repo_s in list(read_git_hooks_record()):
+            remove_git_hooks(repo_s)
+            print(f"removed agent-memory git hooks (post-commit, post-merge) for {repo_s}")
+    except SystemExit as error:
+        # Keep going: the MCP entries below are removed either way.
+        print(f"git hooks left in place: {error}")
 
     try:
         removed = editors.remove_all(HOME)
