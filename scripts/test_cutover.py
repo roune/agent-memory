@@ -896,7 +896,7 @@ echo "curl $@" >> {self.log}
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text().splitlines()
         # The port checks come first: the project list, then a health probe that fails here.
-        self.assertEqual(calls[:2], ["docker compose ls -a --format json", "curl -fsS http://127.0.0.1:8765/v1/health"])
+        self.assertEqual(calls[:2], ["docker compose ls -a --format json", "curl -fsS --max-time 2 http://127.0.0.1:8765/v1/health"])
         self.assertEqual(calls[2], "docker compose up -d --build")
         self.assertEqual(calls[3], "curl -fsS http://127.0.0.1:8765/v1/health")
         server = self.home / ".config" / "agent-memory" / "server"
@@ -937,11 +937,52 @@ echo "curl $@" >> {self.log}
         self.assertIn("docker compose -p agent-memory-server down", said)
         self.assertNotIn("already allocated", said)
 
-    def test_a_stopped_setup_project_counts_too(self):
+    def test_a_stopped_setup_project_holds_no_port_so_it_is_not_refused(self):
         self.listing.write_text('[{"Name":"agent-memory-server","Status":"exited(2)","ConfigFiles":"/srv/compose.yaml"}]\n')
+        result = self.setup_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_stopped_setup_project_counts_when_this_clone_has_the_same_project_name(self):
+        same = Path(self.tmp.name) / "agent-memory-server"
+        self.clone.rename(same)
+        self.clone = same
+        self.listing.write_text('[{"Name":"agent-memory-server","Status":"exited(2)","ConfigFiles":"/srv/compose.yaml"}]\n')
+        said = self.refused()
+        self.assertIn("stopped agent-memory-server compose project", said)
+        self.assertIn("docker compose -p agent-memory-server down", said)
+
+    def test_pretty_printed_json_is_read_too(self):
+        # A clone folder named agent-memory-server, whose own project is listed over several lines.
+        same = Path(self.tmp.name) / "agent-memory-server"
+        self.clone.rename(same)
+        self.clone = same
+        self.listing.write_text(
+            json.dumps([{"Name": "agent-memory-server", "Status": "running(2)", "ConfigFiles": f"{self.clone}/compose.yaml"}], indent=2) + "\n"
+        )
+        result = self.setup_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker compose up -d --build", self.log.read_text())
+
+    def test_pretty_printed_json_from_another_folder_is_refused(self):
+        self.listing.write_text(
+            json.dumps(
+                [
+                    {"Name": "other", "Status": "running(1)", "ConfigFiles": "/x/compose.yaml"},
+                    {"Name": "agent-memory-server", "Status": "running(2)", "ConfigFiles": "/srv/agent-memory/server/compose.yaml"},
+                ],
+                indent=2,
+            )
+            + "\n"
+        )
         self.assertIn("docker compose -p agent-memory-server down", self.refused())
 
+    def test_the_health_probe_has_a_time_limit(self):
+        self.assertIn("--max-time 2", (SCRIPTS / "setup").read_text())
+
     def test_a_clone_folder_named_agent_memory_server_is_its_own_project(self):
+        same = Path(self.tmp.name) / "agent-memory-server"
+        self.clone.rename(same)
+        self.clone = same
         self.listing.write_text(f'[{{"Name":"agent-memory-server","Status":"running(2)","ConfigFiles":"{self.clone}/compose.yaml"}}]\n')
         result = self.setup_run()
         self.assertEqual(result.returncode, 0, result.stderr)

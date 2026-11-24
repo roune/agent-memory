@@ -43,6 +43,24 @@ class VersionLineTest(unittest.TestCase):
         self.assertEqual(line(None, "0.3.0"), "")
         self.assertEqual(line([], "0.3.0"), "")
 
+    def test_a_newer_server_says_to_upgrade_the_cli(self):
+        said = server_client.version_line({"version": "0.4.0"}, "0.3.0", "http://127.0.0.1:8765")
+        self.assertEqual(said, "the server runs 0.4.0 and this CLI is 0.3.0: upgrade this CLI")
+        self.assertNotIn("agent-memory setup", said)
+        self.assertIn("upgrade this CLI", server_client.version_line({"version": "0.10.0"}, "0.9.0"))
+
+    def test_another_url_names_it_and_gives_no_setup_advice(self):
+        for health in ({"version": "0.2.0"}, {"version": "0.4.0"}, {}):
+            said = server_client.version_line(health, "0.3.0", "https://memory.acme.internal")
+            self.assertIn("https://memory.acme.internal", said)
+            self.assertIn("this CLI is 0.3.0", said)
+            self.assertNotIn("agent-memory setup", said)
+        self.assertIn("older than 0.2.0", server_client.version_line({}, "0.3.0", "http://127.0.0.1:9000"))
+
+    def test_loopback_8765_either_way_is_the_local_server(self):
+        for url in ("http://127.0.0.1:8765", "http://localhost:8765"):
+            self.assertIn("run `agent-memory setup`", server_client.version_line({"version": "0.2.0"}, "0.3.0", url))
+
 
 class ReviewWarningTest(Case):
     def review(self):
@@ -61,11 +79,25 @@ class ReviewWarningTest(Case):
     def test_a_different_version_prints_one_line(self):
         self.server.version = "0.2.0"
         said = self.review()
-        self.assertIn(f"the server runs 0.2.0 and this CLI is {CLI_VERSION}: run `agent-memory setup` to upgrade the server", said)
+        # The stub is on a random port, so it counts as a remote server: no setup advice.
+        self.assertIn(f"the server at {self.server.url} runs 0.2.0 and this CLI is {CLI_VERSION}", said)
+        self.assertNotIn("agent-memory setup", said)
         self.assertEqual(said.count("this CLI is"), 1)
 
+    def test_a_local_url_gets_the_setup_advice(self):
+        with mock.patch.object(server_client, "read_config", return_value={"url": "http://127.0.0.1:8765", "token": None, "mode": "shared"}):
+            with mock.patch.object(server_client.Client, "health", return_value={"status": "ok", "version": "0.2.0"}):
+                said = self.review()
+        self.assertIn(f"the server runs 0.2.0 and this CLI is {CLI_VERSION}: run `agent-memory setup` to upgrade the server", said)
+
+    def test_a_newer_server_says_to_upgrade_the_cli(self):
+        with mock.patch.object(server_client, "read_config", return_value={"url": "http://localhost:8765", "token": None, "mode": "shared"}):
+            with mock.patch.object(server_client.Client, "health", return_value={"status": "ok", "version": "0.9.0"}):
+                said = self.review()
+        self.assertIn(f"the server runs 0.9.0 and this CLI is {CLI_VERSION}: upgrade this CLI", said)
+
     def test_a_missing_version_says_older_than_0_2_0(self):
-        self.assertIn("the server runs a version older than 0.2.0", self.review())
+        self.assertIn("runs a version older than 0.2.0", self.review())
 
     def test_the_same_version_says_nothing(self):
         self.server.version = CLI_VERSION

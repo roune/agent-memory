@@ -18,16 +18,42 @@ fi
 # One server at a time can publish 127.0.0.1:8765. If `agent-memory setup`'s
 # project (agent-memory-server) runs from another folder, or another server
 # answers, say how to stop it, instead of Docker's "port is already allocated".
-# ls prints a JSON array; tr puts each project on its own line.
-projects="$(docker compose ls -a --format json 2>/dev/null | tr '}' '\n' || true)"
-other="$(printf '%s\n' "$projects" | grep -E '"Name": *"agent-memory-server"' | grep -vF "$PWD/compose.yaml" || true)"
-if [ -n "$other" ]; then
+# The project list is parsed in python3, which this script needs anyway, so a
+# pretty-printed answer works too. It prints "running" or "stopped" for an
+# agent-memory-server project from another folder. A stopped one holds no port,
+# so it counts only when this clone's own project name would be the same.
+own_name="${COMPOSE_PROJECT_NAME:-$(basename "$PWD" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9_-')}"
+other="$(docker compose ls -a --format json 2>/dev/null | python3 -c '
+import json, os, sys
+own_file, own_name = os.path.realpath(sys.argv[1]), sys.argv[2]
+try:
+    projects = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for item in projects if isinstance(projects, list) else []:
+    if not isinstance(item, dict) or item.get("Name") != "agent-memory-server":
+        continue
+    files = [os.path.realpath(part.strip()) for part in str(item.get("ConfigFiles") or "").split(",") if part.strip()]
+    if own_file in files:
+        continue
+    running = "running" in str(item.get("Status") or "").lower()
+    if running or own_name == "agent-memory-server":
+        print("running" if running else "stopped")
+        break
+' "$PWD/compose.yaml" "$own_name" || true)"
+if [ "$other" = running ]; then
   echo "Port 8765 is taken by the agent-memory-server compose project, which agent-memory setup runs from another folder." >&2
   echo "Stop it with: docker compose -p agent-memory-server down" >&2
   echo "Then run ./scripts/setup again. Its data stays in that folder's data/." >&2
   exit 1
 fi
-if curl -fsS "$URL/v1/health" >/dev/null 2>&1 && [ -z "$(docker compose ps -q 2>/dev/null || true)" ]; then
+if [ "$other" = stopped ]; then
+  echo "A stopped agent-memory-server compose project from another folder has this clone's project name, and starting here would replace its containers." >&2
+  echo "Remove it with: docker compose -p agent-memory-server down" >&2
+  echo "Then run ./scripts/setup again. Its data stays in that folder's data/." >&2
+  exit 1
+fi
+if curl -fsS --max-time 2 "$URL/v1/health" >/dev/null 2>&1 && [ -z "$(docker compose ps -q 2>/dev/null || true)" ]; then
   echo "Another agent-memory server already answers on $URL, and it isn't this clone's." >&2
   echo "Stop it with 'docker compose down' in the clone that runs it, or 'docker compose -p agent-memory-server down' if agent-memory setup runs it." >&2
   echo "Then run ./scripts/setup again." >&2

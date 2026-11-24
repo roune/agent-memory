@@ -143,7 +143,7 @@ agent-memory setup --dir ~/agent-memory-server
 For your own folder layout, or to see each step, do what `setup` does by hand:
 
 ```
-mkdir agent-memory-server && cd agent-memory-server
+mkdir my-agent-memory && cd my-agent-memory
 curl -fsSLO https://raw.githubusercontent.com/roune/agent-memory/v0.1.0/compose.yaml
 mkdir -p data/server data/qdrant
 printf 'AGENT_MEMORY_UID=%s\nAGENT_MEMORY_GID=%s\n' "$(id -u)" "$(id -g)" > .env
@@ -159,7 +159,7 @@ agent-memory install
 - **Create `data/server` first, and write `.env`.** On Linux, Docker creates a missing bind folder owned by root, and the server runs as the ids in `.env` (1000:1000 without them), so it couldn't write `memories.sqlite`. `scripts/setup` does both in a clone.
 - **`data/` next to `compose.yaml` is the store.** Back up `data/server/memories.sqlite`.
 - **`connect` writes `~/.config/agent-memory/server`.** `scripts/setup` writes it in a clone.
-- **Don't run it beside `setup`'s server.** A folder called `agent-memory-server` gets the compose project name `agent-memory-server`, the same one `setup` uses, and both publish port 8765. `setup` refuses to start when it sees that project running from another folder, and says which one. Pass `--dir` with this folder to let `setup` manage it.
+- **Don't run it beside `setup`'s server.** Both publish port 8765. The folder is called `my-agent-memory`, not `agent-memory-server`, because compose names its project after the folder, and `agent-memory-server` is the project name `setup` uses. `setup` refuses to start when it sees that project running from another folder, and says which one. Pass `--dir` with this folder to let `setup` manage it.
 
 To upgrade by hand, download `compose.yaml` from the new tag, then run `docker compose pull` and `docker compose up -d`. Then upgrade the CLI as the table below says.
 
@@ -182,15 +182,14 @@ The other ways to install the CLI will appear here as they exist.
 Qdrant may not read storage written more than one minor version back, which a CLI that skipped releases can cause. `memories.sqlite` is the source of truth and Qdrant is derived from it, so rebuild Qdrant's storage from the rows. In the server folder (`agent-memory setup --print-dir`):
 
 ```
-compose="docker compose -p agent-memory-server"
-$compose stop
+docker compose -p agent-memory-server stop
 mv data/qdrant data/qdrant.old
 mkdir data/qdrant
-$compose run --rm --no-build -T server agent-memory-server reindex
-$compose up -d --no-build
+docker compose -p agent-memory-server run --rm --no-build -T server agent-memory-server reindex --rebuild
+docker compose -p agent-memory-server up -d --no-build
 ```
 
-`reindex` embeds every row that the new storage lacks, and takes the server's lock, which is why the server is stopped first (see [server.md](server.md#embedding)). Delete `data/qdrant.old` once the server answers. In a clone, use `docker compose` without `-p`, and without `--no-build`.
+`--rebuild` matters. `memories.sqlite` still records every row as embedded, so a plain `reindex` would embed nothing, find an empty collection, and stop with an error. `--rebuild` drops the collection, forgets what it held, and embeds every memory again. `reindex` takes the server's lock, which is why the server is stopped first (see [server.md](server.md#embedding)). Delete `data/qdrant.old` once the server answers. In a clone, leave out `-p agent-memory-server` and `--no-build`.
 
 ### Why auth is off here, and when it must not be
 

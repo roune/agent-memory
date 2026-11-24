@@ -2803,7 +2803,7 @@ def warn_server_version():
         if config is None:
             return
         health = server_client.Client(config["url"], config["token"], PAGE_TIMEOUT).health()
-        line = server_client.version_line(health, cli_version())
+        line = server_client.version_line(health, cli_version(), config["url"])
     except (server_client.ConfigError, server_client.ServerError, server_client.ServerUnreachable, OSError):
         return
     if line:

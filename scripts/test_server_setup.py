@@ -746,13 +746,18 @@ class VersionWarningTest(SetupCase):
         self.assertNotIn("this CLI is", out + err)
 
     def test_a_different_version_gives_the_one_line(self):
-        self.answer = {"status": "ok", "version": "0.1.9"}
+        self.answer = {"status": "ok", "version": "0.0.9"}
         result, out, err = self.setup()
         self.assertEqual(result, 0)
         self.assertIn(
-            f"the server runs 0.1.9 and this CLI is {PINNED}: run `agent-memory setup` to upgrade the server",
+            f"the server runs 0.0.9 and this CLI is {PINNED}: run `agent-memory setup` to upgrade the server",
             err,
         )
+
+    def test_a_newer_server_says_to_upgrade_the_cli(self):
+        self.answer = {"status": "ok", "version": "9.0.0"}
+        _, _, err = self.setup()
+        self.assertIn(f"the server runs 9.0.0 and this CLI is {PINNED}: upgrade this CLI", err)
 
     def test_a_missing_version_says_older_than_0_2_0(self):
         self.answer = {"status": "ok"}
