@@ -1499,7 +1499,8 @@ def note(args):
     if not rr:
         raise SystemExit(
             f"note needs a remote repo id, and {repo} has none. Run it inside the git repo the memory is "
-            "about, with an origin remote or repo= in its .agent-memory.toml."
+            "about, with an origin URL such as https://github.com/owner/name or git@host:owner/name, "
+            "or set repo= in its .agent-memory.toml."
         )
     folder = session_dir(NOTE_TOOL, session_id)
     bundle_path = folder / "bundle.json"
@@ -1508,6 +1509,7 @@ def note(args):
     # replaces that one, so the id doesn't match two tools in keep and drop.
     legacy = session_dir("cursor", session_id)
     legacy_path = legacy / "bundle.json"
+    replaces_legacy = False
     if legacy_path.is_file():
         try:
             old = read_json(legacy_path)
@@ -1515,7 +1517,7 @@ def note(args):
             old = {}
         if old.get("event") == "note":
             previous = previous or old
-            shutil.rmtree(legacy)
+            replaces_legacy = True
     bundle = {
         "tool": NOTE_TOOL,
         "session_id": session_id,
@@ -1532,6 +1534,8 @@ def note(args):
         "draft": {"kind": args.kind, "domain": args.domain, "text": text},
     }
     write_json(bundle_path, bundle)
+    if replaces_legacy:
+        shutil.rmtree(legacy)
     print(f"pinned {session_id}")
     print("Open it with: agent-memory review")
 

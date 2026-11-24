@@ -125,6 +125,18 @@ class NoteCommandTest(unittest.TestCase):
         self.assertEqual(self.inbox(), ["note/my-note/bundle.json"])
         self.assertEqual(self.bundle("note")["started_at"], "2026-11-01T00:00:00+00:00")
 
+    def test_a_failed_write_keeps_the_note_filed_under_cursor(self):
+        repo = self.make_repo()
+        legacy = self.store / "inbox" / "cursor" / "my-note"
+        legacy.mkdir(parents=True)
+        (legacy / "bundle.json").write_text(
+            json.dumps({"tool": "cursor", "session_id": "my-note", "event": "note"}), encoding="utf-8"
+        )
+        # A file where the note folder goes, so the new bundle can't be written.
+        (self.store / "inbox" / "note").write_text("", encoding="utf-8")
+        self.assertNotEqual(self.note(repo).returncode, 0)
+        self.assertTrue((legacy / "bundle.json").is_file())
+
     def test_pinning_keeps_a_cursor_session_with_the_same_id(self):
         repo = self.make_repo()
         session = self.store / "inbox" / "cursor" / "my-note"
@@ -152,6 +164,14 @@ class NoteCommandTest(unittest.TestCase):
         result = self.note(repo)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("remote repo id", result.stderr)
+        self.assertEqual(self.inbox() if (self.store / "inbox").is_dir() else [], [])
+
+    def test_note_with_a_local_path_origin_fails_and_names_the_url_shape(self):
+        repo = self.make_repo(origin="/srv/git/proj.git")
+        result = self.note(repo)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("https://github.com/owner/name", result.stderr)
+        self.assertIn("repo=", result.stderr)
         self.assertEqual(self.inbox() if (self.store / "inbox").is_dir() else [], [])
 
     def test_note_takes_the_repo_id_from_agent_memory_toml(self):
