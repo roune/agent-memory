@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import hashlib
 import importlib.metadata
 import tomllib
@@ -2899,26 +2900,46 @@ class VersionAction(argparse.Action):
         parser.exit()
 
 
+def path_without_own_env():
+    """PATH minus the folder of the environment this code runs in.
+
+    uvx and `pipx run` put their temporary environment's bin first on PATH, so
+    a plain which() finds the cached copy itself. A tool install, pipx install
+    or Homebrew puts a link in another folder (~/.local/bin, $(brew --prefix)/bin),
+    which stays. The price: a pip install into an activated venv is refused too,
+    because its bin is the running environment's own.
+    """
+    own = os.path.realpath(sysconfig.get_path("scripts"))
+    keep = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry and os.path.realpath(entry) != own]
+    return os.pathsep.join(keep)
+
+
+def lasting_agent_memory():
+    """The agent-memory on PATH that isn't this run's own temporary environment, or None."""
+    return shutil.which("agent-memory", path=path_without_own_env())
+
+
 def lasting_command(command):
     """Refuse a command that won't be there when a hook fires: a uvx or pipx run.
 
     The clone's own bin/agent-memory is fine. Otherwise the running file must be
     the agent-memory on PATH, which is what a tool install or Homebrew gives.
-    uvx, `uvx --no-cache` and `pipx run` run a copy in a cache that a clean-up
-    removes, and that copy is not on PATH, so this needs no list of their folders.
     """
     if command == BIN:
         return command
-    found = shutil.which("agent-memory")
+    found = lasting_agent_memory()
     try:
         if found and os.path.samefile(found, sys.argv[0]):
             return command
     except OSError:
         pass
+    if found:
+        why = f"this is {command}; `agent-memory` on PATH is {found}"
+    else:
+        why = f"this is {command}, and no `agent-memory` that lasts is on PATH"
     raise SystemExit(
-        "this run of agent-memory won't last, so hooks that point at it would break. "
-        f"Install the CLI first with {INSTALL_HINT}, then run `agent-memory install` again. "
-        "Nothing was written."
+        f"{why}. Hooks that point at this run could break when it is cleaned up, so nothing was written. "
+        f"Install the CLI first with {INSTALL_HINT}, then run this command again."
     )
 
 
@@ -2936,9 +2957,11 @@ def hook_bin():
         return lasting_command(Path(os.path.abspath(called)))
     if BIN.is_file():
         return BIN
-    found = shutil.which("agent-memory")
+    # python -m agent_memory, or a script run by path: the command is the one on
+    # PATH, found without this run's own temporary environment.
+    found = lasting_agent_memory()
     if found:
-        return lasting_command(Path(os.path.abspath(found)))
+        return Path(os.path.abspath(found))
     raise SystemExit(
         "could not find the agent-memory command for the hooks to run. Install it with "
         f"{INSTALL_HINT}, then run `agent-memory install` again."

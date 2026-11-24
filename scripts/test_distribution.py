@@ -11,8 +11,10 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 import tomllib
 import unittest
+import venv
 from pathlib import Path
 from unittest import mock
 
@@ -132,24 +134,64 @@ class LastingInstallTest(Temp):
         settings = json.loads((self.home / ".claude" / "settings.json").read_text())
         return settings["hooks"]["Stop"][0]["hooks"][0]["command"]
 
-    def test_a_copy_that_is_not_on_path_is_refused_and_nothing_is_written(self):
-        # What uvx leaves: a console script in a cache folder, not on PATH.
-        copy = console_script(self.base / "uvx-cache", make_clone(self.base / "uvx-cache"))
+    def venv_script(self, name):
+        """A console script inside a real venv, as uvx and uv tool leave: its folder is that env's scripts folder."""
+        folder = self.base / name
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(folder)
+        clone = make_clone(self.base / name)
+        script = folder / "bin" / "agent-memory"
+        script.write_text(
+            f"#!{folder / 'bin' / 'python'}\nimport sys\nsys.path.insert(0, {str(clone / 'scripts')!r})\n"
+            "import agent_memory\nagent_memory.main()\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return script
+
+    def test_a_uvx_run_with_its_env_first_on_path_is_refused_and_nothing_is_written(self):
+        copy = self.venv_script("uvx-env")
         before = tree(self.home)
-        result = self.install(copy, self.path)
+        result = self.install(copy, f"{copy.parent}{os.pathsep}{self.path}")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("won't last", result.stderr)
+        self.assertIn(str(copy), result.stderr)
         self.assertIn(agent_memory.DIST, result.stderr)
-        self.assertIn("agent-memory install", result.stderr)
+        self.assertIn("run this command again", result.stderr)
         self.assertEqual(tree(self.home), before)
 
-    def test_a_copy_is_refused_when_another_agent_memory_is_on_path(self):
-        copy = console_script(self.base / "uvx-cache", make_clone(self.base / "uvx-cache"))
+    def test_a_copy_off_path_is_refused(self):
+        copy = console_script(self.base / "cache", make_clone(self.base / "cache"))
+        result = self.install(copy, self.path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(tree(self.home), {".claude": None})
+
+    def test_the_refusal_names_the_other_agent_memory_on_path(self):
+        copy = console_script(self.base / "cache", make_clone(self.base / "cache"))
         other = console_script(self.base / "other", make_clone(self.base / "other"))
         result = self.install(copy, f"{other.parent}{os.pathsep}{self.path}")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("won't last", result.stderr)
+        self.assertIn(f"this is {copy}; `agent-memory` on PATH is {other}", result.stderr)
         self.assertEqual(tree(self.home), {".claude": None})
+
+    def test_a_tool_bin_link_into_a_venv_installs(self):
+        target = self.venv_script("tool-env")
+        link = self.base / "tool-bin" / "agent-memory"
+        link.parent.mkdir()
+        link.symlink_to(target)
+        result = self.install(link, f"{link.parent}{os.pathsep}{self.path}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.hook_command(), f"{link} capture --tool claude-code --event stop")
+
+    def test_python_dash_m_uses_the_agent_memory_on_path(self):
+        found = self.base / "bin" / "agent-memory"
+        with mock.patch.object(agent_memory, "BIN", self.base / "none"), mock.patch.object(
+            agent_memory, "lasting_agent_memory", return_value=str(found)
+        ), mock.patch.object(sys, "argv", ["/site-packages/agent_memory.py", "install"]):
+            self.assertEqual(agent_memory.hook_bin(), found)
+
+    def test_the_running_envs_scripts_folder_is_dropped_from_path(self):
+        own = sysconfig.get_path("scripts")
+        with mock.patch.dict(os.environ, {"PATH": f"{own}{os.pathsep}/x/bin"}):
+            self.assertEqual(agent_memory.path_without_own_env(), "/x/bin")
 
     def test_the_tool_on_path_installs(self):
         tool = console_script(self.base / "tool", make_clone(self.base / "tool"))
