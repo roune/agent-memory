@@ -38,7 +38,7 @@ from starlette.routing import Route
 
 from store_core import StoreError
 
-from agent_memory_server import auth, mcp_tools, rules
+from agent_memory_server import auth, mcp_tools, package_version, rules
 
 log = logging.getLogger("agent_memory_server")
 
@@ -197,6 +197,7 @@ def create_app(settings, store, embedding, retry_seconds=None):
         return JSONResponse(
             {
                 "status": "ok",
+                "version": package_version(),
                 "auth": "off" if settings.auth_off else "on",
                 "qdrant": {"ready": qdrant_ready},
                 "embedder": embedding.status(),

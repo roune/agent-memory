@@ -322,6 +322,8 @@ class InstallTest(CliTemp):
         self.old_clone = make_clone(self.base / "old")
         self.old_bin = self.old_clone / "bin" / "agent-memory"
         self.tool = console_script(self.base, make_clone(self.base / "installed"))
+        # install writes hooks only from the agent-memory that is on PATH.
+        self.env["PATH"] = f"{self.tool.parent}{os.pathsep}{self.env['PATH']}"
         for name in (".claude", ".codex", ".cursor", ".pi/agent"):
             (self.home / name).mkdir(parents=True)
 

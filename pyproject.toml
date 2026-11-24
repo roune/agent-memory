@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-memory"
+name = "roune-agent-memory"
 version = "0.1.0"
 description = "File coding-agent sessions and git history, keep only what a person approves, and index that."
 readme = "README.md"

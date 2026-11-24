@@ -16,14 +16,34 @@ Modules:
   cli        `serve` and `reindex`
 """
 
+import importlib.metadata
 import importlib.util
 import sys
+import tomllib
+from pathlib import Path
+
+# The name on PyPI. This package can't import agent_memory, so it keeps its own
+# copy of agent_memory.DIST; a test checks that the two and pyproject agree.
+DIST = "roune-agent-memory"
 
 REQUIRED = ("mcp", "fastembed")
 INSTALL_HINT = (
     "this command needs the server extra: "
-    "uv tool install 'agent-memory[server] @ git+https://github.com/roune/agent-memory'"
+    f"uv tool install '{DIST}[server] @ git+https://github.com/roune/agent-memory'"
 )
+
+
+def package_version():
+    """The version of this package: its metadata, or pyproject.toml in a clone with no install."""
+    try:
+        return importlib.metadata.version(DIST)
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    try:
+        with open(Path(__file__).resolve().parents[2] / "pyproject.toml", "rb") as handle:
+            return tomllib.load(handle)["project"]["version"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return "unknown"
 
 
 def missing_modules(find_spec=importlib.util.find_spec):

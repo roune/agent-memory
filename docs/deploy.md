@@ -49,6 +49,18 @@ The rest of the clone's `data/` stays where it is: the server's `data/server`, Q
 
 Each entry keeps its place and its other keys, such as a `timeout`. Every other hook stays as it is. If a file at one of those paths has no marker, install stops before it writes anything and says which file it is.
 
+The CLI's distribution name is `roune-agent-memory`, and uv names the tool after it. The command is still `agent-memory`. If you installed it under the old name, switch once:
+
+```
+uv tool uninstall agent-memory
+uv tool install git+https://github.com/roune/agent-memory
+agent-memory install
+```
+
+From a clone, run `./scripts/install --force` instead of the second line. The hook path, `~/.local/bin/agent-memory`, doesn't change.
+
+`agent-memory install` refuses to write hooks from a run that won't last, such as `uvx` or `pipx run`: the copy it runs sits in a cache that gets cleaned. Install the CLI first, then run `agent-memory install`. `agent-memory --version` prints the installed version.
+
 ## Git hooks in a folder Cursor manages
 
 Cursor can set a repository's `core.hooksPath` to `~/.cursor/agent-hooks/<id>/`. It owns that folder: hook names there link to its `.dispatcher`, which runs the hooks path the repository had before (named in `.cursor-original-hooks-path`, usually `.git/hooks`) and then Cursor's own `<hook>.cursor*` files. A file written into that folder can vanish when Cursor rebuilds it.
@@ -64,7 +76,7 @@ So when `install --git-repo` or `config --git-hooks true` finds that folder, it:
 
 Any other `core.hooksPath` outside the repository's `.git/hooks` gets the hooks as before, and install names the folder, since another tool may manage it.
 
-The hooks run the command as it was called. For a tool install that's `~/.local/bin/agent-memory`, or uv's tool bin folder, which survives `uv tool upgrade agent-memory`. Run from a clone without the tool install, the hooks run `<clone>/bin/agent-memory`, as before.
+The hooks run the command as it was called. For a tool install that's `~/.local/bin/agent-memory`, or uv's tool bin folder, which survives `uv tool upgrade roune-agent-memory`. Run from a clone without the tool install, the hooks run `<clone>/bin/agent-memory`, as before.
 
 ## One laptop, from a clone
 
@@ -101,7 +113,7 @@ agent-memory install
 - **`data/` next to `compose.yaml` is the store.** Back up `data/server/memories.sqlite`.
 - **`connect` writes `~/.config/agent-memory/server`.** `scripts/setup` writes it in a clone.
 
-To upgrade, download `compose.yaml` from the new tag, then run `docker compose pull` and `docker compose up -d`. Then run `uv tool upgrade agent-memory`.
+To upgrade, download `compose.yaml` from the new tag, then run `docker compose pull` and `docker compose up -d`. Then run `uv tool upgrade roune-agent-memory`.
 
 ### Why auth is off here, and when it must not be
 
@@ -171,6 +183,14 @@ agent-memory connect --editor claude-code,cursor,codex
 ```
 
 `connect --editor` mints a read-only token for each editor, so editor files never hold the write token.
+
+## Windows (WSL 2)
+
+agent-memory doesn't run on native Windows. The CLI exits with a pointer to this section. Use WSL 2, where everything below works as it does on Linux.
+
+- **Install the CLI inside WSL**, in a WSL shell: `uv tool install git+https://github.com/roune/agent-memory`. The Windows `PATH` isn't enough, because the CLI is a Linux program.
+- **Docker** comes from Docker Desktop with its WSL integration turned on for your distribution, or from Docker Engine installed inside WSL. Run `docker compose` from the WSL shell too, so `data/` sits on the WSL filesystem.
+- **The editors have to run in WSL too.** That means Claude Code or Codex in a WSL shell, or Cursor or VS Code attached to WSL. A hook in the Windows-side `%USERPROFILE%\.cursor` can't run a CLI that lives in WSL, so don't point Windows-side editors at it.
 
 ## Releasing
 

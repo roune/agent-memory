@@ -32,11 +32,15 @@ already sent.
 """
 
 import contextlib
-import fcntl
 import json
 import os
 import uuid
 from datetime import datetime, timezone
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock. The CLI exits there before it gets this far.
+    fcntl = None
 
 import memory_rules
 import server_client
@@ -166,10 +170,12 @@ def lock(store_root):
     folder.mkdir(parents=True, exist_ok=True)
     handle = open(folder / ".lock", "a+")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
 
 
