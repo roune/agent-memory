@@ -71,10 +71,10 @@ To build the memory for one repository, from a clone of this repo:
 agent-memory install --git-repo /path/to/repo       # editor hooks, and git hooks for that repo
 agent-memory land /path/to/repo --since 2026-01-01  # file its git history, grouped by PR
 agent-memory review                                 # approve or reject the drafts
-agent-memory connect --editor claude-code           # give Claude Code the MCP tools
+agent-memory connect --editor claude-code           # MCP tools in your editor: claude-code, cursor, codex
 ```
 
-Pick a `--since` date before the repo's first commit. From then on, the hooks file new commits and sessions. Sessions from before the install are not captured.
+Pick a `--since` date before the repo's first commit. `--editor` takes a comma-separated list, such as `claude-code,cursor,codex`. Pi has no MCP entry. From then on, the hooks file new commits and sessions. Sessions from before the install are not captured.
 
 ## Features
 
