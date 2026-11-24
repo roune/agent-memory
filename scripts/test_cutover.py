@@ -768,13 +768,13 @@ class TokenWithAuthOffTest(ReviewPageCase):
 class EmbedWrapperTest(unittest.TestCase):
     """scripts/embed with a docker on PATH that only records its arguments."""
 
-    def run_embed(self, *args, run_code=0, up_code=0):
+    def run_embed(self, *args, run_code=0, up_code=0, interrupt=False):
         with tempfile.TemporaryDirectory() as folder:
             log = Path(folder) / "docker.log"
             docker = Path(folder) / "docker"
             docker.write_text(
                 f'#!/bin/sh\necho "$@" >> {log}\n'
-                f'case "$2" in run) exit {run_code} ;; up) exit {up_code} ;; esac\n',
+                f'case "$2" in run) {"kill -INT $PPID; " if interrupt else ""}exit {run_code} ;; up) exit {up_code} ;; esac\n',
                 encoding="utf-8",
             )
             docker.chmod(0o755)
@@ -807,6 +807,23 @@ class EmbedWrapperTest(unittest.TestCase):
         result, calls = self.run_embed("--rebuild", run_code=3)
         self.assertEqual(result.returncode, 3)
         self.assertEqual(calls[-1], "compose up -d server")
+        self.assertIn("refuses to start until reindex succeeds: docker compose logs server", result.stderr)
+
+    def test_a_good_reindex_prints_no_failure_hint(self):
+        result, _ = self.run_embed("--rebuild")
+        self.assertEqual(result.stderr, "")
+
+    def test_a_failed_restart_after_a_good_reindex_does_not_blame_reindex(self):
+        result, _ = self.run_embed("--rebuild", up_code=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("reindex failed", result.stderr)
+
+    def test_an_interrupted_reindex_still_starts_the_server(self):
+        result, calls = self.run_embed("--rebuild", interrupt=True)
+        self.assertEqual(result.returncode, 130)
+        self.assertIn("interrupted, starting the server again", result.stderr)
+        self.assertEqual(calls[-1], "compose up -d server")
+        self.assertEqual(calls.count("compose up -d server"), 1)
 
     def test_a_failed_restart_says_how_to_start_the_server(self):
         result, _ = self.run_embed("--rebuild", up_code=1)

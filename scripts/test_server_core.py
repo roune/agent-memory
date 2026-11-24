@@ -386,7 +386,7 @@ class ReindexTest(ServerCase):
         lines = []
         reindex(self.store, self.model, self.qdrant, prune=True, out=lines.append)
         self.assertIn("would delete: memories-old-8-00000000", lines)
-        self.assertTrue(any(line.startswith("keeping memories:") for line in lines))
+        self.assertTrue(any(line.startswith("keeping memories,") for line in lines))
         reindex(self.store, self.model, self.qdrant, prune=True, yes=True, out=lines.append)
         active = describe(self.model)["collection"]
         self.assertEqual(sorted(self.fake.collections), sorted([active, "memories", "unrelated"]))

@@ -70,6 +70,10 @@ class ReindexOutputTest(ServerCase):
             ],
         )
 
+    def test_one_point_and_one_memory_are_singular(self):
+        self.fill(1)
+        self.assertIn(f"{self.name} holds 1 point, one for each of the 1 memory in memories.sqlite", self.lines())
+
     def test_a_plain_reindex_reuses_the_collection_and_embeds_only_what_it_lacks(self):
         self.fill(1)
         self.embedding().embed_pending()
@@ -102,8 +106,7 @@ class ReindexOutputTest(ServerCase):
         self.assertEqual(
             printed[-3:],
             [
-                "keeping memories: the laptop's scripts/embed still writes it until the cutover "
-                "(pass --include-legacy to delete it too)",
+                "keeping memories, the collection from before the server (pass --include-legacy to delete it too)",
                 "would delete: memories-old-8-00000000, memories-older-8-11111111",
                 "run again with --prune --yes to delete them",
             ],
@@ -116,6 +119,12 @@ class ReindexOutputTest(ServerCase):
         printed = self.lines(prune=True, yes=True, include_legacy=True)
         self.assertEqual(printed[-2:], ["deleted memories", "deleted memories-old-8-00000000"])
         self.assertEqual(sorted(self.fake.collections), [self.name])
+
+    def test_prune_with_only_the_legacy_collection_says_nothing_else(self):
+        self.fake.collections["memories"] = empty_collection(384)
+        printed = self.lines(prune=True)
+        self.assertEqual(printed[-1], "nothing else to prune")
+        self.assertIn("memories", self.fake.collections)
 
     def test_prune_with_nothing_to_delete_says_so(self):
         self.fake.collections["unrelated"] = empty_collection()
