@@ -450,7 +450,7 @@ Once PRs 1 to 5 are merged:
 - **Skipping releases moves Qdrant several versions at once.** Qdrant may not read storage written more than one minor version back (unverified). If an upgrade leaves Qdrant unable to start:
   1. Move `data/qdrant` aside.
   2. Start again.
-  3. Run `agent-memory-server reindex` inside the server container. `memories.sqlite` is the source of truth, and Qdrant is derived from it.
+  3. Run `agent-memory-server reindex --rebuild` inside the server container. A plain `reindex` refuses, because `memories.sqlite` still marks every row as embedded. `memories.sqlite` is the source of truth, and Qdrant is derived from it.
 
   The Upgrades section in `deploy.md` gives those commands.
 - **WSL and editors on the Windows side.** Hooks written by a CLI in WSL live in WSL's home. An editor running on the Windows side doesn't read them. The WSL docs say so, rather than claim it works.
