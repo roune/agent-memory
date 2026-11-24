@@ -265,9 +265,10 @@ def create_app(settings, store, embedding, retry_seconds=None):
         counts = await run_in_threadpool(store.import_rows, memories, rejections, who.token_id)
         # Embed after the reply is sent. A batch of 50 on a cold model can take
         # longer than the CLI's 10-second timeout, and migrate needs only the
-        # rows: what is still pending shows in /v1/health and the retry loop
-        # finishes it if this run fails.
-        return JSONResponse(counts, background=BackgroundTask(embedding.embed_pending))
+        # rows: what is still pending shows in /v1/health. If another embed is
+        # running, this one returns at once rather than park a threadpool
+        # thread behind it; that embed or the retry loop takes these rows.
+        return JSONResponse(counts, background=BackgroundTask(embedding.embed_pending_if_idle))
 
     async def post_tokens(request):
         """A read-only child of the caller's token, for an editor. The same label replaces the earlier one.

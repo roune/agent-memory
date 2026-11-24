@@ -291,22 +291,30 @@ class ImportOverHttpTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "uvicorn did not start")
             time.sleep(0.02)
 
-        rows = [
-            {**body(session_id=f"s{n}"), "id": f"miguel-learning-{n}", "person": "miguel", "updated_at": "2026-11-01T00:00:00+00:00", "commits": []}
-            for n in range(3)
-        ]
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{port}/v1/admin/import",
-            data=json.dumps({"memories": rows}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=3) as response:
-            answer = json.load(response)
-        self.assertEqual(answer["written"], 3)
-        self.assertFalse(model.release.is_set())
+        def row(n):
+            return {**body(session_id=f"s{n}"), "id": f"miguel-learning-{n}", "person": "miguel", "updated_at": "2026-11-01T00:00:00+00:00", "commits": []}
+
+        def send(rows):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/admin/import",
+                data=json.dumps({"memories": rows}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.load(response)
+
+        self.assertEqual(send([row(n) for n in range(3)])["written"], 3)
         self.assertTrue(model.started.wait(5), "the import did not start embedding")
         self.assertEqual(store.count_pending(embedding.collection), 3)
+
+        # A migrate sends batch after batch while that embed is still held.
+        # Each batch must not park a threadpool thread behind it: anyio's pool
+        # has 40, and once they are all waiting every route stops answering.
+        for n in range(3, 48):
+            self.assertEqual(send([row(n)])["written"], 1, f"import {n} was not answered")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/health", timeout=3) as response:
+            self.assertEqual(json.load(response)["pending"], 48)
 
         model.release.set()
         deadline = time.monotonic() + 5
