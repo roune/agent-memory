@@ -524,7 +524,8 @@ class ReleaseCheckTest(Temp):
         super().setUp()
         self.copy = self.base / "repo-copy"
         (self.copy / "scripts").mkdir(parents=True)
-        for name in ("pyproject.toml", "compose.yaml", "compose.team.yaml"):
+        (self.copy / "scripts" / "agent_memory_assets").mkdir()
+        for name in ("pyproject.toml", "compose.yaml", "compose.team.yaml", "scripts/agent_memory_assets/compose.yaml"):
             shutil.copy2(ROOT / name, self.copy / name)
         shutil.copy2(ROOT / "scripts" / "release-check", self.copy / "scripts" / "release-check")
 
@@ -563,6 +564,34 @@ class ReleaseCheckTest(Temp):
 
     def test_no_tag_is_a_usage_error(self):
         self.assertEqual(self.check().returncode, 2)
+
+    def test_a_packaged_copy_that_differs_is_refused(self):
+        path = self.copy / "scripts" / "agent_memory_assets" / "compose.yaml"
+        path.write_text(path.read_text() + "# edited\n")
+        result = self.check(f"v{self.version()}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("scripts/agent_memory_assets/compose.yaml differs from compose.yaml", result.stderr)
+        self.assertNotIn("pins", result.stderr)
+
+    def test_a_packaged_copy_pinning_another_version_is_refused(self):
+        # The root file moves with it, so only the copy's pin is wrong and the bytes still match.
+        path = self.copy / "scripts" / "agent_memory_assets" / "compose.yaml"
+        path.write_text(path.read_text().replace(f"agent-memory-server:{self.version()}", "agent-memory-server:0.0.9"))
+        result = self.check(f"v{self.version()}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("scripts/agent_memory_assets/compose.yaml pins ghcr.io/roune/agent-memory-server at 0.0.9", result.stderr)
+        self.assertIn("differs from compose.yaml", result.stderr)
+
+
+class PackagedComposeTest(unittest.TestCase):
+    def test_the_packaged_copy_is_the_root_file(self):
+        packaged = ROOT / "scripts" / "agent_memory_assets" / "compose.yaml"
+        self.assertEqual(packaged.read_bytes(), (ROOT / "compose.yaml").read_bytes())
+
+    def test_compose_text_reads_it_through_importlib_resources(self):
+        import agent_memory_assets
+
+        self.assertEqual(agent_memory_assets.compose_text(), (ROOT / "compose.yaml").read_text(encoding="utf-8"))
 
 
 class ComposeFilesTest(unittest.TestCase):

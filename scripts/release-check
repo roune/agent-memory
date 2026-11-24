@@ -6,7 +6,9 @@
 
 The tag must be v<version>, with the version from pyproject.toml, and
 compose.yaml and compose.team.yaml must default to
-ghcr.io/roune/agent-memory-server:<version>. The release workflow runs it before
+ghcr.io/roune/agent-memory-server:<version>. The copy of compose.yaml that the
+wheel carries, scripts/agent_memory_assets/compose.yaml, must pin the same
+version and be byte-for-byte the root file. The release workflow runs it before
 it builds anything, and CI runs it on every PR with the current version, so a
 version bump that misses a compose file fails there first.
 """
@@ -18,7 +20,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "ghcr.io/roune/agent-memory-server"
-COMPOSE_FILES = ("compose.yaml", "compose.team.yaml")
+COMPOSE_FILES = ("compose.yaml", "compose.team.yaml", "scripts/agent_memory_assets/compose.yaml")
+PACKAGED = "scripts/agent_memory_assets/compose.yaml"
 # image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
 PIN = re.compile(r"^\s*image:\s*\$\{AGENT_MEMORY_IMAGE:-" + re.escape(IMAGE) + r":([^}\s]+)\}\s*$", re.MULTILINE)
 
@@ -39,6 +42,8 @@ def problems(tag, root=ROOT):
         if pins != [expected]:
             shown = ", ".join(pins) or "none"
             found.append(f"{name} pins {IMAGE} at {shown}; it should pin {expected}")
+    if (root / PACKAGED).read_bytes() != (root / "compose.yaml").read_bytes():
+        found.append(f"{PACKAGED} differs from compose.yaml; copy it: cp compose.yaml {PACKAGED}")
     return found
 
 
