@@ -181,6 +181,7 @@ def remember_dir(folder):
 class Found:
     compose: bytes = None  # the current compose.yaml, or None
     sidecar: dict = None  # .setup.json, or None when missing or unreadable
+    env: bytes = None  # the current .env, or None
 
     @property
     def ours(self):
@@ -204,6 +205,13 @@ def read_folder(folder):
             found.compose = compose.read_bytes()
     except OSError as error:
         raise SetupFailed(f"Could not read {compose}: {error.strerror}. Fix its permissions, then run agent-memory setup again.") from None
+    # .env too, so one that can't be read refuses here, before compose.yaml is touched.
+    env = folder / ".env"
+    try:
+        if env.exists():
+            found.env = env.read_bytes()
+    except OSError as error:
+        raise SetupFailed(f"Could not read {env}: {error.strerror}. Fix it, then run agent-memory setup again.") from None
     try:
         sidecar = json.loads((folder / SIDECAR).read_text(encoding="utf-8"))
         found.sidecar = sidecar if isinstance(sidecar, dict) else None
@@ -267,9 +275,10 @@ def check_docker(deps):
         )
 
 
-def running_projects(deps):
-    """[(name, [config files])] for each running compose project."""
-    ran = deps.run(["docker", "compose", "ls", "--format", "json"])
+def compose_projects(deps):
+    """[(name, status, [config files])] for each compose project, running or stopped."""
+    # -a: a stopped project still owns its containers, and up -d from here would recreate them.
+    ran = deps.run(["docker", "compose", "ls", "-a", "--format", "json"])
     if ran.returncode != 0:
         raise SetupFailed("docker compose ls failed, so setup can't tell what runs on port 8765. Check Docker, then run agent-memory setup again.")
     text = ran.stdout.strip()
@@ -287,33 +296,51 @@ def running_projects(deps):
     projects = []
     for item in listed:
         files = [part.strip() for part in str(item.get("ConfigFiles") or "").split(",") if part.strip()]
-        projects.append((str(item.get("Name") or ""), files))
+        projects.append((str(item.get("Name") or ""), str(item.get("Status") or ""), files))
     return projects
+
+
+def is_running(status):
+    return "running" in status.lower()
+
+
+def refuse_other_project(folder, status, files):
+    """Our project name, from files that aren't this folder's compose.yaml. Says how to stop it, never looping."""
+    state = "runs" if is_running(status) else "exists, stopped,"
+    if not files:
+        raise SetupFailed(
+            f"The {PROJECT} compose project {state} in another folder, and starting it here would replace its "
+            f"containers. Remove it with `docker compose -p {PROJECT} down`, then run agent-memory setup again."
+        )
+    down = shlex.join(["docker", "compose", "-p", PROJECT, *[part for path in files for part in ("-f", path)], "down"])
+    where = Path(files[0]).parent
+    real_files = {os.path.realpath(path) for path in files}
+    # --dir helps only when that folder's own compose.yaml is what runs. Otherwise
+    # (compose.team.yaml, say, or this very folder through another file) it would refuse again.
+    if os.path.realpath(where) != os.path.realpath(folder) and os.path.realpath(where / COMPOSE) in real_files:
+        raise SetupFailed(
+            f"The {PROJECT} compose project {state} in {where}, and starting it here would replace its containers. "
+            f"Run agent-memory setup --dir {shlex.quote(str(where))} to keep using that folder, or remove it with `{down}`."
+        )
+    raise SetupFailed(
+        f"The {PROJECT} compose project {state} from {', '.join(files)}, which setup doesn't manage, and starting it "
+        f"here would replace its containers. Remove it with `{down}`, then run agent-memory setup again."
+    )
 
 
 def check_port(folder, deps):
     """Port 8765 must be free, or held by this folder's own project, which setup then restarts."""
     own = os.path.realpath(folder / COMPOSE)
-    projects = running_projects(deps)
-    for name, files in projects:
+    projects = compose_projects(deps)
+    for name, status, files in projects:
         if name != PROJECT:
             continue
         if any(os.path.realpath(path) == own for path in files):
             return
-        if not files:
-            raise SetupFailed(
-                f"The {PROJECT} compose project already runs from another folder, and starting it here would replace it. "
-                f"Stop it with `docker compose -p {PROJECT} down`, then run agent-memory setup again."
-            )
-        where = str(Path(files[0]).parent)
-        stop = shlex.join(["docker", "compose", "-p", PROJECT, "-f", files[0], "down"])
-        raise SetupFailed(
-            f"The {PROJECT} compose project already runs from {where}, and starting it here would replace it. "
-            f"Run agent-memory setup --dir {shlex.quote(where)} to keep using that folder, or stop it with `{stop}`."
-        )
+        refuse_other_project(folder, status, files)
     holder = deps.port_holder()
     if holder == "agent-memory":
-        others = [f"{name} in {Path(files[0]).parent}" if files else name for name, files in projects]
+        others = [f"{name} in {Path(files[0]).parent}" if files else name for name, status, files in projects if is_running(status)]
         running = f" Running compose projects: {', '.join(others)}." if others else ""
         raise SetupFailed(
             f"Another agent-memory server already answers on {URL}, most likely a clone's ./scripts/setup.{running} "
@@ -379,10 +406,10 @@ def env_has(text, key):
     return re.search(rf"^\s*(?:export\s+)?{key}\s*=", text, re.MULTILINE) is not None
 
 
-def write_env(folder):
+def write_env(folder, found):
     """.env, mode 0600, with the host's uid and gid added when missing. Every other line stays."""
     path = folder / ".env"
-    old = path.read_bytes() if path.exists() else b""
+    old = found.env or b""
     text = old.decode("utf-8", errors="replace")
     add = []
     # The server runs as you, so the files it writes in data/server are yours.
@@ -390,7 +417,7 @@ def write_env(folder):
         add.append(f"AGENT_MEMORY_UID={os.getuid()}")
     if not env_has(text, "AGENT_MEMORY_GID"):
         add.append(f"AGENT_MEMORY_GID={os.getgid()}")
-    if not add and path.exists():
+    if not add and found.env is not None:
         os.chmod(path, 0o600)
         return
     separator = b"\n" if old and not old.endswith(b"\n") else b""
@@ -479,38 +506,53 @@ def wait_for_health(folder, deps):
 # Steps 11 and 12: the CLI, then the editors.
 
 
+@dataclass
+class CliConfig:
+    """What connect_cli found: whether the config names this server, why not, and a write that failed."""
+
+    this_server: bool
+    why_not: str = ""
+    failed: str = ""
+
+
 def connect_cli(deps):
-    """Write the CLI's server config when it's missing. Returns whether the config names this server."""
+    """Write the CLI's server config when it's missing, and say what it names."""
     path = server_client.config_dir() / "server"
     try:
         if not path.exists():
             # The mode the legacy database file had, or shared, as scripts/setup does.
             written = server_client.write_config(URL, None, server_client.legacy_mode())
             deps.out(f"Wrote {written}, so the CLI sends approved memories to {URL}.")
-            return True
+            return CliConfig(True)
         config = server_client.read_config()
     except server_client.ConfigError as error:
         deps.out(f"Left {path} as it is: {error}.")
         deps.out(f"To use this server, run: agent-memory connect --url {URL}")
-        return False
+        return CliConfig(False, "the CLI's server config can't be read")
+    except OSError as error:
+        return CliConfig(
+            False,
+            f"setup couldn't write {path}",
+            f"The server runs, but setup couldn't write {path}: {error.strerror}. Fix that, then run agent-memory connect --url {URL}.",
+        )
     if config is None:
         deps.out(f"Left {path} as it is. It names no server; to use this one, run: agent-memory connect --url {URL}")
-        return False
+        return CliConfig(False, "the CLI's server config names no server")
     if config["url"] in SAME_SERVER:
         deps.out(f"Left {path} as it is. It already points at {config['url']}.")
-        return True
+        return CliConfig(True)
     deps.out(f"Left {path} as it is. It points the CLI at {config['url']}, not at this server.")
     deps.out(f"To use this server instead, run: agent-memory connect --url {URL}")
-    return False
+    # connect --editor registers the servers the CLI's config names, which isn't this one.
+    return CliConfig(False, "the CLI points at another server")
 
 
-def offer_editors(found, names_this_server, options, deps):
+def offer_editors(found, cli, options, deps):
     """Ask once whether to add MCP to the editors found. Returns connect's exit code, or 0 when nothing ran."""
     if not found:
         return 0
-    if not names_this_server:
-        # connect --editor registers the servers the CLI's config names, which isn't this one.
-        deps.out("The CLI points at another server, so setup doesn't offer to add MCP to your editors.")
+    if not cli.this_server:
+        deps.out(f"Setup doesn't offer to add MCP to your editors, because {cli.why_not}.")
         return 0
     if options.no_input or not deps.interactive():
         return 0
@@ -565,7 +607,7 @@ def setup(options, deps):
             remember_dir(folder)
         make_folders(folder)
         write_compose(folder, found, deps.version, deps)
-        write_env(folder)
+        write_env(folder, found)
     except OSError as error:
         raise SetupFailed(f"Could not write {error.filename or folder}: {error.strerror}. Fix that, then run agent-memory setup again.") from None
 
@@ -573,10 +615,12 @@ def setup(options, deps):
     wait_for_health(folder, deps)
     deps.out(f"The agent-memory server is ready at {URL}, from {folder}.")
 
-    names_this_server = connect_cli(deps)
+    cli = connect_cli(deps)
     tools = [tool for tool in deps.present_tools() if tool not in editors.NO_MCP]
-    code = offer_editors(tools, names_this_server, options, deps)
+    code = offer_editors(tools, cli, options, deps)
     next_steps(folder, tools, deps)
+    if cli.failed:
+        raise SetupFailed(cli.failed)
     if code:
         raise SetupFailed(f"The server runs, but adding MCP to the editors failed. Fix the cause above, then run agent-memory connect --editor {','.join(tools)}.")
     return 0

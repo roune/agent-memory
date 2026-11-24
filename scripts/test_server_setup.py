@@ -212,7 +212,7 @@ class FirstRunTest(SetupCase):
             [
                 ["docker", "compose", "version"],
                 ["docker", "info", "--format", "{{.ServerVersion}}"],
-                ["docker", "compose", "ls", "--format", "json"],
+                ["docker", "compose", "ls", "-a", "--format", "json"],
                 self.compose(None, "pull"),
                 ["docker", "image", "inspect", "--format", "{{.Id}}", IMAGE],
                 self.compose(None, "up", "-d", "--no-build"),
@@ -352,6 +352,14 @@ class RerunTest(SetupCase):
         self.assertEqual(self.docker.kinds()[-1], "up")
 
 
+    def test_its_own_project_stopped_in_this_folder_is_started_again(self):
+        self.first_run()
+        listed = [{"Name": "agent-memory-server", "Status": "exited(2)", "ConfigFiles": str(self.folder / "compose.yaml")}]
+        self.docker.answers["ls"] = Ran(0, json.dumps(listed), "")
+        self.succeed()
+        self.assertEqual(self.docker.kinds()[-1], "up")
+
+
 class DowngradeTest(SetupCase):
     def newer_folder(self):
         self.first_run()
@@ -471,6 +479,54 @@ class RefusalTest(SetupCase):
         self.assertIn("--dir /srv/agent-memory-server", message)
         self.assertUnchanged(["version", "info", "ls"])
         self.assertEqual(self.probed, [])
+
+    def test_its_project_stopped_in_another_folder(self):
+        # deploy.md's manual steps, then docker compose stop: ls -a still lists it.
+        listed = [{"Name": "agent-memory-server", "Status": "exited(2)", "ConfigFiles": "/srv/agent-memory-server/compose.yaml"}]
+        self.docker.answers["ls"] = Ran(0, json.dumps(listed), "")
+        message = self.refuse()
+        self.assertIn("exists, stopped, in /srv/agent-memory-server", message)
+        self.assertIn("--dir /srv/agent-memory-server", message)
+        self.assertUnchanged(["version", "info", "ls"])
+        self.assertEqual(self.probed, [])
+
+    def test_its_project_with_two_config_files_in_another_folder(self):
+        other = self.base / "other"
+        files = f"{other / 'compose.yaml'},{other / 'compose.override.yaml'}"
+        self.docker.answers["ls"] = Ran(0, json.dumps([{"Name": "agent-memory-server", "Status": "running(2)", "ConfigFiles": files}]), "")
+        message = self.refuse()
+        self.assertIn(f"--dir {other}", message)
+        self.assertIn(f"-f {other / 'compose.yaml'} -f {other / 'compose.override.yaml'} down", message)
+        self.assertUnchanged(["version", "info", "ls"])
+        # The hint works: from that folder, setup goes ahead.
+        self.succeed(dir=str(other))
+        self.assertEqual(self.docker.kinds()[-1], "up")
+
+    def test_its_project_through_another_file_in_this_folder_gives_no_looping_hint(self):
+        team = self.folder / "compose.team.yaml"
+        self.docker.answers["ls"] = Ran(0, json.dumps([{"Name": "agent-memory-server", "Status": "running(2)", "ConfigFiles": str(team)}]), "")
+        message = self.refuse()
+        self.assertNotIn("--dir", message)
+        self.assertIn(f"from {team}, which setup doesn't manage", message)
+        self.assertIn(f"-f {team} down", message)
+        self.assertUnchanged(["version", "info", "ls"])
+
+    def test_its_project_through_a_team_file_elsewhere_gives_no_dir_hint(self):
+        team = "/srv/team/compose.team.yaml"
+        self.docker.answers["ls"] = Ran(0, json.dumps([{"Name": "agent-memory-server", "Status": "running(2)", "ConfigFiles": team}]), "")
+        message = self.refuse()
+        self.assertNotIn("--dir", message)
+        self.assertIn(f"-f {team} down", message)
+        self.assertUnchanged(["version", "info", "ls"])
+
+    def test_an_env_that_cannot_be_read_refuses_before_any_write(self):
+        (self.folder / "compose.yaml").write_bytes(PACKAGED + b"# hand edit\n")
+        (self.folder / ".env").unlink()
+        (self.folder / ".env").mkdir()
+        self.before = snapshot(self.base)
+        self.assertIn(".env", self.refuse())
+        self.assertUnchanged(["version", "info"])
+        self.assertEqual(list(self.folder.glob("*.bak")), [])
 
     def test_its_project_from_an_unknown_folder(self):
         self.docker.answers["ls"] = Ran(0, json.dumps([{"Name": "agent-memory-server", "Status": "running(2)", "ConfigFiles": ""}]), "")
@@ -633,6 +689,31 @@ class EditorOfferTest(SetupCase):
         out = self.succeed()
         self.assertEqual((self.asked, self.connected), ([], []))
         self.assertIn("another server", out)
+
+    def test_an_unreadable_config_gives_that_reason_not_another_server(self):
+        self.deps.interactive = lambda: True
+        self.answers = ["y"]
+        self.config.mkdir(parents=True)
+        (self.config / "server").write_text("url = ftp://nowhere\n")
+        out = self.succeed()
+        self.assertEqual((self.asked, self.connected), ([], []))
+        self.assertIn("because the CLI's server config can't be read", out)
+        self.assertNotIn("another server", out)
+
+    def test_a_config_write_that_fails_is_one_line_not_a_traceback(self):
+        self.deps.interactive = lambda: True
+        self.answers = ["y"]
+        # A file where the config folder should be: write_config's mkdir fails.
+        (self.home / ".config").mkdir()
+        (self.home / ".config" / "agent-memory").write_text("not a folder\n")
+        result, out, err = self.setup()
+        self.assertIn("couldn't write", result)
+        self.assertIn("agent-memory connect --url http://127.0.0.1:8765", result)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual((self.asked, self.connected), ([], []))
+        self.assertIn("because setup couldn't write", out)
+        self.assertNotIn("another server", out)
+        self.assertIn("Next steps", out)
 
     def test_nothing_found_means_no_question(self):
         self.deps.interactive = lambda: True
