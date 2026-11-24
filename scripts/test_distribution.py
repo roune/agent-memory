@@ -206,10 +206,6 @@ class LastingInstallTest(Temp):
         self.assertEqual(self.hook_command(), f"{clone / 'bin' / 'agent-memory'} capture --tool claude-code --event stop")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PyPITest(unittest.TestCase):
     """PR 3: what PyPI shows, and that every install command names the distribution."""
 
@@ -252,9 +248,16 @@ class PyPITest(unittest.TestCase):
         import re
 
         text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-        job = text[text.index("\n  pypi:") :]
+        start = text.index("\n  pypi:")
+        after = re.search(r"\n  [a-z-]+:\n", text[start + 1 :])
+        job = text[start : start + 1 + after.start()] if after else text[start:]
         self.assertIn("needs: [check, build, verify]", job)
         self.assertIn("environment: pypi", job)
         self.assertRegex(job, r"pypa/gh-action-pypi-publish@[0-9a-f]{40} # v\d")
+        self.assertIn("id-token: write", job)
         self.assertEqual(text.count("id-token: write"), 1)
         self.assertIn("twine check --strict", (ROOT / ".github" / "workflows" / "test.yml").read_text())
+
+
+if __name__ == "__main__":
+    unittest.main()

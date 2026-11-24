@@ -108,7 +108,7 @@ The PyPI package exists from v0.2.0. Until then, and for the unreleased main, in
 - **Try without installing:** `uvx --from roune-agent-memory agent-memory setup` starts the server from a throwaway copy. `agent-memory install` refuses such a run, so install the CLI before you connect hooks.
 - **mise:** `mise use -g pipx:roune-agent-memory`. mise's pipx backend uses uv when uv is installed.
   - With `mise activate`, `PATH` holds a versioned folder, `…/mise/installs/pipx-roune-agent-memory/<version>/bin`. After a `mise upgrade`, run `agent-memory install` again, so the hooks point at the new version.
-  - Use `mise activate`, not mise's shims. `install` compares `which agent-memory` with the file that is running. A shim is a link to the mise binary, which then starts the real script by its versioned path, so the two probably differ and `install` would refuse. Not verified: mise wasn't available when this was written, and the check is untested against `mise activate` too, because it also skips the running environment's own `bin`.
+  - Use `mise activate`, not mise's shims. mise installs through uv, with links in `…/installs/pipx-roune-agent-memory/<version>/bin`, so with `mise activate` on `PATH`, `install` accepts the command. A shim is a link to the mise binary, so `install` refuses it. (Checked against mise's pipx backend and a real wheel. A later release could let `install` accept a shim.)
 
 `setup` does what `./scripts/setup` does in a clone, with the published image. It checks everything first and writes nothing until every check has passed:
 
@@ -188,7 +188,7 @@ Homebrew and `install.sh` will appear here as they exist.
 - **`setup` is the upgrade for the server.** It rewrites `compose.yaml` for the new version, keeps `.env` and `data/`, pulls the new image and restarts. The server moves to the new image only then.
 - **The CLI tells you when they differ.** `/v1/health` reports the server's `version`. `agent-memory setup` and `agent-memory review` compare it with the CLI's own, and print one line when they differ: `the server runs 0.2.0 and this CLI is 0.3.0: run agent-memory setup to upgrade the server`. A server whose `/v1/health` has no version is older than 0.2.0, and the line says so. `capture`, `git-hook` and `sync --quiet` never ask, so the hooks stay fast and silent. `review` asks with a short timeout and says nothing when the server doesn't answer.
 - **A server you started another way** (the manual steps, a team host) is upgraded the way you started it.
-- **The hooks keep working.** They run the command as it was called, which uv's and pipx's bin links keep across an upgrade (mise is the exception: see [mise](#other-ways-to-install-the-cli)) (see [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages)).
+- **The hooks keep working.** They run the command as it was called, which uv's and pipx's bin links keep across an upgrade; mise is the exception (see [mise](#other-ways-to-install-the-cli)). See [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages).
 
 ### If Qdrant won't start after an upgrade
 
@@ -265,7 +265,7 @@ Send the token to its person by a private channel. `migrate` needs a separate ad
 ### On each laptop
 
 ```
-uv tool install roune-agent-memory
+uv tool install roune-agent-memory   # from v0.2.0; before that, from git
 agent-memory connect --url https://memory.acme.internal --token-stdin < token.txt
 agent-memory install
 agent-memory connect --editor claude-code,cursor,codex
@@ -277,7 +277,7 @@ agent-memory connect --editor claude-code,cursor,codex
 
 agent-memory doesn't run on native Windows. The CLI exits with a pointer to this section. Use WSL 2, where everything below works as it does on Linux.
 
-- **Install the CLI inside WSL**, in a WSL shell: `uv tool install roune-agent-memory`. The Windows `PATH` isn't enough, because the CLI is a Linux program.
+- **Install the CLI inside WSL**, in a WSL shell: `uv tool install roune-agent-memory` (from v0.2.0). The Windows `PATH` isn't enough, because the CLI is a Linux program.
 - **Docker** comes from Docker Desktop with its WSL integration turned on for your distribution, or from Docker Engine installed inside WSL. Run `docker compose` from the WSL shell too, so `data/` sits on the WSL filesystem.
 - **The editors have to run in WSL too.** That means Claude Code or Codex in a WSL shell, or Cursor or VS Code attached to WSL. A hook in the Windows-side `%USERPROFILE%\.cursor` can't run a CLI that lives in WSL, so don't point Windows-side editors at it.
 

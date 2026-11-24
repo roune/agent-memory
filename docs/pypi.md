@@ -12,6 +12,7 @@ You need [uv](https://docs.astral.sh/uv/) and Docker with Compose.
 uv tool install roune-agent-memory
 agent-memory setup
 agent-memory install --git-repo /path/to/repo
+agent-memory land /path/to/repo --since 2026-01-01
 agent-memory review
 agent-memory connect --editor claude-code
 ```
