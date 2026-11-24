@@ -526,7 +526,9 @@ class ReleaseCheckTest(Temp):
         self.copy = self.base / "repo-copy"
         (self.copy / "scripts").mkdir(parents=True)
         (self.copy / "scripts" / "agent_memory_assets").mkdir()
-        for name in ("pyproject.toml", "compose.yaml", "compose.team.yaml", "scripts/agent_memory_assets/compose.yaml"):
+        # __init__.py too: release-check reads the pin's pattern from it.
+        assets = ("scripts/agent_memory_assets/__init__.py", "scripts/agent_memory_assets/compose.yaml")
+        for name in ("pyproject.toml", "compose.yaml", "compose.team.yaml", *assets):
             shutil.copy2(ROOT / name, self.copy / name)
         shutil.copy2(ROOT / "scripts" / "release-check", self.copy / "scripts" / "release-check")
 
