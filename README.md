@@ -61,6 +61,21 @@ agent-memory install --git-repo /path/to/repo
 
 With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. Add `--install-auto-approve true` to approve those git drafts immediately. Omitting it leaves auto-approve off.
 
+## Quick start
+
+To build the memory for one repository, from a clone of this repo:
+
+```
+./scripts/install                                   # put agent-memory on PATH
+./scripts/setup                                     # start Qdrant and the server
+agent-memory install --git-repo /path/to/repo       # editor hooks, and git hooks for that repo
+agent-memory land /path/to/repo --since 2026-01-01  # file its git history, grouped by PR
+agent-memory review                                 # approve or reject the drafts
+agent-memory connect --editor claude-code           # give Claude Code the MCP tools
+```
+
+Pick a `--since` date before the repo's first commit. From then on, the hooks file new commits and sessions. Sessions from before the install are not captured.
+
 ## Features
 
 - **Session capture.** Hooks for Cursor, Claude Code, Codex, and Pi write an inbox bundle (which tool, which repo, the session id, and a pointer at the transcript) and return. The choice happens later, in review.
