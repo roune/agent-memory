@@ -697,10 +697,11 @@ class AgentMemoryTest(unittest.TestCase):
         self.assertNotIn('type="radio"', approve)
         self.assertEqual(approve.count('name="commit"'), 1)
         self.assertIn(f'<input type="hidden" name="commit" value="{second}">', approve)
-        self.assertNotIn("This text is long", page)
+        # The note is on every form, hidden while the text is short; the page script follows the textarea.
+        self.assertIn('data-long-note aria-live="polite" hidden>', page)
 
         item["draft"]["text"] = "x" * 2000
-        self.assertIn("This text is long", module.render_page([item], False))
+        self.assertIn('data-long-note aria-live="polite">This text is long', module.render_page([item], False))
 
     def test_review_form_checks_one_commit_without_a_draft_commit(self):
         spec = importlib.util.spec_from_file_location(

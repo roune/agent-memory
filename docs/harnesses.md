@@ -73,7 +73,7 @@ Whatever the harness, the capture command writes one bundle:
 - `tool` — `cursor`, `claude-code`, `codex`, or `pi`
 - `session_id`
 - `repo` — git root when there is one, otherwise `cwd`
-- `ended_at`
+- `started_at` and `ended_at` — the first and last top-level `timestamp` in the transcript (Claude Code and Codex write one per JSONL line). Cursor's transcript has none, so they fall back to the capture time. Only the times are read.
 - `event` — the harness event that wrote this copy
 - a copy of the transcript, or a path that was verified readable at capture time
 - `last_assistant_message` when the harness provides it and the transcript file lags

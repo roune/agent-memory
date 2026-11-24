@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import hashlib
@@ -1189,6 +1190,56 @@ def resolve_transcript(payload, repo, session_id):
     return None
 
 
+# How much of a large transcript's head and tail transcript_times reads.
+TRANSCRIPT_TIME_WINDOW = 1 << 20
+
+
+def _transcript_line_time(line):
+    """The top-level "timestamp" of one JSONL line, in UTC, or None."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    value = entry.get("timestamp") if isinstance(entry, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def transcript_times(path):
+    """The first and last times a JSONL transcript records, as UTC text, or None for each.
+
+    Claude Code and Codex put an ISO time on each line's top-level "timestamp".
+    Cursor's agent transcript has none, so the caller falls back to now. Only
+    the times are read: nothing else from the transcript reaches the bundle. A
+    large file is read at its head and its tail only, to keep a hook fast.
+    """
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size <= 2 * TRANSCRIPT_TIME_WINDOW:
+                head = tail = handle.read().splitlines()
+            else:
+                head = handle.read(TRANSCRIPT_TIME_WINDOW).splitlines()[:-1]
+                handle.seek(size - TRANSCRIPT_TIME_WINDOW)
+                tail = handle.read().splitlines()[1:]
+    except OSError:
+        return None, None
+    first = [t for t in map(_transcript_line_time, head) if t is not None]
+    last = [t for t in map(_transcript_line_time, tail) if t is not None]
+
+    def text(moment):
+        return moment.replace(microsecond=0).isoformat()
+
+    return (text(min(first)) if first else None, text(max(last)) if last else None)
+
+
 def session_dir(tool, session_id):
     return inbox_root() / tool / session_id
 
@@ -1345,12 +1396,17 @@ def write_capture(args, payload):
             copy_name = "transcript"
 
     message = payload.get("last_assistant_message") or previous.get("last_assistant_message") or ""
+    # The session's own times, so an old transcript captured late keeps its dates.
+    source = transcript
+    if source is None and copy_name and (folder / copy_name).is_file():
+        source = folder / copy_name
+    first_at, last_at = transcript_times(source) if source is not None else (None, None)
     bundle = {
         "tool": tool,
         "session_id": session_id,
         "repo": repo,
-        "started_at": previous.get("started_at") or now(),
-        "ended_at": now(),
+        "started_at": first_at or previous.get("started_at") or now(),
+        "ended_at": last_at or now(),
         "event": event,
         "closed": previous.get("closed", False) or event.lower() in END_EVENTS,
         "transcript_copy": copy_name,
@@ -1735,6 +1791,18 @@ PAGE = """<!DOCTYPE html>
 <p class="meta">__LEAD__</p>
 __BANNER__
 __ITEMS__
+<script>
+// The long-text note follows the textarea as you type. Without JS it shows
+// how the text was when the page loaded.
+document.querySelectorAll("textarea[data-long-chars]").forEach(function (area) {
+  var note = area.form && area.form.querySelector("[data-long-note]");
+  if (!note) return;
+  var limit = parseInt(area.getAttribute("data-long-chars"), 10);
+  var update = function () { note.hidden = Array.from(area.value).length <= limit; };
+  area.addEventListener("input", update);
+  update();
+});
+</script>
 </body>
 </html>
 """
@@ -2009,14 +2077,19 @@ def render_page(items, include_all, status=None, done=""):
             if message:
                 message_block = f"<pre>{html.escape(message[:4000])}</pre>"
             text_label = "Context of this commit" if kind == "change" else "Keep this text"
-            long_note = ""
-            if len(draft.get("text") or "") > LONG_TEXT_CHARS:
-                long_note = (
-                    '<p class="meta">This text is long. The embedding reads only about '
-                    "the first 512 tokens. Trim it, or keep what matters first.</p>"
-                )
+            # Rendered for every form, and hidden while the text is short. The
+            # page script follows the textarea; without JS it shows the load state.
+            hidden = "" if len(draft.get("text") or "") > LONG_TEXT_CHARS else " hidden"
+            long_note = (
+                f'<p class="meta" data-long-note aria-live="polite"{hidden}>This text is long. '
+                "The embedding reads only about the first 512 tokens. "
+                "Trim it, or keep what matters first.</p>"
+            )
             iden = read_identity()
+            # As approve does: the bundle's own id, else the origin of its repo.
             rr_default = (land_meta.get("remote_repo") or "").strip()
+            if not rr_default and item.get("repo") and Path(str(item["repo"])).is_dir():
+                rr_default = git_remote_repo_id(str(item["repo"]))
             remote_d = html.escape(rr_default)
             occurred_default = html.escape(item.get("ended_at") or "")
             record_val = ""
@@ -2053,7 +2126,7 @@ def render_page(items, include_all, status=None, done=""):
 <label>Kind <select name="kind">{select_options(kinds, kind)}</select></label>
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
 {extra_fields}
-<label>{text_label} <textarea name="text">{draft_text}</textarea></label>
+<label>{text_label} <textarea name="text" data-long-chars="{LONG_TEXT_CHARS}">{draft_text}</textarea></label>
 {long_note}
 <button type="submit">Approve</button>
 </form>
@@ -2213,16 +2286,49 @@ def review(args):
             continue
     if server is None:
         raise SystemExit(f"no free port from {port}")
-    write_json(state_path, {"pid": os.getpid(), "port": port})
-    url = f"http://127.0.0.1:{port}"
-    print(url)
-    webbrowser.open(url)
+    previous = stop_on_signals()
     try:
+        write_json(state_path, {"pid": os.getpid(), "port": port})
+        url = f"http://127.0.0.1:{port}"
+        print(url)
+        webbrowser.open(url)
         server.serve_forever()
     finally:
-        if state_path.is_file():
-            state_path.unlink()
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        server.server_close()
+        drop_review_state(state_path)
     return 0
+
+
+def _stop_review(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def stop_on_signals():
+    """`kill <pid>` and a closed terminal stop the page through its finally, as Ctrl-C does.
+
+    Returns the handlers it replaced. A SIGHUP that is ignored (nohup) stays ignored.
+    """
+    replaced = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        if name == "SIGHUP" and signal.getsignal(number) == signal.SIG_IGN:
+            continue
+        replaced[number] = signal.signal(number, _stop_review)
+    return replaced
+
+
+def drop_review_state(state_path):
+    """Remove review.json if it still names this process, not a page started since."""
+    try:
+        state = read_json(state_path)
+    except (OSError, SystemExit):
+        return
+    if isinstance(state, dict) and state.get("pid") == os.getpid():
+        state_path.unlink(missing_ok=True)
 
 
 def present_tools():
