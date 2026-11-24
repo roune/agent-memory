@@ -106,7 +106,9 @@ flowchart TD
 
 The review page shows a banner: connected (as whom), offline, or not configured; how many items wait, and the oldest one's age; and each failed item with its error, and the stored text for a 409. With auth on it fills org and team from `/v1/whoami`, offers only the values the token allows, and shows `person` read-only. In per-repo mode each bundle shows the identity of the server its repo goes to. `connect` doesn't save a token for a server with auth off. The page answers only `Host: 127.0.0.1:<port>`, and takes a POST only when its `Origin` (or else `Referer`) is the page itself, so another web page can't approve or reject.
 
-`land` and the hooks skip a commit that the server reports kept or rejected (`/v1/commits/status`, one call per batch), or that an outbox item already covers. If the server can't be reached they offer it anyway: a duplicate costs one Reject, while a missed memory is lost. The git hook's call has a 1-second timeout and it makes no other network call, so it returns within about two seconds.
+`land` and the hooks skip a commit that the server reports kept or rejected (`/v1/commits/status`, one call per batch), or that an outbox item already covers. If the server can't be reached they offer it anyway: a duplicate costs one Reject, while a missed memory is lost. The git hook's call has a 1-second timeout and it makes no other network call (no `gh` either), so it returns within about two seconds.
+
+Approve asks again for a git bundle stored as a change: it reads the outbox, then `/v1/commits/status`, for the commits the memory would store. A `land` bundle can wait in review while the git hook auto-approves the same commit, or another laptop keeps it. When every commit of the bundle is already kept or rejected, Approve stores nothing, drops the bundle, and the page says which commits. When only some are, they are taken off the bundle, the edited text is kept, and the page asks for one more Approve. If the server can't be reached, Approve queues the memory with the same check, so `sync` asks before it sends. Session bundles are not rechecked.
 
 ## Routes
 

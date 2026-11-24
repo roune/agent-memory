@@ -282,7 +282,9 @@ class AgentMemoryTest(unittest.TestCase):
         repo = self._init_repo(store)
         env = self._env(store)
         wt = Path(self.tmp.name) / "wt"
-        subprocess.run(["git", "worktree", "add", "-b", "wt-branch", str(wt)], cwd=repo, check=True)
+        # The hook files default-branch commits only, so the worktree has main checked out.
+        subprocess.run(["git", "checkout", "-q", "--detach"], cwd=repo, check=True)
+        subprocess.run(["git", "worktree", "add", str(wt), "main"], cwd=repo, check=True)
         self._install(env, wt, hooks="true", auto="false")
         self.assertTrue((repo / ".git" / "hooks" / "post-commit").is_file())
         self.assertFalse((wt / ".git" / "hooks" / "post-commit").exists())

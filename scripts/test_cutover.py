@@ -153,7 +153,9 @@ class ApproveTest(Case):
         self.assertFalse(self.bundle_exists())
         [(path, item)] = outbox.queued(self.state)
         self.assertEqual(mode_bits(path), 0o600)
-        self.assertEqual(set(item), {"server_url", "op", "body", "created_at", "attempts", "last_error"})
+        self.assertEqual(set(item), {"server_url", "op", "body", "created_at", "attempts", "last_error", "unless_settled"})
+        # sync asks the server about the commit once more before it sends.
+        self.assertEqual(item["unless_settled"], {"repo": REPO, "shas": [A]})
         self.assertEqual((item["server_url"], item["op"]), (url, "memory"))
         self.assertEqual(
             set(item["body"]),
@@ -163,7 +165,7 @@ class ApproveTest(Case):
         self.assertNotIn("transcript", path.read_text())
 
     def test_a_5xx_queues_too(self):
-        self.server.fail_next = (503, {"error": "store failed"})
+        self.server.fail_path["/v1/memories"] = (503, {"error": "store failed"})
         result = agent_memory.approve(self.bundle(), "change", "code", "why", commit=A)
         self.assertEqual(result["status"], "queued")
         self.assertFalse(self.bundle_exists())
@@ -178,11 +180,12 @@ class ApproveTest(Case):
         self.assertEqual(self.queued(), [])
 
     def test_a_409_carries_the_stored_text(self):
-        agent_memory.approve(self.bundle(), "change", "code", "the first text", commit=A)
+        # A session bundle: a git bundle whose commit is kept never gets this far (Approve rechecks it).
+        agent_memory.approve(self.bundle(tool="cursor"), "change", "code", "the first text", commit=A)
         with self.assertRaises(agent_memory.Refused) as raised:
-            agent_memory.approve(self.bundle(), "change", "code", "a second text", commit=A)
+            agent_memory.approve(self.bundle(tool="cursor"), "change", "code", "a second text", commit=A)
         self.assertEqual(raised.exception.stored, "the first text")
-        self.assertTrue(self.bundle_exists())
+        self.assertTrue(self.bundle_exists(tool="cursor"))
 
     def test_queued_items_go_first_so_the_order_is_kept(self):
         self.queue("older note")
@@ -663,13 +666,13 @@ class ReviewPageTest(ReviewPageCase):
         self.assertIn("Queued: 1 waiting in the outbox, the oldest for", page)
 
     def test_a_409_shows_the_stored_text_and_keeps_the_bundle(self):
-        agent_memory.approve(self.bundle(), "change", "code", "the stored text", commit=A)
-        self.bundle()
-        status, page, _ = self.post("/approve", session_id="s1", tool="git", kind="change", domain="code", text="new text", commit=A)
+        agent_memory.approve(self.bundle(tool="cursor"), "change", "code", "the stored text", commit=A)
+        self.bundle(tool="cursor")
+        status, page, _ = self.post("/approve", session_id="s1", tool="cursor", kind="change", domain="code", text="new text", commit=A)
         self.assertEqual(status, 409)
         self.assertIn("the stored text", page)
         self.assertIn("The bundle is kept", page)
-        self.assertTrue(self.bundle_exists())
+        self.assertTrue(self.bundle_exists(tool="cursor"))
 
     def test_failed_items_are_listed_with_their_error_and_the_409_text(self):
         agent_memory.approve(self.bundle(), "learning", "code", "kept text")

@@ -384,6 +384,15 @@ def single_commit_hook_group(repo, sha, message):
     }
 
 
+def no_pr_description(repo, pr_number):
+    """The hook's describe: no gh call, so the hook never waits on GitHub."""
+    return "", ""
+
+
+def no_pr_for_sha(sha):
+    return None
+
+
 def draft_choice(bundle):
     """kind, domain, text and commit an auto-approve takes from a bundle's draft."""
     draft = bundle.get("draft") or {}
@@ -407,41 +416,54 @@ def is_merge_commit(repo, sha):
     return len(parents) > 1
 
 
-def hook_commit_shas(repo, event, head):
-    """Commits this hook invocation should file.
+def _rev_list(repo, spec):
+    listing = run(["git", "rev-list", "--reverse", spec], repo)
+    return [line.strip() for line in listing.splitlines() if line.strip()]
 
-    post-commit files the new HEAD. post-merge files every single-parent commit
-    reachable from HEAD but not from ORIG_HEAD, so a fast-forward or merge does
-    not keep only the tip.
+
+def hook_commit_shas(repo, event, head):
+    """Commits this hook invocation brought onto the branch, oldest first, merge commits included.
+
+    post-merge: every commit reachable from HEAD but not from ORIG_HEAD, so a
+    fast-forward or merge does not keep only the tip. After `git merge --squash`
+    git runs post-merge with ORIG_HEAD at HEAD: nothing is new, and the squash
+    commit comes later, through post-commit.
+
+    post-commit: the new HEAD. When HEAD is a merge (a conflicted merge that
+    `git commit` concluded, which runs no post-merge), the commits it merged.
+
+    The caller groups them as land does: a merge commit's own message is never
+    filed, it only names the pull request of the commits it brought in.
     """
     if event == "post-merge":
-        orig = run(["git", "rev-parse", "--verify", "ORIG_HEAD"], repo)
-        if orig and orig != head:
-            listing = run(["git", "rev-list", "--reverse", f"{orig}..{head}"], repo)
-            shas = [line.strip() for line in listing.splitlines() if line.strip()]
-            return [sha for sha in shas if not is_merge_commit(repo, sha)]
+        orig = run(["git", "rev-parse", "--verify", "--quiet", "ORIG_HEAD"], repo)
+        if orig == head:
+            return []
+        if orig:
+            return _rev_list(repo, f"{orig}..{head}")
+    if is_merge_commit(repo, head):
+        return _rev_list(repo, f"{head}^1..{head}")
     return [head]
 
 
-def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_approve):
-    """File one commit locally: an approved document in the outbox, or a bundle in the inbox.
+def git_group_session_id(repo_key, group):
+    """The session id land and the hook both give a group, so one group files one bundle."""
+    shas = [m["sha"] for m in group["commits"]]
+    prn = group.get("pr")
+    return land_session_id(repo_key, f"pr-{prn}" if prn is not None else shas[0], prn, shas)
 
-    Returns the path written, or None when there was nothing to file.
-    """
-    msg = run(["git", "log", "-1", "--format=%B", sha], repo_s)
-    group = single_commit_hook_group(repo_s, sha, msg)
-    session_id = land_session_id(remote_id or repo_s, sha[:12], None, [sha])
-    bundle_path = land_bundle_path("git", session_id)
-    if bundle_path.is_file():
-        return None
-    draft_text = draft_text_commit_only(msg)
-    bundle = {
+
+def git_bundle(repo, session_id, group, event, branch, tip, remote_id, draft_text):
+    """An inbox bundle for one group of default-branch commits, from land or the git hook."""
+    members = group["commits"]
+    shas = [m["sha"] for m in members]
+    return {
         "tool": "git",
         "session_id": session_id,
-        "repo": repo_s,
-        "started_at": since,
+        "repo": repo,
+        "started_at": started_at_for_group(group),
         "ended_at": occurred_at_for_group(group),
-        "event": "git-" + event.replace("_", "-"),
+        "event": event,
         "closed": True,
         "transcript_copy": None,
         "last_assistant_message": "",
@@ -450,33 +472,48 @@ def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_app
             "head": tip,
             "status": "",
             "diff_stat": "",
-            "paths": commit_files(repo_s, sha),
+            "paths": git_paths_for_group(repo, shas),
         },
         "pinned": True,
         "draft": {
             "kind": "change",
             "domain": "code",
             "text": draft_text,
-            "commit": sha,
+            "commit": shas[-1],
         },
         "land": {
             "remote_repo": remote_id,
-            "pull_request": None,
+            "pull_request": group.get("pr"),
             "commits": [
-                {
-                    "sha": sha,
-                    "subject": (msg or "").split("\n", 1)[0].strip(),
-                }
+                {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
+                for m in members
             ],
         },
     }
+
+
+def file_hook_group(repo_s, group, event, branch, tip, remote_id, auto_approve):
+    """File one group of commits locally: an approved document in the outbox, or a bundle in the inbox.
+
+    Returns the path written, or None when a bundle for this group already
+    waits in the inbox (land filed it, or an earlier hook did).
+    """
+    session_id = git_group_session_id(remote_id or repo_s, group)
+    bundle_path = land_bundle_path("git", session_id)
+    if bundle_path.is_file():
+        return None
+    draft_text = draft_text_for_group(repo_s, group, describe=no_pr_description)
+    bundle = git_bundle(
+        repo_s, session_id, group, "git-" + event.replace("_", "-"), branch, tip, remote_id, draft_text
+    )
     if auto_approve:
         try:
             kind, domain, text, commit = draft_choice(bundle)
             url, body = approved_request(bundle, kind, domain, text, commit=commit)
             # The hook's own status call may time out, so sync asks again before
             # it sends: a commit someone else already explained gets no second memory.
-            check = {"repo": remote_id, "shas": [sha]} if remote_id else None
+            shas = [m["sha"] for m in group["commits"]]
+            check = {"repo": remote_id, "shas": shas} if remote_id else None
             return outbox.add(store_root(), url, "memory", body, unless_settled=check)
         except (ValueError, OSError, server_client.ConfigError) as error:
             log(f"git-hook: auto_approve failed, inbox bundle kept for review: {error}")
@@ -484,11 +521,21 @@ def file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, auto_app
     return bundle_path
 
 
-def git_hook(args):
-    """File the new commits locally first, check them with one short call, then start a detached sync.
+def _unfile(path):
+    if path.name == "bundle.json":
+        shutil.rmtree(path.parent, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
 
-    The hook makes no other network call, so it returns within about two
-    seconds even when the server doesn't answer.
+
+def git_hook(args):
+    """File the new default-branch commits locally first, check them with one short call, then start a detached sync.
+
+    Only commits on the repo's default branch are filed, the branch land reads:
+    a commit on a feature branch is filed when it reaches that branch. Commits
+    are grouped by pull request the way land groups them, from the messages
+    alone. The hook makes no other network call (no gh), so it returns within
+    about two seconds even when the server doesn't answer.
     """
     repo = Path(args.repo or os.getcwd()).resolve()
     if run(["git", "rev-parse", "--is-inside-work-tree"], str(repo)) != "true":
@@ -503,32 +550,54 @@ def git_hook(args):
         return 0
 
     event = (args.event or "post-commit").lower()
+    branch = run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], repo_s)
+    default = local_default_branch(repo_s, fall_back_to_head=False)
+    if not default:
+        log(
+            "git-hook skipped: no default branch (no origin/HEAD, main or master); "
+            "run git remote set-head origin --auto"
+        )
+        return 0
+    if branch != default:
+        log(f"git-hook skipped: {branch or 'detached HEAD'} is not the default branch {default}")
+        return 0
     head = run(["git", "rev-parse", "HEAD"], repo_s)
     if not head:
         log("git-hook skipped: could not resolve HEAD")
         return 0
     shas = hook_commit_shas(repo_s, event, head)
-    remote_id = git_remote_repo_id(repo_s)
-    waiting = waiting_settled(remote_id, shas)
-    shas = [sha for sha in shas if sha not in waiting]
     if not shas:
         return 0
+    groups, _ = build_land_groups(repo_s, commit_records(repo_s, shas), pr_for_sha=no_pr_for_sha)
+    remote_id = git_remote_repo_id(repo_s)
+    waiting = waiting_settled(remote_id, [m["sha"] for group in groups for m in group["commits"]])
+    auto_approve = bool(cfg.get("auto_approve"))
 
-    branch, tip = default_branch_tip(repo_s)
-    since = parse_since("", 24)
-    written = {}
-    for sha in shas:
-        path = file_hook_commit(repo_s, sha, event, branch, tip, since, remote_id, bool(cfg.get("auto_approve")))
+    def file(group):
+        return file_hook_group(repo_s, group, event, branch, head, remote_id, auto_approve)
+
+    written = []
+    for group in groups:
+        members = [m for m in group["commits"] if m["sha"] not in waiting]
+        if not members:
+            continue
+        group = dict(group, commits=members)
+        path = file(group)
         if path is not None:
-            written[sha] = path
+            written.append((path, group))
     # Commits pulled in by a merge may be settled already, by someone else or
-    # by another laptop. On any failure the files stay.
-    for sha in server_settled(remote_id, list(written), timeout=HOOK_STATUS_TIMEOUT):
-        path = written[sha]
-        if path.name == "bundle.json":
-            shutil.rmtree(path.parent, ignore_errors=True)
-        else:
-            path.unlink(missing_ok=True)
+    # by another laptop. Such a group is filed again with only the rest, so no
+    # commit gets a second memory. On any failure the files stay.
+    settled = server_settled(
+        remote_id, [m["sha"] for _, group in written for m in group["commits"]], timeout=HOOK_STATUS_TIMEOUT
+    )
+    for path, group in written:
+        rest = [m for m in group["commits"] if m["sha"] not in settled]
+        if len(rest) == len(group["commits"]):
+            continue
+        _unfile(path)
+        if rest:
+            file(dict(group, commits=rest))
     spawn_sync()
     return 0
 
@@ -703,6 +772,76 @@ def gh_pr_for_sha(repo, sha):
     return None
 
 
+# One gh call answers land's whole window; past this many PRs it asks per commit.
+GH_PR_LIMIT = 1000
+
+
+class GhMergedPrs:
+    """The PRs merged since a date, from one `gh pr list` call, for land.
+
+    land used to ask gh once per commit without a PR marker and once per PR for
+    its description, which took about 20 s over a long history. This asks once,
+    lazily, and answers both questions from that list. When the list fails, or
+    is cut at GH_PR_LIMIT, what it doesn't hold is asked for alone, as before.
+    """
+
+    def __init__(self, repo, since_iso):
+        self.repo = repo
+        self.since_iso = since_iso
+        self._prs = None
+        self._loaded = False
+        self.complete = False
+
+    def _load(self):
+        if self._loaded:
+            return self._prs
+        self._loaded = True
+        try:
+            since = datetime.fromisoformat(str(self.since_iso).replace("Z", "+00:00"))
+            day = (since - timedelta(days=1)).date().isoformat()
+        except ValueError:
+            day = ""
+        command = ["gh", "pr", "list", "--state", "merged", "--json", "number,title,body,mergeCommit"]
+        command += ["--limit", str(GH_PR_LIMIT)]
+        if day:
+            command += ["--search", f"merged:>={day}"]
+        out = run(command, self.repo)
+        try:
+            rows = json.loads(out) if out else None
+        except json.JSONDecodeError:
+            rows = None
+        if not isinstance(rows, list):
+            return None
+        prs = {}
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("number"), int):
+                continue
+            prs[row["number"]] = {
+                "title": (row.get("title") or "").strip(),
+                "body": (row.get("body") or "").strip(),
+                "merge_commit": ((row.get("mergeCommit") or {}).get("oid") or "").lower(),
+            }
+        self._prs = prs
+        self.complete = len(rows) < GH_PR_LIMIT
+        self._by_merge_commit = {pr["merge_commit"]: n for n, pr in prs.items() if pr["merge_commit"]}
+        return prs
+
+    def pr_for_sha(self, sha):
+        prs = self._load()
+        if prs is None:
+            return gh_pr_for_sha(self.repo, sha)
+        found = self._by_merge_commit.get(sha.lower())
+        if found is not None or self.complete:
+            return found
+        return gh_pr_for_sha(self.repo, sha)
+
+    def describe(self, repo, pr_number):
+        prs = self._load()
+        if prs is not None and pr_number in prs:
+            return prs[pr_number]["title"], prs[pr_number]["body"]
+        return gh_pr_description(repo, pr_number)
+
+
 def land_session_id(repo_key, group_key, pr_number, shas):
     raw = f"{repo_key}|{group_key}|{pr_number or ''}|" + ",".join(sorted(shas))
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -800,7 +939,7 @@ def deliver(url, op, body, queue_only=False, unless_settled=None):
                 stopped = error
             except server_client.ServerUnreachable as error:
                 stopped = error
-        outbox.add(root, url, op, body)
+        outbox.add(root, url, op, body, unless_settled=unless_settled)
         return "queued", server_client.explain(stopped) if stopped else None
 
 
@@ -895,26 +1034,23 @@ def reject_bundle(bundle):
     return status
 
 
-def default_branch_tip(repo):
-    branch = default_branch(repo)
-    sha = run(["git", "rev-parse", branch], repo)
-    return branch, sha
+# Unit separator between fields, record separator after each commit.
+# A commit message cannot end up holding either one.
+_LOG_FORMAT = "--pretty=format:%H%x1f%ct%x1f%B%x1e"
 
 
 def commits_on_branch_since(repo, branch, since_iso):
-    listing = run(
-        [
-            "git",
-            "log",
-            branch,
-            f"--since={since_iso}",
-            "--reverse",
-            # Unit separator between fields, record separator after each commit.
-            # A commit message cannot end up holding either one.
-            "--pretty=format:%H%x1f%ct%x1f%B%x1e",
-        ],
-        repo,
-    )
+    return _log_records(run(["git", "log", branch, f"--since={since_iso}", "--reverse", _LOG_FORMAT], repo))
+
+
+def commit_records(repo, shas):
+    """{sha, committer_date, message} for each sha, in the order given."""
+    if not shas:
+        return []
+    return _log_records(run(["git", "log", "--no-walk=unsorted", _LOG_FORMAT, *shas], repo))
+
+
+def _log_records(listing):
     commits = []
     for block in listing.split("\x1e"):
         block = block.strip()
@@ -952,11 +1088,30 @@ def pr_numbers_from_merges(repo, merges):
     return found
 
 
-def build_land_groups(repo, commits):
+def merge_titles(merges):
+    """PR number -> the title GitHub writes under "Merge pull request #N from …"."""
+    titles = {}
+    for item in merges:
+        prn = pr_from_commit_message(item["message"])
+        if prn is None:
+            continue
+        _, _, rest = (item["message"] or "").strip().partition("\n")
+        # Skip the "# Conflicts:" block git leaves when `git commit --no-edit` concludes a merge.
+        lines = [line.strip() for line in clean_message(rest).splitlines()]
+        title = next((line for line in lines if line and not line.startswith("#")), "")
+        if title:
+            titles.setdefault(prn, title)
+    return titles
+
+
+def build_land_groups(repo, commits, pr_for_sha=None):
     """Split off merge commits; group the rest by PR number when present.
 
     A root commit has no parent. It is filed like any single-parent commit.
+    pr_for_sha(sha) is the last way to tell a commit's PR (gh_pr_for_sha by
+    default); the git hook passes one that never calls gh.
     """
+    pr_for_sha = pr_for_sha or (lambda sha: gh_pr_for_sha(repo, sha))
     merges = []
     singles = []
     for item in commits:
@@ -977,14 +1132,18 @@ def build_land_groups(repo, commits):
         if prn is None:
             prn = pr_from_commit_message(item["message"])
         if prn is None:
-            prn = gh_pr_for_sha(repo, item["sha"])
+            prn = pr_for_sha(item["sha"])
         if prn is not None:
             by_pr.setdefault(prn, []).append(item)
         else:
             orphan_singles.append(item)
 
+    titles = merge_titles(merges)
     for prn, members in sorted(by_pr.items()):
-        groups.append({"pr": prn, "commits": sorted(members, key=lambda x: x["committer_date"])})
+        group = {"pr": prn, "commits": sorted(members, key=lambda x: x["committer_date"])}
+        if prn in titles:
+            group["merge_title"] = titles[prn]
+        groups.append(group)
 
     for item in orphan_singles:
         groups.append({"pr": None, "commits": [item]})
@@ -1002,17 +1161,21 @@ def build_land_groups(repo, commits):
     return groups, merge_notes
 
 
-def draft_text_for_group(repo, group):
+def draft_text_for_group(repo, group, describe=None):
     """PR title and description, then each commit message, each said once.
 
     The PR number, shas, and repo id are stored beside the text, so
-    they are not repeated in what gets embedded.
+    they are not repeated in what gets embedded. describe(repo, n) gives the
+    PR's title and body (gh_pr_description by default). Without one, the title
+    is the one a "Merge pull request" commit carries, if any.
     """
+    describe = describe or gh_pr_description
     parts = []
     title = ""
     pr_number = group.get("pr")
     if pr_number is not None:
-        title, body = gh_pr_description(repo, pr_number)
+        title, body = describe(repo, pr_number)
+        title = title or group.get("merge_title") or ""
         if title:
             parts.append(title)
         body = clean_pr_body(body)
@@ -1041,6 +1204,14 @@ def git_paths_for_group(repo, shas):
     return out
 
 
+def started_at_for_group(group):
+    """The group's oldest commit date: when the work it explains was committed."""
+    times = [m["committer_date"] for m in group["commits"] if m.get("committer_date")]
+    if not times:
+        return now()
+    return datetime.fromtimestamp(min(times), tz=timezone.utc).replace(microsecond=0).isoformat()
+
+
 def occurred_at_for_group(group):
     times = [m["committer_date"] for m in group["commits"] if m.get("committer_date")]
     if not times:
@@ -1066,7 +1237,8 @@ def land(args):
     tip = run(["git", "rev-parse", branch], str(repo))
     remote_id = git_remote_repo_id(str(repo))
     commits = commits_on_branch_since(str(repo), branch, since)
-    groups, merge_notes = build_land_groups(str(repo), commits)
+    gh_prs = GhMergedPrs(str(repo), since)
+    groups, merge_notes = build_land_groups(str(repo), commits, pr_for_sha=gh_prs.pr_for_sha)
 
     tool = "git"
     wrote = 0
@@ -1081,52 +1253,12 @@ def land(args):
         if not members:
             continue
         group = dict(group, commits=members)
-        shas = [m["sha"] for m in members]
-
-        prn = group.get("pr")
-        group_key = f"pr-{prn}" if prn is not None else shas[0]
-        session_id = land_session_id(remote_id or str(repo), group_key, prn, shas)
+        session_id = git_group_session_id(remote_id or str(repo), group)
         bundle_path = land_bundle_path(tool, session_id)
         if bundle_path.is_file():
             continue
-
-        paths = git_paths_for_group(str(repo), shas)
-        draft_text = draft_text_for_group(str(repo), group)
-        ended = occurred_at_for_group(group)
-        bundle = {
-            "tool": tool,
-            "session_id": session_id,
-            "repo": str(repo),
-            "started_at": since,
-            "ended_at": ended,
-            "event": "land",
-            "closed": True,
-            "transcript_copy": None,
-            "last_assistant_message": "",
-            "git": {
-                "branch": branch,
-                "head": tip,
-                "status": "",
-                "diff_stat": "",
-                "paths": paths,
-            },
-            "pinned": True,
-            "draft": {
-                "kind": "change",
-                "domain": "code",
-                "text": draft_text,
-                "commit": shas[-1],
-            },
-            "land": {
-                "remote_repo": remote_id,
-                "pull_request": prn,
-                "commits": [
-                    {"sha": m["sha"], "subject": (m["message"] or "").split("\n", 1)[0].strip()}
-                    for m in members
-                ],
-            },
-        }
-        write_json(bundle_path, bundle)
+        draft_text = draft_text_for_group(str(repo), group, describe=gh_prs.describe)
+        write_json(bundle_path, git_bundle(str(repo), session_id, group, "land", branch, tip, remote_id, draft_text))
         wrote += 1
 
     for note in merge_notes:
@@ -1399,12 +1531,16 @@ def default_branch(repo):
     return "main"
 
 
-def local_default_branch(repo):
-    """Local branch `land` should read.
+def local_default_branch(repo, fall_back_to_head=True):
+    """Local branch `land` should read, and the only one the git hook files from.
 
     `origin/HEAD` only supplies the name (`main` or `master`). Logging the
     remote-tracking ref skips commits that are on the local branch and not
     pushed, and files commits that are not on the local branch.
+
+    With neither, land reads the checked-out branch. The hook passes
+    fall_back_to_head=False and gets "" instead, so it never takes a feature
+    branch for the default one.
     """
     ref = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repo)
     if ref:
@@ -1414,6 +1550,8 @@ def local_default_branch(repo):
     for name in ("main", "master"):
         if ok(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], repo):
             return name
+    if not fall_back_to_head:
+        return ""
     head = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo)
     if head and head != "HEAD":
         return head
@@ -1598,11 +1736,64 @@ def approve(
         superseded_by=superseded_by,
         updates=updates,
     )
+    if bundle.get("tool") == "git" and body.get("commits"):
+        check = {"repo": body["repo"], "shas": list(body["commits"])}
+        if not queue_only:
+            recheck_git_bundle(bundle, check, kind, domain, text)
+        # Queued because the server is down: sync asks once more before it sends.
+        unless_settled = unless_settled or check
     status, answer = deliver(url, "memory", body, queue_only=queue_only, unless_settled=unless_settled)
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     if status == "sent":
         return {"status": "sent", "id": (answer or {}).get("id"), "reason": None}
     return {"status": "queued", "id": None, "reason": answer}
+
+
+class AlreadySettled(ValueError):
+    """Approve found the git bundle's commits already kept or rejected. Nothing was stored."""
+
+    def __init__(self, message, dropped):
+        super().__init__(message)
+        self.dropped = dropped
+
+
+def recheck_git_bundle(bundle, check, kind, domain, text):
+    """Ask again, at Approve, whether a git bundle's commits are settled. Raises AlreadySettled.
+
+    A land bundle can wait in review while the git hook auto-approves the same
+    commit, or another laptop keeps it. Approving it then would store a second
+    memory for that commit. The outbox is read first, then /v1/commits/status
+    is asked. If the server can't be reached, nothing is known, and the
+    approve goes ahead (queued with unless_settled, so sync asks once more).
+
+    When every commit the bundle lists is settled, the bundle is dropped. When
+    only some are, they are taken off it, and the text as edited is kept for
+    the next try.
+    """
+    settled = settled_commits(check["repo"], check["shas"])
+    if not settled:
+        return
+    folder = session_dir(bundle["tool"], bundle["session_id"])
+    land_meta = bundle.get("land") if isinstance(bundle.get("land"), dict) else {}
+    listed = [c for c in land_meta.get("commits") or [] if isinstance(c, dict)]
+    rest = [c for c in listed if str(c.get("sha") or "") not in settled]
+    named = ", ".join(sha[:10] for sha in check["shas"] if sha in settled)
+    said = (
+        f"Not approved: {named} {'is' if len(settled) == 1 else 'are'} already kept or rejected "
+        "(on the server, or waiting in the outbox), so this would be a second memory for "
+        f"{'it' if len(settled) == 1 else 'them'}."
+    )
+    if not rest:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise AlreadySettled(f"{said} Every commit of this bundle is settled, so the bundle was dropped.", True)
+    draft = dict(bundle.get("draft") or {}, kind=kind, domain=domain, text=text)
+    if str(draft.get("commit") or "") in settled:
+        draft["commit"] = str(rest[-1].get("sha") or "")
+    trimmed = dict(bundle, draft=draft, land=dict(land_meta, commits=rest))
+    write_json(folder / "bundle.json", trimmed)
+    if len(rest) < len(listed):
+        raise AlreadySettled(f"{said} They were taken off this bundle. Check the text, then approve it again.", False)
+    raise AlreadySettled(f"{said} Pick one of the bundle's own commits.", False)
 
 
 def approved_request(
@@ -2154,6 +2345,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             else:
                 self._send(404, "not found")
                 return
+        except AlreadySettled as error:
+            self._send(409, f"<p>{html.escape(str(error))}</p><p><a href='/'>Back</a></p>")
+            return
         except Refused as error:
             stored = ""
             if error.stored is not None:
