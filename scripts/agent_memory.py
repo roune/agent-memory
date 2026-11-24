@@ -51,8 +51,8 @@ HOME = Path.home()
 # lookup and install hint uses it. agent_memory_server keeps its own copy.
 DIST = "roune-agent-memory"
 INSTALL_HINT = (
-    "`uv tool install git+https://github.com/roune/agent-memory`, "
-    f"or `uv tool install {DIST}` once it is on PyPI"
+    f"`uv tool install {DIST}`, "
+    "or `uv tool install git+https://github.com/roune/agent-memory` for the unreleased main"
 )
 WINDOWS_MESSAGE = (
     "agent-memory runs on macOS, Linux and WSL 2. On Windows, install it inside WSL: "

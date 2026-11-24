@@ -6,13 +6,33 @@ build-backend = "setuptools.build_meta"
 name = "roune-agent-memory"
 version = "0.1.0"
 description = "File coding-agent sessions and git history, keep only what a person approves, and index that."
-readme = "README.md"
+# Not README.md: PyPI doesn't resolve its relative links or its image, and
+# absolute links would make the GitHub README worse on branches and forks.
+readme = "docs/pypi.md"
+keywords = ["coding-agent", "memory", "mcp", "cursor", "claude-code", "codex", "git", "qdrant"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    # No "License ::" classifier: setuptools 77+ refuses one next to the SPDX
+    # `license` expression below.
+]
 requires-python = ">=3.11"
 license = "PolyForm-Noncommercial-1.0.0"
 license-files = ["LICENSE", "NOTICE"]
 # The CLI is standard library only. AGENTS.md keeps capture and review free of
 # new dependencies.
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/roune/agent-memory"
+Source = "https://github.com/roune/agent-memory"
+Issues = "https://github.com/roune/agent-memory/issues"
+Documentation = "https://github.com/roune/agent-memory/blob/main/docs/deploy.md"
 
 [project.optional-dependencies]
 # The server in Docker: MCP over streamable HTTP, and the default embedder.

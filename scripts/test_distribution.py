@@ -208,3 +208,53 @@ class LastingInstallTest(Temp):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PyPITest(unittest.TestCase):
+    """PR 3: what PyPI shows, and that every install command names the distribution."""
+
+    def test_the_long_description_is_pypi_md_and_has_no_relative_links(self):
+        import re
+
+        self.assertEqual(pyproject()["readme"], "docs/pypi.md")
+        text = (ROOT / "docs" / "pypi.md").read_text()
+        self.assertEqual(re.findall(r"!\[[^\]]*\]\(", text), [])
+        for target in re.findall(r"\]\(([^)]+)\)", text):
+            self.assertTrue(target.startswith("https://"), target)
+
+    def test_metadata_has_urls_and_no_license_classifier(self):
+        project = pyproject()
+        for name in ("Homepage", "Source", "Issues", "Documentation"):
+            self.assertTrue(project["urls"][name].startswith("https://github.com/roune/agent-memory"))
+        self.assertTrue(project["keywords"])
+        self.assertIn("Environment :: Console", project["classifiers"])
+        self.assertEqual([c for c in project["classifiers"] if c.startswith("License ::")], [])
+
+    def test_every_install_command_names_the_distribution(self):
+        import re
+
+        command = re.compile(
+            r"(?:uv tool (?:install|upgrade)|pipx (?:install|upgrade)|uvx --from|mise (?:use -g|upgrade)) +'?(?:pipx:)?([^\s'`\]\[]+)"
+        )
+        files = [ROOT / "README.md", ROOT / "pyproject.toml", *sorted((ROOT / "docs").glob("*.md")), *sorted(SCRIPTS.glob("*.py"))]
+        files += sorted((SCRIPTS / "agent_memory_server").glob("*.py"))
+        # Plans and tests quote old or foreign names on purpose.
+        skip = {"distribution-plan.md", "server-plan.md", "research.md"}
+        for path in files:
+            if path.name in skip or path.name.startswith("test_"):
+                continue
+            for name in command.findall(path.read_text()):
+                if name.startswith(("git+", "--", ".", "$", "<", "{", '"')):
+                    continue
+                self.assertEqual(name, agent_memory.DIST, f"{path.name}: {name}")
+
+    def test_the_release_workflow_uploads_after_verify_with_a_pinned_action(self):
+        import re
+
+        text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        job = text[text.index("\n  pypi:") :]
+        self.assertIn("needs: [check, build, verify]", job)
+        self.assertIn("environment: pypi", job)
+        self.assertRegex(job, r"pypa/gh-action-pypi-publish@[0-9a-f]{40} # v\d")
+        self.assertEqual(text.count("id-token: write"), 1)
+        self.assertIn("twine check --strict", (ROOT / ".github" / "workflows" / "test.yml").read_text())

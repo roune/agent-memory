@@ -37,9 +37,16 @@ flowchart LR
 You need [uv](https://docs.astral.sh/uv/) and Docker with Compose. Install the CLI, then let it start the server:
 
 ```
-uv tool install git+https://github.com/roune/agent-memory
+uv tool install roune-agent-memory
 agent-memory setup
 ```
+
+That is on PyPI from v0.2.0. These work too:
+
+- **pipx:** `pipx install roune-agent-memory`.
+- **mise:** `mise use -g pipx:roune-agent-memory`. Use `mise activate`, not mise's shims, and run `agent-memory install` again after each `mise upgrade`. See [deploy.md](docs/deploy.md#other-ways-to-install-the-cli).
+- **Unreleased main:** `uv tool install git+https://github.com/roune/agent-memory`.
+- **Try it without installing:** `uvx --from roune-agent-memory agent-memory setup`. `agent-memory install` refuses a run like that, so install the CLI before you connect hooks.
 
 `setup` writes the release's `compose.yaml` into `~/.local/share/agent-memory/server/` (`--dir` picks another folder), pulls the published image `ghcr.io/roune/agent-memory-server` and Qdrant, starts them, waits for `/v1/health`, and writes `~/.config/agent-memory/server` with `url = http://127.0.0.1:8765` if that file is missing. Auth is off locally, and only loopback can reach the server. After you upgrade the CLI, run `agent-memory setup` again: it keeps your data and moves the server to the new version.
 
@@ -75,12 +82,12 @@ With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. 
 To build the memory for one repository:
 
 ```
-uv tool install git+https://github.com/roune/agent-memory  # put agent-memory on PATH
-agent-memory setup                                         # start Qdrant and the server
-agent-memory install --git-repo /path/to/repo              # editor hooks, and git hooks for that repo
-agent-memory land /path/to/repo --since 2026-01-01         # file its git history, grouped by PR
-agent-memory review                                        # approve or reject the drafts
-agent-memory connect --editor claude-code                  # MCP tools in your editor: claude-code, cursor, codex
+uv tool install roune-agent-memory                  # put agent-memory on PATH (from v0.2.0; see Install)
+agent-memory setup                                  # start Qdrant and the server
+agent-memory install --git-repo /path/to/repo       # editor hooks, and git hooks for that repo
+agent-memory land /path/to/repo --since 2026-01-01  # file its git history, grouped by PR
+agent-memory review                                 # approve or reject the drafts
+agent-memory connect --editor claude-code           # MCP tools in your editor: claude-code, cursor, codex
 ```
 
 From a clone of this repo, `./scripts/install` and `./scripts/setup` replace the first two lines.
