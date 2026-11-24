@@ -93,12 +93,14 @@ What the server answers decides what happens to the bundle:
 ```
 agent-memory sync                  # send the outbox now
 agent-memory sync --retry-failed   # send again what the server refused, after a fix
+agent-memory sync --resolve <item> supersede   # a 409: send the queued text as a newer memory
+agent-memory sync --resolve <item> drop        # a 409: keep the stored one, delete the queued text
 agent-memory list --team platform --since 2026-11-01T00:00:00+00:00
 agent-memory list --org acme --since 2026-11-01T00:00:00+00:00
 agent-memory list --repo github.com/owner/name
 ```
 
-`sync` stops at the first item the server doesn't take, so a server that is down costs one timeout and the order is kept. A 401 or 403 keeps the whole queue until you connect again. A 409 or another 4xx moves that item to `outbox/failed/`, where the review page lists it with its error. `flush` is retired: it prints "use `agent-memory sync`".
+`sync` stops at the first item the server doesn't take, so a server that is down costs one timeout and the order is kept. A 401 or 403 keeps the whole queue until you connect again. A 409 or another 4xx moves that item to `outbox/failed/`, where `sync` and the review page list it with its error. A 409 means different text is already kept under that id, so a retry gets 409 again: `sync` shows both texts, and `--resolve <item> supersede` sends yours as a new memory that supersedes the stored one, or `drop` keeps the stored one. See [docs/server.md](docs/server.md#the-outbox). `flush` is retired: it prints "use `agent-memory sync`".
 
 `list` asks the server. To use another server, or a token, see [Connecting the CLI](docs/server.md#connecting-the-cli). `~/.config/agent-memory/database` and `databases` are no longer read, except by `agent-memory migrate`, which copies an old `data/memories.sqlite` into the server.
 

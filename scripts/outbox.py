@@ -17,8 +17,14 @@ sync sends the queue in order. What each answer does:
   `agent-memory connect` fixes the token or the URL; nothing approved is set aside.
   A 403 with code "identity" is about that one item (a person, org or team the
   token may not write as), so it goes to failed/ like another 4xx.
-- 409: move the item to outbox/failed/ with the stored text alongside.
+- 409: move the item to outbox/failed/ with the stored text alongside. A
+  resend gets 409 again, because a kept memory is never edited, so resolve()
+  settles it: supersede sends the queued text as a new memory that supersedes
+  the stored one, and drop keeps the stored one.
 - Any other 4xx: move the item to outbox/failed/ with the error.
+
+Nothing leaves outbox/failed/ on its own: the approved text stays there until
+the person picks supersede or drop, or a retry gets through.
 
 Items for another server keep going when one server stops. A lock file makes
 sure only one sync runs at a time; a second one waits, then finds the queue
@@ -223,8 +229,15 @@ class Report:
         if left["queued"]:
             out.append(f"{left['queued']} waiting, the oldest for {left['oldest']}")
         if left["failed"]:
-            out.append(f"{left['failed']} failed: fix them, then run agent-memory sync --retry-failed")
+            out.append(f"{left['failed']} failed: {RESOLVE_HINT}")
         return out or ["nothing to send"]
+
+
+RESOLVE_HINT = (
+    "agent-memory sync lists each one. For a 409, choose with "
+    "agent-memory sync --resolve <item> supersede|drop; for another error, fix the cause, "
+    "then run agent-memory sync --retry-failed"
+)
 
 
 def drain(store_root, client_for, report=None):
@@ -295,6 +308,189 @@ def sync(store_root, client_for, retry=False):
         if retry:
             retry_failed(store_root)
         return drain(store_root, client_for)
+
+
+CHOICES = ("supersede", "drop")
+# How many ids resolve tries after the stored one: <session id>-2, -3, ...
+SUFFIXES = 20
+# How far resolve follows superseded_by to find the newest memory.
+CHAIN_LIMIT = 50
+
+
+class ResolveError(ValueError):
+    """resolve can't do what was asked. The item stays in outbox/failed/."""
+
+
+def _failed_path(store_root, name):
+    """The file in outbox/failed/ that name means: its file name, with or without .json."""
+    name = str(name or "").strip()
+    if name.endswith(".json"):
+        name = name[: -len(".json")]
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        raise ResolveError(f"{name or 'that'} is not an item name; agent-memory sync lists them")
+    path = failed_root(store_root) / f"{name}.json"
+    if not path.is_file():
+        raise ResolveError(f"no item {name} in {failed_root(store_root)}; agent-memory sync lists them")
+    return path
+
+
+def _read(path):
+    try:
+        item = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return item if isinstance(item, dict) else None
+
+
+def is_conflict(item):
+    """A memory the server refused with a 409: that id already holds different content."""
+    return (
+        isinstance(item, dict)
+        and item.get("op") == "memory"
+        and item.get("status") == 409
+        and isinstance(item.get("body"), dict)
+        and bool(item.get("stored_id"))
+        and bool(item.get("server_url"))
+    )
+
+
+def _newest(client, stored_id, text):
+    """(id to supersede, id already holding text or None), following superseded_by from stored_id.
+
+    Superseding the newest memory keeps the chain in one line: superseding an
+    old one again would move its superseded_by off the memory that replaced it.
+    When a newer memory in the chain already has the queued text, an earlier
+    resolve got through and nothing more is sent. A token without the read
+    scope can't follow the chain, so the stored id is used as it is.
+    """
+    chain = []
+    current = stored_id
+    while len(chain) < CHAIN_LIMIT:
+        try:
+            found = client.get_memory(current)
+        except server_client.ServerError as error:
+            if error.status == 403 and not chain:
+                return stored_id, None
+            raise
+        if found is None:
+            if not chain:
+                raise ResolveError(
+                    f"the server no longer keeps {stored_id}; run agent-memory sync --retry-failed "
+                    "to send the item as it was"
+                )
+            # superseded_by names a memory this server doesn't have: stop at the last one it has.
+            return chain[-1], None
+        if chain and memory_rules.clean_text(str(found.get("text") or "")) == text:
+            return current, current
+        chain.append(current)
+        newer = str(found.get("superseded_by") or "").strip()
+        if not newer or newer in chain:
+            return current, None
+        current = newer
+    return current, None
+
+
+def resolve(store_root, name, choice, client_for):
+    """Settle one item in outbox/failed/. Returns what was done, as a dict.
+
+    drop deletes the item: for a 409 the server keeps the memory it has. It
+    works for any failed item, an unreadable one included.
+
+    supersede is for a 409 only. A kept memory is never edited, so the queued
+    text goes to the server as a new memory under <session id>-2 (or the next
+    free number) whose supersedes names the stored one, or the newest memory
+    that replaces it. The server stamps superseded_by on that one. The item is
+    deleted only once the server has kept the new memory; when the server
+    doesn't answer, it stays where it is.
+    """
+    if choice not in CHOICES:
+        raise ResolveError(f"choose {' or '.join(CHOICES)}, not {choice!r}")
+    with lock(store_root):
+        path = _failed_path(store_root, name)
+        item = _read(path)
+        if choice == "drop":
+            path.unlink()
+            return {"choice": "drop", "item": item, "name": path.stem}
+        if not is_conflict(item):
+            status = (item or {}).get("status") or "unreadable"
+            raise ResolveError(
+                f"supersede is for a memory that got a 409, and {path.stem} failed with {status}: "
+                "fix the cause and run agent-memory sync --retry-failed, or drop it"
+            )
+        client = client_for(item["server_url"])
+        body = dict(item["body"])
+        text = memory_rules.clean_text(str(body.get("text") or ""))
+        target, already = _newest(client, item["stored_id"], text)
+        if already:
+            path.unlink()
+            return {"choice": "supersede", "item": item, "name": path.stem, "id": already, "supersedes": None, "already": True}
+        base = str(body.get("session_id") or "").strip()
+        replaced = str(body.get("supersedes") or "").strip()
+        for number in range(2, 2 + SUFFIXES):
+            body["session_id"] = f"{base}-{number}"
+            body["supersedes"] = target
+            try:
+                answer = send(client, {"op": "memory", "body": body})
+            except server_client.ServerError as error:
+                if error.status == 409:
+                    continue
+                raise
+            path.unlink()
+            return {
+                "choice": "supersede",
+                "item": item,
+                "name": path.stem,
+                "id": (answer or {}).get("id"),
+                "supersedes": target,
+                "dropped_link": replaced if replaced and replaced != target else None,
+                "already": False,
+            }
+        raise ResolveError(
+            f"every id from {base}-2 to {base}-{1 + SUFFIXES} already holds other text; "
+            "make a new note with Supersedes instead, then drop this item"
+        )
+
+
+def _indent(text, prefix="    "):
+    return "\n".join(prefix + line for line in (str(text or "").splitlines() or [""]))
+
+
+def describe_failed(store_root):
+    """Lines for every item in outbox/failed/: its error, and for a 409 both texts and the two choices."""
+    out = []
+    for path, item in failed(store_root):
+        name = path.stem
+        if item is None:
+            out.append(f"{name}: not readable. Drop it with agent-memory sync --resolve {name} drop")
+            continue
+        body = item.get("body") if isinstance(item.get("body"), dict) else {}
+        what = "memory" if item.get("op") == "memory" else "rejection"
+        out.append(f"{name}: {what} for {body.get('repo') or '?'}, queued {item.get('created_at') or '?'}")
+        if not is_conflict(item):
+            out.append(f"  failed ({item.get('status')}): {item.get('error') or ''}")
+            if item.get("op") == "memory":
+                out.append("  queued text:")
+                out.append(_indent(body.get("text")))
+            out.append(
+                "  fix the cause, then run agent-memory sync --retry-failed, "
+                f"or drop it: agent-memory sync --resolve {name} drop"
+            )
+            continue
+        stored_id = item["stored_id"]
+        out.append(f"  409: the server already keeps {stored_id} with other content.")
+        out.append("  queued text (yours, approved offline):")
+        out.append(_indent(body.get("text")))
+        out.append(f"  stored text ({stored_id}):")
+        out.append(_indent(item.get("stored")))
+        if memory_rules.clean_text(str(body.get("text") or "")) == memory_rules.clean_text(str(item.get("stored") or "")):
+            out.append("  The texts are the same; another field differs (kind, domain, commits, links or the time).")
+        out.append("  Choose one:")
+        out.append(
+            f"    agent-memory sync --resolve {name} supersede   "
+            f"send the queued text as a new memory that supersedes {stored_id}"
+        )
+        out.append(f"    agent-memory sync --resolve {name} drop        keep {stored_id} as it is, and delete the queued text")
+    return out
 
 
 def pending_for(store_root, url):

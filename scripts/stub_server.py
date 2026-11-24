@@ -128,8 +128,9 @@ class StubServer:
             return 400, {"error": str(error)}
         current = self.rows.get(document["id"])
         if current is not None:
-            kept = {key: value for key, value in current.items() if key != "updated_at"}
-            if kept != document:
+            # As the real app: superseded_by is set by a later write, so a resend still matches.
+            kept = {key: value for key, value in current.items() if key not in ("updated_at", "superseded_by")}
+            if kept != {key: value for key, value in document.items() if key != "superseded_by"}:
                 return 409, {
                     "error": f"{document['id']} is already kept with different content; a newer memory replaces it through supersedes",
                     "id": document["id"],
@@ -139,6 +140,8 @@ class StubServer:
             return 200, {"id": document["id"], "updated_at": current["updated_at"], "embedded": True}
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
         self.rows[document["id"]] = {**document, "updated_at": stamp}
+        if document.get("supersedes") in self.rows:
+            self.rows[document["supersedes"]]["superseded_by"] = document["id"]
         return 201, {"id": document["id"], "updated_at": stamp, "embedded": True}
 
     def kept(self, sha):
