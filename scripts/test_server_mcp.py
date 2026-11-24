@@ -366,7 +366,7 @@ class McpAuthTest(McpCase):
         self.assertEqual(refused.status_code, 403)
         self.assertIn("read", refused.json()["error"])
         session, _ = self.open_session(token=self.reader)
-        self.assertEqual(self.call(session, "list", token=self.reader)["structuredContent"], {"filter": {}, "offset": 0, "memories": [], "next_offset": None})
+        self.assertEqual(self.call(session, "list", token=self.reader)["structuredContent"], {"filter": {}, "limit": 20, "offset": 0, "memories": [], "next_offset": None})
         # A session doesn't outlive its token: each request is checked again.
         self.assertEqual(self.rpc("tools/list", session=session).status_code, 401)
         self.assertEqual(self.rpc("tools/list", session=session, token=self.writer).status_code, 403)

@@ -122,34 +122,22 @@ def clamp_offset(offset):
 
 
 def supersedes_first(results):
-    """results in score order, except that a superseded hit comes right after its newer hit.
+    """results in score order, except that a superseded hit never comes before its newer hit.
 
-    Only a hit whose superseded_by is also among the results moves, and only
-    down: nothing is dropped, no score changes, and the others keep their order. A
-    chain v1 -> v2 -> v3 comes out v3, v2, v1 at v3's place. A hit whose newer
-    one isn't a hit stays where its score put it; its superseded_by says to get
-    the newer one. Links that loop, which the API can't make but an import
-    could, keep score order.
+    A hit moves only when its superseded_by is a hit that scored lower: then it
+    goes to just after that newer hit. So it only ever moves down, nothing is
+    dropped, no score changes, and the others keep their order. A chain
+    v1 -> v2 -> v3, scored in that order, comes out v3, v2, v1 at v3's place.
+    When the newer hit already comes first, or isn't a hit, the old one keeps
+    its place; its superseded_by says to get the newer one. Because a move
+    always points further down the list, links that loop can't move a hit
+    twice.
     """
-    by_id = {hit["document_id"]: hit for hit in results}
-
-    def newer_hit(hit):
-        newer = hit.get("superseded_by")
-        return newer if newer in by_id and newer != hit["document_id"] else None
-
-    def ends(hit):
-        """Following superseded_by among the hits stops at a hit nothing supersedes."""
-        seen = {hit["document_id"]}
-        while (newer := newer_hit(hit)) is not None:
-            if newer in seen:
-                return False
-            seen.add(newer)
-            hit = by_id[newer]
-        return True
-
+    position = {hit["document_id"]: index for index, hit in enumerate(results)}
     older = {}
-    for hit in results:
-        if (newer := newer_hit(hit)) is not None and ends(hit):
+    for index, hit in enumerate(results):
+        newer = hit.get("superseded_by")
+        if position.get(newer, -1) > index:
             older.setdefault(newer, []).append(hit)
     moved = {hit["document_id"] for hits in older.values() for hit in hits}
     ordered = []
@@ -223,8 +211,8 @@ def list_memories(store, since=None, until=None, limit=None, offset=None, **give
     """Metadata query, newest occurred_at first. No ranking.
 
     filter echoes every filter that applied, since and until as the UTC bounds
-    compared. next_offset is the offset of the next page, or None when this
-    page is the last one.
+    compared. limit is the page size used, after clamping. next_offset is the
+    offset of the next page, or None when this page is the last one.
     """
     filters = filters_from(**given)
     try:
@@ -240,7 +228,13 @@ def list_memories(store, since=None, until=None, limit=None, offset=None, **give
     except (StoreError, ValueError) as error:
         raise QueryError(str(error)) from None
     echoed = {**filters, **{name: bound for name, bound in bounds.items() if bound is not None}}
-    return {"filter": echoed, "offset": skip, "memories": hits, "next_offset": skip + size if more else None}
+    return {
+        "filter": echoed,
+        "limit": size,
+        "offset": skip,
+        "memories": hits,
+        "next_offset": skip + size if more else None,
+    }
 
 
 FILTER_HELP = (
@@ -274,8 +268,8 @@ def build_server(store, embedding):
             "Semantic search over approved memories, best match first. Each hit has document_id, "
             "score, text, kind, domain, repo, commits, pull_request, occurred_at, person, org and "
             "team, and superseded_by or supersedes when set. When a hit and the memory that "
-            "supersedes it are both found, the superseded one comes right after the newer one, "
-            "even when its score is higher; both are returned. " + FILTER_HELP
+            "supersedes it are both found, the superseded one never comes first: if it scored "
+            "higher, it moves down to just after the newer one. Both are returned. " + FILTER_HELP
         ),
         annotations=read_only,
     )
@@ -307,7 +301,8 @@ def build_server(store, embedding):
         description=(
             "List approved memories by metadata, newest first. No semantic ranking. since and "
             "until are ISO-8601 times with a zone, such as 2026-08-01T00:00:00+00:00, or a date "
-            "such as 2026-08-01 (midnight UTC). limit is the page size (at most 100) and offset "
+            "such as 2026-08-01 (midnight UTC). limit is the page size (at most 100; the result "
+            "says the one used) and offset "
             "skips that many rows; pass next_offset back as offset for the next page, and stop "
             "when it is null. A memory approved while you page shifts later rows down, so a page "
             "can repeat a row from the one before. filter echoes the filters that applied, since "

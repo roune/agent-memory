@@ -138,6 +138,9 @@ class ListPagingTest(StoreCase):
         self.assertEqual(ids(last["memories"]), ["miguel-decision-n001", "miguel-decision-n000"])
         self.assertIsNone(last["next_offset"])
         self.assertEqual(mcp_tools.list_memories(self.store, offset=10)["memories"], [])
+        # limit is clamped to 100; the result says so, and next_offset follows the clamped size.
+        clamped = mcp_tools.list_memories(self.store, limit=500)
+        self.assertEqual((clamped["limit"], clamped["next_offset"]), (100, None))
         self.assertEqual(mcp_tools.list_memories(self.store, limit=3)["next_offset"], 3)
         self.assertIsNone(mcp_tools.list_memories(self.store, limit=5)["next_offset"])
 
@@ -200,13 +203,23 @@ class SupersedesFirstTest(unittest.TestCase):
         results = [self.hit("a", 0.9, "new"), self.hit("b", 0.8, "new"), self.hit("new", 0.5)]
         self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["new", "a", "b"])
 
-    def test_links_that_loop_keep_score_order(self):
-        results = [self.hit("a", 0.9, "b"), self.hit("x", 0.8), self.hit("b", 0.7, "a"), self.hit("s", 0.6, "s")]
-        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["a", "x", "b", "s"])
+    def test_an_old_hit_below_its_newer_hit_never_moves_up(self):
+        # Opus review: v1 used to be pulled up to second place, above x and y.
+        results = [self.hit("v2", 0.9), self.hit("x", 0.8), self.hit("y", 0.7), self.hit("v1", 0.6, "v2")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["v2", "x", "y", "v1"])
+        chain = [self.hit("v3", 0.9), self.hit("x", 0.8), self.hit("v2", 0.5, "v3"), self.hit("v1", 0.95, "v2")]
+        chain.sort(key=lambda hit: hit["score"], reverse=True)
+        self.assertEqual(ids(mcp_tools.supersedes_first(chain)), ["v3", "x", "v2", "v1"])
 
-    def test_a_hit_that_leads_into_a_loop_keeps_its_place(self):
-        results = [self.hit("c", 0.9, "a"), self.hit("a", 0.8, "b"), self.hit("b", 0.7, "a")]
-        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["c", "a", "b"])
+    def test_an_old_hit_already_below_its_newer_hit_stays_put(self):
+        results = [self.hit("new", 0.9), self.hit("x", 0.8), self.hit("a", 0.7, "new"), self.hit("b", 0.6, "zz")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["new", "x", "a", "b"])
+
+    def test_links_that_loop_move_a_hit_at_most_once(self):
+        results = [self.hit("a", 0.9, "b"), self.hit("x", 0.8), self.hit("b", 0.7, "a"), self.hit("s", 0.6, "s")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["x", "b", "a", "s"])
+        into = [self.hit("c", 0.9, "a"), self.hit("a", 0.8, "b"), self.hit("b", 0.7, "a")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(into)), ["b", "a", "c"])
 
 
 class SearchSupersedeTest(StoreCase):
@@ -267,9 +280,10 @@ class McpHttpTest(test_server_mcp.McpCase):
         tools = {tool["name"]: tool for tool in listed}
         self.assertIn("offset", tools["list"]["inputSchema"]["properties"])
         self.assertIn("next_offset", tools["list"]["description"])
-        self.assertIn("superseded one comes right after", tools["search"]["description"])
+        self.assertIn("superseded one never comes first", tools["search"]["description"])
         first = self.call("list", repo=REPO, since="2026-11-01", limit=2)["structuredContent"]
         self.assertEqual(first["filter"], {"repo": REPO, "since": "2026-11-01T00:00:00+00:00"})
+        self.assertEqual(first["limit"], 2)
         self.assertEqual(first["next_offset"], 2)
         second = self.call("list", repo=REPO, since="2026-11-01", limit=2, offset=first["next_offset"])
         self.assertEqual(ids(second["structuredContent"]["memories"]), ["miguel-decision-n000"])
