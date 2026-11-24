@@ -1,6 +1,6 @@
 # Distribution plan
 
-Status: written from Miguel's interview answers on 24 November 2026, and waiting for his approval. No PR below is built yet.
+Status: approved by Miguel on 24 November 2026, after his interview answers the same day and an Opus review of this plan. Each PR below says what it builds.
 
 This plan covers how someone installs and starts agent-memory without a clone. Today that takes a uv install from git and then about seven manual steps from [deploy.md](deploy.md#one-laptop-without-a-clone): make a folder, download `compose.yaml`, create the data folders, write `.env`, pull, start, and connect. The plan replaces those steps with one command, `agent-memory setup`, and makes the CLI installable from PyPI and a Homebrew tap.
 

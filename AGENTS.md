@@ -10,7 +10,7 @@ The vector engine is Qdrant server, which only the agent-memory server container
 
 ## Working here
 
-Read [docs/context.md](docs/context.md) first. [docs/server.md](docs/server.md) describes the server: routes, auth, MCP, embedding, and `reindex`. [docs/deploy.md](docs/deploy.md) covers running it on one laptop or as a team server, and how a release is made. [docs/harnesses.md](docs/harnesses.md) and [docs/integration.md](docs/integration.md) cover the editor hooks. [docs/server-plan.md](docs/server-plan.md) is the plan the server was built from. All of its PRs are merged. [docs/distribution-plan.md](docs/distribution-plan.md) is the plan for installing without a clone: `agent-memory setup`, PyPI and a Homebrew tap. It is waiting for approval.
+Read [docs/context.md](docs/context.md) first. [docs/server.md](docs/server.md) describes the server: routes, auth, MCP, embedding, and `reindex`. [docs/deploy.md](docs/deploy.md) covers running it on one laptop or as a team server, and how a release is made. [docs/harnesses.md](docs/harnesses.md) and [docs/integration.md](docs/integration.md) cover the editor hooks. [docs/server-plan.md](docs/server-plan.md) is the plan the server was built from. All of its PRs are merged. [docs/distribution-plan.md](docs/distribution-plan.md) is the plan for installing without a clone: `agent-memory setup`, PyPI and a Homebrew tap. Miguel approved it; its PRs are being built in order.
 
 Sections 2 to 4 of [docs/research.md](docs/research.md) are answered: the engine, the model, and the hook facts. Section 1, what already does this, is still open.
 
