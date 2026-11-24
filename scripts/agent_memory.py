@@ -513,7 +513,11 @@ def file_hook_group(repo_s, group, event, branch, tip, remote_id, auto_approve):
             # The hook's own status call may time out, so sync asks again before
             # it sends: a commit someone else already explained gets no second memory.
             shas = [m["sha"] for m in group["commits"]]
+            # A PR is dropped only when all its commits are settled: a duplicate
+            # costs one Reject, a missed memory is lost.
             check = {"repo": remote_id, "shas": shas} if remote_id else None
+            if check and len(shas) > 1:
+                check["all"] = True
             return outbox.add(store_root(), url, "memory", body, unless_settled=check)
         except (ValueError, OSError, server_client.ConfigError) as error:
             log(f"git-hook: auto_approve failed, inbox bundle kept for review: {error}")
@@ -554,8 +558,8 @@ def git_hook(args):
     default = local_default_branch(repo_s, fall_back_to_head=False)
     if not default:
         log(
-            "git-hook skipped: no default branch (no origin/HEAD, main or master); "
-            "run git remote set-head origin --auto"
+            "git-hook skipped: no local default branch (origin/HEAD's branch, main or master); "
+            "set origin/HEAD with git remote set-head origin --auto, or check out that branch once"
         )
         return 0
     if branch != default:
@@ -1045,18 +1049,24 @@ def commits_on_branch_since(repo, branch, since_iso):
 
 def commit_records(repo, shas):
     """{sha, committer_date, message} for each sha, in the order given."""
-    if not shas:
-        return []
-    return _log_records(run(["git", "log", "--no-walk=unsorted", _LOG_FORMAT, *shas], repo))
+    records = []
+    # In batches, so a pull of many thousands of commits stays under ARG_MAX.
+    for start in range(0, len(shas), 500):
+        batch = shas[start : start + 500]
+        records.extend(_log_records(run(["git", "log", "--no-walk=unsorted", _LOG_FORMAT, *batch], repo)))
+    return records
 
 
 def _log_records(listing):
     commits = []
     for block in listing.split("\x1e"):
-        block = block.strip()
-        if not block:
+        block = block.strip("\n")
+        if not block.strip():
             continue
+        # An empty message leaves "sha\x1fct", once run() strips the output's end.
         parts = block.split("\x1f", 2)
+        if len(parts) == 2:
+            parts.append("")
         if len(parts) < 3:
             continue
         sha, ct_s, message = parts[0], parts[1], parts[2]
@@ -1736,12 +1746,8 @@ def approve(
         superseded_by=superseded_by,
         updates=updates,
     )
-    if bundle.get("tool") == "git" and body.get("commits"):
-        check = {"repo": body["repo"], "shas": list(body["commits"])}
-        if not queue_only:
-            recheck_git_bundle(bundle, check, kind, domain, text)
-        # Queued because the server is down: sync asks once more before it sends.
-        unless_settled = unless_settled or check
+    if bundle.get("tool") == "git" and body.get("commits") and not queue_only:
+        recheck_git_bundle(bundle, {"repo": body["repo"], "shas": list(body["commits"])}, kind, domain, text)
     status, answer = deliver(url, "memory", body, queue_only=queue_only, unless_settled=unless_settled)
     shutil.rmtree(session_dir(bundle["tool"], bundle["session_id"]))
     if status == "sent":
@@ -1762,38 +1768,45 @@ def recheck_git_bundle(bundle, check, kind, domain, text):
 
     A land bundle can wait in review while the git hook auto-approves the same
     commit, or another laptop keeps it. Approving it then would store a second
-    memory for that commit. The outbox is read first, then /v1/commits/status
-    is asked. If the server can't be reached, nothing is known, and the
-    approve goes ahead (queued with unless_settled, so sync asks once more).
+    memory for that commit. /v1/commits/status is asked, with the page's short
+    timeout, and the outbox is read. If the server can't be reached, only the
+    outbox is known. A queued approve carries no unless_settled: sync would
+    drop the reviewed text if one commit were rejected meanwhile.
 
-    When every commit the bundle lists is settled, the bundle is dropped. When
-    only some are, they are taken off it, and the text as edited is kept for
-    the next try.
+    Only what the server reports kept or rejected changes the bundle. When that
+    is every commit it lists, it is dropped; when it is some, they are taken
+    off it, and the text as edited is kept for the next try. A commit that only
+    an outbox item covers (queued, or in failed/) is refused with the bundle
+    kept, since that item may never reach the server.
     """
-    settled = settled_commits(check["repo"], check["shas"])
-    if not settled:
+    on_server = server_settled(check["repo"], check["shas"], timeout=PAGE_TIMEOUT)
+    waiting = waiting_settled(check["repo"], [sha for sha in check["shas"] if sha not in on_server])
+    if not on_server and not waiting:
         return
     folder = session_dir(bundle["tool"], bundle["session_id"])
     land_meta = bundle.get("land") if isinstance(bundle.get("land"), dict) else {}
     listed = [c for c in land_meta.get("commits") or [] if isinstance(c, dict)]
-    rest = [c for c in listed if str(c.get("sha") or "") not in settled]
-    named = ", ".join(sha[:10] for sha in check["shas"] if sha in settled)
-    said = (
-        f"Not approved: {named} {'is' if len(settled) == 1 else 'are'} already kept or rejected "
-        "(on the server, or waiting in the outbox), so this would be a second memory for "
-        f"{'it' if len(settled) == 1 else 'them'}."
-    )
-    if not rest:
+    rest = [c for c in listed if str(c.get("sha") or "") not in on_server]
+
+    def names(found):
+        return ", ".join(sha[:10] for sha in check["shas"] if sha in found)
+
+    said = []
+    if on_server:
+        said.append(f"{names(on_server)}: already kept or rejected on the server")
+    if waiting:
+        said.append(f"{names(waiting)}: waiting in the outbox (run agent-memory sync, or see its failed items)")
+    said = "Not approved, so no commit gets a second memory. " + "; ".join(said) + "."
+    if listed and not rest:
         shutil.rmtree(folder, ignore_errors=True)
         raise AlreadySettled(f"{said} Every commit of this bundle is settled, so the bundle was dropped.", True)
     draft = dict(bundle.get("draft") or {}, kind=kind, domain=domain, text=text)
-    if str(draft.get("commit") or "") in settled:
+    if rest and str(draft.get("commit") or "") in on_server:
         draft["commit"] = str(rest[-1].get("sha") or "")
-    trimmed = dict(bundle, draft=draft, land=dict(land_meta, commits=rest))
-    write_json(folder / "bundle.json", trimmed)
-    if len(rest) < len(listed):
-        raise AlreadySettled(f"{said} They were taken off this bundle. Check the text, then approve it again.", False)
-    raise AlreadySettled(f"{said} Pick one of the bundle's own commits.", False)
+    write_json(folder / "bundle.json", dict(bundle, draft=draft, land=dict(land_meta, commits=rest)))
+    if 0 < len(rest) < len(listed):
+        raise AlreadySettled(f"{said} Those were taken off this bundle. Check the text, then approve it again.", False)
+    raise AlreadySettled(f"{said} The bundle is kept, with your text.", False)
 
 
 def approved_request(

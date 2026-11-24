@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -112,7 +113,7 @@ class DefaultBranchOnlyTest(HookCase):
         self.install(auto_approve=False)
         self.commit_as("t1", "on trunk")
         self.assertEqual(self.bundles(), [])
-        self.assertIn("no default branch", (self.state / "capture.log").read_text())
+        self.assertIn("no local default branch", (self.state / "capture.log").read_text())
 
         self.git("update-ref", "refs/remotes/origin/trunk", "HEAD")
         self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
@@ -310,19 +311,46 @@ class ApproveRecheckTest(test_cutover.Case):
         row = self.server.rows["tester-change-s1"]
         self.assertEqual((row["commits"], row["pull_request"]), ([B], 4))
 
-    def test_a_commit_waiting_in_the_outbox_counts_without_a_network_call(self):
+    def test_a_commit_waiting_in_the_outbox_is_refused_and_the_bundle_kept(self):
         outbox.add(self.state, test_cutover.dead_url(), "rejection", {"repo": REPO, "shas": [A]})
-        with self.assertRaises(agent_memory.AlreadySettled):
-            agent_memory.approve(self.bundle(shas=(A,)), "change", "code", "why", commit=A)
-        self.assertFalse(self.bundle_exists())
-        self.assertEqual(self.server.requests, [])
+        with self.assertRaises(agent_memory.AlreadySettled) as raised:
+            agent_memory.approve(self.bundle(shas=(A,)), "change", "code", "edited", commit=A)
+        self.assertFalse(raised.exception.dropped)
+        self.assertIn("waiting in the outbox", str(raised.exception))
+        self.assertEqual(agent_memory.find_bundle("s1", "git")["draft"]["text"], "edited")
+        self.assertEqual(self.server.posts("/v1/memories"), [])
 
-    def test_offline_approve_queues_with_a_check_for_sync(self):
+    def test_a_failed_outbox_item_never_drops_the_bundle(self):
+        """A hook item that got a 4xx sits in failed/ and may never be sent."""
+        path = outbox.add(self.state, self.server.url, "memory", {"commits": [A], "commit": A})
+        outbox._move_to_failed(self.state, path, json.loads(path.read_text()), agent_memory.server_client.ServerError(403, "org"))
+        with self.assertRaises(agent_memory.AlreadySettled) as raised:
+            agent_memory.approve(self.bundle(shas=(A,)), "change", "code", "why", commit=A)
+        self.assertFalse(raised.exception.dropped)
+        self.assertTrue(self.bundle_exists())
+
+    def test_offline_approve_queues_the_reviewed_text_without_a_drop_check(self):
+        """sync must not drop text a person reviewed because one commit was rejected meanwhile."""
         self.connect(test_cutover.dead_url())
         result = agent_memory.approve(self.bundle(shas=(A, B)), "change", "code", "why", commit=B)
         self.assertEqual(result["status"], "queued")
         [item] = self.queued()
-        self.assertEqual(item["unless_settled"], {"repo": REPO, "shas": [A, B]})
+        self.assertNotIn("unless_settled", item)
+
+    def test_a_bundle_listing_no_commits_is_refused_not_dropped(self):
+        self.keep(A)
+        bundle = self.bundle(shas=(A,))
+        bundle["land"]["commits"] = []
+        agent_memory.write_json(agent_memory.session_dir("git", "s1") / "bundle.json", bundle)
+        with self.assertRaises(agent_memory.AlreadySettled) as raised:
+            agent_memory.approve(bundle, "change", "code", "why", commit=A)
+        self.assertFalse(raised.exception.dropped)
+        self.assertTrue(self.bundle_exists())
+
+    def test_the_recheck_uses_the_page_timeout(self):
+        with unittest.mock.patch.object(agent_memory, "server_settled", return_value=set()) as settled:
+            agent_memory.approve(self.bundle(shas=(A,)), "change", "code", "why", commit=A)
+        self.assertEqual(settled.call_args.kwargs["timeout"], agent_memory.PAGE_TIMEOUT)
 
     def test_a_session_bundle_is_not_rechecked(self):
         self.keep(A)
@@ -339,6 +367,91 @@ class ReviewPageRecheckTest(test_cutover.ReviewPageCase):
         self.assertIn("already kept or rejected", page)
         self.assertIn("bundle was dropped", page)
         self.assertFalse(self.bundle_exists())
+
+
+class SyncDropTest(test_cutover.Case):
+    """A PR the hook filed as one memory is dropped by sync only when all its commits are settled."""
+
+    def item(self, check):
+        body = {"kind": "change", "domain": "code", "text": "PR", "repo": REPO, "tool": "git", "session_id": "pr",
+                "org": "Org", "team": "Team", "person": "tester", "occurred_at": "2026-11-20T10:00:00+00:00",
+                "commit": B, "commits": [A, B]}
+        outbox.add(self.state, self.server.url, "memory", body, unless_settled=check)
+
+    def test_one_commit_kept_elsewhere_does_not_drop_the_pr(self):
+        self.server.rows["mate-change-x"] = {"id": "mate-change-x", "commits": [A], "updated_at": "1", "text": "k"}
+        self.item({"repo": REPO, "shas": [A, B], "all": True})
+        self.sync()
+        self.assertIn("tester-change-pr", self.server.rows)
+
+    def test_every_commit_kept_drops_it(self):
+        self.server.rows["mate-change-x"] = {"id": "mate-change-x", "commits": [A, B], "updated_at": "1", "text": "k"}
+        self.item({"repo": REPO, "shas": [A, B], "all": True})
+        self.sync()
+        self.assertNotIn("tester-change-pr", self.server.rows)
+        self.assertEqual(self.queued(), [])
+
+    def test_without_all_one_commit_is_enough(self):
+        self.server.rows["mate-change-x"] = {"id": "mate-change-x", "commits": [A], "updated_at": "1", "text": "k"}
+        self.item({"repo": REPO, "shas": [A, B]})
+        self.sync()
+        self.assertNotIn("tester-change-pr", self.server.rows)
+
+
+class GhMergedPrsTest(unittest.TestCase):
+    def test_a_failed_list_falls_back_to_one_call_each(self):
+        calls = []
+
+        def fake_run(command, cwd=None):
+            calls.append(command[:3])
+            if command[:3] == ["gh", "pr", "view"]:
+                return json.dumps({"title": "T", "body": "B"})
+            return ""
+
+        with unittest.mock.patch.object(agent_memory, "run", fake_run):
+            prs = agent_memory.GhMergedPrs("/r", "2026-11-20T00:00:00+00:00")
+            self.assertEqual(prs.describe("/r", 4), ("T", "B"))
+            self.assertIsNone(prs.pr_for_sha(A))
+        self.assertEqual(calls, [["gh", "pr", "list"], ["gh", "pr", "view"], ["gh", "pr", "list"]])
+
+    def test_a_list_cut_at_the_limit_asks_for_what_it_misses(self):
+        rows = [{"number": n, "title": f"t{n}", "body": "", "mergeCommit": {"oid": f"{n:040x}"}} for n in range(1, 4)]
+        calls = []
+
+        def fake_run(command, cwd=None):
+            calls.append(command)
+            if "--state" in command and "--search" in command and "merged:>=2026-11-19" in command:
+                return json.dumps(rows)
+            return ""
+
+        with unittest.mock.patch.object(agent_memory, "run", fake_run), \
+                unittest.mock.patch.object(agent_memory, "GH_PR_LIMIT", 3):
+            prs = agent_memory.GhMergedPrs("/r", "2026-11-20T00:00:00+00:00")
+            self.assertEqual(prs.pr_for_sha(f"{2:040x}"), 2)
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(prs.pr_for_sha(A))
+            self.assertEqual(len(calls), 2, "a miss in a cut list is asked for alone")
+            self.assertEqual(prs.describe("/r", 3), ("t3", ""))
+            self.assertEqual(len(calls), 2)
+
+
+class CommitRecordsTest(HookCase):
+    def test_an_empty_message_commit_on_main_is_filed(self):
+        self.commit_as("base", "base", hooks=False)
+        self.install(auto_approve=False)
+        (self.repo / "e").write_text("e\n", encoding="utf-8")
+        self.git("add", "e")
+        self.git("commit", "-q", "--allow-empty-message", "-m", "")
+        head = self.head()
+        [bundle] = self.bundles()
+        self.assertEqual([c["sha"] for c in bundle["land"]["commits"]], [head])
+
+    def test_many_commits_are_read_in_batches(self):
+        shas = [self.commit_as(f"f{i}", f"commit {i}", hooks=False) for i in range(3)]
+        with unittest.mock.patch.object(agent_memory, "run", wraps=agent_memory.run) as run:
+            records = agent_memory.commit_records(str(self.repo), shas * 400)
+        self.assertEqual(run.call_count, 3, "1200 shas in batches of 500")
+        self.assertEqual({record["sha"] for record in records}, set(shas))
 
 
 class LandTest(HookCase):

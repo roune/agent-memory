@@ -76,7 +76,8 @@ def add(store_root, server_url, op, body, unless_settled=None):
 
     unless_settled, {"repo", "shas"}, makes sync ask /v1/commits/status first
     and drop the item when the server reports one of those commits kept or
-    rejected. A hook that must not wait on the network leaves that check to sync.
+    rejected; with "all": True, only when it reports every one of them. A hook
+    that must not wait on the network leaves that check to sync.
     """
     if op not in OPS:
         raise ValueError(f"unknown outbox op {op!r}")
@@ -90,6 +91,8 @@ def add(store_root, server_url, op, body, unless_settled=None):
     }
     if unless_settled:
         item["unless_settled"] = {"repo": unless_settled["repo"], "shas": list(unless_settled["shas"])}
+        if unless_settled.get("all"):
+            item["unless_settled"]["all"] = True
     path = root(store_root) / f"{_stamp()}-{uuid.uuid4().hex}.json"
     write_private(path, item)
     return path
@@ -170,7 +173,10 @@ def settled_already(client, item):
     if not isinstance(check, dict) or not check.get("repo") or not check.get("shas"):
         return False
     answer = client.commits_status(check["repo"], check["shas"])
-    return any(isinstance(info, dict) and (info.get("kept") or info.get("rejected")) for info in answer.values())
+    if not check.get("all"):
+        return any(isinstance(info, dict) and (info.get("kept") or info.get("rejected")) for info in answer.values())
+    infos = [answer.get(sha) for sha in check["shas"]]
+    return all(isinstance(info, dict) and (info.get("kept") or info.get("rejected")) for info in infos)
 
 
 def send(client, item):

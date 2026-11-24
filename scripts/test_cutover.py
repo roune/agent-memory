@@ -153,9 +153,7 @@ class ApproveTest(Case):
         self.assertFalse(self.bundle_exists())
         [(path, item)] = outbox.queued(self.state)
         self.assertEqual(mode_bits(path), 0o600)
-        self.assertEqual(set(item), {"server_url", "op", "body", "created_at", "attempts", "last_error", "unless_settled"})
-        # sync asks the server about the commit once more before it sends.
-        self.assertEqual(item["unless_settled"], {"repo": REPO, "shas": [A]})
+        self.assertEqual(set(item), {"server_url", "op", "body", "created_at", "attempts", "last_error"})
         self.assertEqual((item["server_url"], item["op"]), (url, "memory"))
         self.assertEqual(
             set(item["body"]),
