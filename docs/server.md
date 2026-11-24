@@ -121,7 +121,7 @@ The review page shows a banner: connected (as whom), offline, or not configured;
 | `POST /v1/commits/status` `{repo, shas}` | read | `{commits: {sha: {kept, rejected}}}`. Abbreviated hashes match both ways. |
 | `POST /v1/tokens` `{label}` | read and write | Mints a read-only child of the caller's token, for an editor. Returns the secret once. The same label again replaces the earlier child. A label is at most 64 characters, one line. 400 with auth off. |
 | `POST /mcp` | read | MCP over streamable HTTP, with the read-only tools `search`, `get` and `list`. See [MCP](#mcp). |
-| `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. Returns `{written, skipped, rejections, newer}`, where `newer` lists the skipped ids the server holds at a later `updated_at`. |
+| `POST /v1/admin/import` `{memories, rejections}` | admin | Bulk upsert of full rows, each with its own `id`, `person` and `updated_at`. A newer `updated_at` wins. Up to 500 of each per request. Returns `{written, skipped, rejections, newer}`, where `newer` lists the skipped ids the server holds at a later `updated_at`. The rows are embedded after the reply is sent; `/v1/health` counts those still `pending`. |
 
 With auth off, every caller has every scope.
 

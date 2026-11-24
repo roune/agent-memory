@@ -173,29 +173,47 @@ class Embedding:
         Called after each write and by the retry loop.
         """
         with self._lock:
-            try:
-                if self.state != "ready":
-                    self.prepare()
-                    self.state = "ready"
-                self.embed_all_pending()
-            except EmbeddingMismatch as error:
-                self.state, self.error = "mismatch", str(error)
-                log.error("%s", error)
-                return False
-            except (QdrantError, EmbedderError, StoreError, OSError) as error:
-                if self.state == "ready":
-                    self.state = "pending"
-                self.error = str(error)
-                log.warning("embedding is waiting: %s", error)
-                return False
-            except Exception as error:  # a bug in a model or a transport must not kill the server
-                if self.state == "ready":
-                    self.state = "pending"
-                self.error = f"{type(error).__name__}: {error}"
-                log.exception("embedding failed")
-                return False
-            self.error = ""
-            return True
+            return self._embed_pending_locked()
+
+    def embed_pending_if_idle(self):
+        """embed_pending, unless another caller is embedding already. Never blocks or raises.
+
+        For work queued behind a reply, such as an import: a caller that waited
+        here would hold a threadpool thread for the whole backlog, and a long
+        migrate would use up the pool. The caller holding the lock reads pending
+        rows again after each batch, and the retry loop takes what it misses.
+        """
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            return self._embed_pending_locked()
+        finally:
+            self._lock.release()
+
+    def _embed_pending_locked(self):
+        try:
+            if self.state != "ready":
+                self.prepare()
+                self.state = "ready"
+            self.embed_all_pending()
+        except EmbeddingMismatch as error:
+            self.state, self.error = "mismatch", str(error)
+            log.error("%s", error)
+            return False
+        except (QdrantError, EmbedderError, StoreError, OSError) as error:
+            if self.state == "ready":
+                self.state = "pending"
+            self.error = str(error)
+            log.warning("embedding is waiting: %s", error)
+            return False
+        except Exception as error:  # a bug in a model or a transport must not kill the server
+            if self.state == "ready":
+                self.state = "pending"
+            self.error = f"{type(error).__name__}: {error}"
+            log.exception("embedding failed")
+            return False
+        self.error = ""
+        return True
 
     def status(self):
         return {**self.description, "state": self.state, "error": self.error}

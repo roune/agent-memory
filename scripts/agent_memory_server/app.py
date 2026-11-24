@@ -28,6 +28,7 @@ import json
 import logging
 
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.requests import Request
@@ -262,8 +263,12 @@ def create_app(settings, store, embedding, retry_seconds=None):
         who = await caller(request, "admin")
         memories, rejections = rules.import_from_body(await _body(request))
         counts = await run_in_threadpool(store.import_rows, memories, rejections, who.token_id)
-        counts["embedded"] = await embed_now()
-        return JSONResponse(counts)
+        # Embed after the reply is sent. A batch of 50 on a cold model can take
+        # longer than the CLI's 10-second timeout, and migrate needs only the
+        # rows: what is still pending shows in /v1/health. If another embed is
+        # running, this one returns at once rather than park a threadpool
+        # thread behind it; that embed or the retry loop takes these rows.
+        return JSONResponse(counts, background=BackgroundTask(embedding.embed_pending_if_idle))
 
     async def post_tokens(request):
         """A read-only child of the caller's token, for an editor. The same label replaces the earlier one.
