@@ -34,16 +34,23 @@ flowchart LR
 
 ## Install
 
-You need [uv](https://docs.astral.sh/uv/) and Docker with Compose. From a clone of this repo:
+You need [uv](https://docs.astral.sh/uv/) and Docker with Compose. Install the CLI, then let it start the server:
+
+```
+uv tool install git+https://github.com/roune/agent-memory
+agent-memory setup
+```
+
+`setup` writes the release's `compose.yaml` into `~/.local/share/agent-memory/server/` (`--dir` picks another folder), pulls the published image `ghcr.io/roune/agent-memory-server` and Qdrant, starts them, waits for `/v1/health`, and writes `~/.config/agent-memory/server` with `url = http://127.0.0.1:8765` if that file is missing. Auth is off locally, and only loopback can reach the server. After you upgrade the CLI, run `agent-memory setup` again: it keeps your data and moves the server to the new version.
+
+To work on agent-memory itself, use a clone. The CLI then runs the clone's code, and the server is built from it:
 
 ```
 ./scripts/install
 ./scripts/setup
 ```
 
-`install` runs `uv tool install --editable .`, so the `agent-memory` on your `PATH` runs this clone's code. `setup` builds the server image from the clone, starts it and Qdrant with `docker compose`, waits for `/v1/health`, and writes `~/.config/agent-memory/server` with `url = http://127.0.0.1:8765` if that file is missing. Auth is off locally, and only loopback can reach the server.
-
-Without a clone, install the CLI with `uv tool install git+https://github.com/roune/agent-memory`, and run the published image `ghcr.io/roune/agent-memory-server` with the release's `compose.yaml`. [docs/deploy.md](docs/deploy.md) has those steps, a team server with auth on (`compose.team.yaml`), and how a release is made.
+`install` runs `uv tool install --editable .`. `setup` builds the server image from the clone, starts it and Qdrant with `docker compose`, waits for `/v1/health`, and writes the same server file. The clone's server and `agent-memory setup`'s can't both run, because they share port 8765. [docs/deploy.md](docs/deploy.md) has the details, the manual steps without `setup`, a team server with auth on (`compose.team.yaml`), upgrades, and how a release is made.
 
 The distribution is named `roune-agent-memory`; the command is `agent-memory`. On Windows, run everything inside WSL 2: see [Windows (WSL 2)](docs/deploy.md#windows-wsl-2).
 
@@ -65,16 +72,18 @@ With `--yes` and `--git-repo`, also pass `--install-git-hooks true` or `false`. 
 
 ## Quick start
 
-To build the memory for one repository, from a clone of this repo:
+To build the memory for one repository:
 
 ```
-./scripts/install                                   # put agent-memory on PATH
-./scripts/setup                                     # start Qdrant and the server
-agent-memory install --git-repo /path/to/repo       # editor hooks, and git hooks for that repo
-agent-memory land /path/to/repo --since 2026-01-01  # file its git history, grouped by PR
-agent-memory review                                 # approve or reject the drafts
-agent-memory connect --editor claude-code           # MCP tools in your editor: claude-code, cursor, codex
+uv tool install git+https://github.com/roune/agent-memory  # put agent-memory on PATH
+agent-memory setup                                         # start Qdrant and the server
+agent-memory install --git-repo /path/to/repo              # editor hooks, and git hooks for that repo
+agent-memory land /path/to/repo --since 2026-01-01         # file its git history, grouped by PR
+agent-memory review                                        # approve or reject the drafts
+agent-memory connect --editor claude-code                  # MCP tools in your editor: claude-code, cursor, codex
 ```
+
+From a clone of this repo, `./scripts/install` and `./scripts/setup` replace the first two lines.
 
 Pick a `--since` date before the repo's first commit. `--editor` takes a comma-separated list, such as `claude-code,cursor,codex`. Pi has no MCP entry. From then on, the hooks file new commits and sessions. Sessions from before the install are not captured.
 

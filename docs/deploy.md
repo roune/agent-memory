@@ -5,7 +5,7 @@ There are three ways to run it. Each one has two parts: the `agent-memory` CLI o
 | Setup | CLI | Server | Auth |
 | --- | --- | --- | --- |
 | [One laptop, from a clone](#one-laptop-from-a-clone) | `./scripts/install` (editable) | `./scripts/setup`, built from the clone | off, loopback only |
-| [One laptop, without a clone](#one-laptop-without-a-clone) | `uv tool install git+https://github.com/roune/agent-memory` | `compose.yaml`, the published image | off, loopback only |
+| [One laptop, without a clone](#one-laptop-without-a-clone) | `uv tool install git+https://github.com/roune/agent-memory` | `agent-memory setup`, with `compose.yaml` from the package and the published image | off, loopback only |
 | [A team server](#a-team-server) | the same tool install on each laptop | `compose.team.yaml`, the published image | on |
 
 The image is `ghcr.io/roune/agent-memory-server:<version>`, for `linux/amd64` and `linux/arm64`. `compose.yaml` and `compose.team.yaml` pin the version of their release. To run another image, set `AGENT_MEMORY_IMAGE` in `.env`.
@@ -96,6 +96,53 @@ You need [uv](https://docs.astral.sh/uv/) and Docker with Compose.
 
 ```
 uv tool install git+https://github.com/roune/agent-memory
+agent-memory setup
+agent-memory install         # editor hooks, after a yes
+```
+
+`setup` does what `./scripts/setup` does in a clone, with the published image. It checks everything first and writes nothing until every check has passed:
+
+- **Docker** is installed, `docker compose` works, and the daemon answers. Each failure prints one line that says what to install or start.
+- **No newer server's files are in the folder.** If the folder's `compose.yaml` pins a newer version than the CLI, `setup` stops and says to upgrade the CLI. `--force` goes back anyway.
+- **Port 8765 is free**, or held by this folder's own server. If the `agent-memory-server` compose project runs from another folder, `setup` names that folder and says to pass `--dir` with it, or to stop that project. If a clone's server answers, it says to run `docker compose down` in that clone.
+
+Then it writes, pulls and starts:
+
+- **The folder** is `${XDG_DATA_HOME:-~/.local/share}/agent-memory/server/`. `agent-memory setup --print-dir` prints it. `--dir <path>` picks another, and `~/.config/agent-memory/setup` remembers it, so a rerun without `--dir` finds it. `AGENT_MEMORY_DIR` moves the CLI's state, not this folder.
+- **`compose.yaml`** is the copy inside the package, pinned to this CLI's image. A `compose.yaml` that `setup` didn't write is saved as `compose.yaml.<timestamp>.bak` first. Put your own settings in `.env`, next to it, such as `AGENT_MEMORY_IMAGE` or `AGENT_MEMORY_EMBEDDER`.
+- **`.env`** (mode 0600) gets `AGENT_MEMORY_UID` and `AGENT_MEMORY_GID`, which make the server write `data/server` as you. Other lines stay.
+- **`data/server` and `data/qdrant`** are created before Docker starts, because on Linux Docker would create them owned by root.
+- **It runs** `docker compose pull` and `up -d --no-build` as the project `agent-memory-server`, so its containers stay apart from a clone's. Then it waits up to 120 seconds for `/v1/health`.
+- **`~/.config/agent-memory/server`** is written with `url = http://127.0.0.1:8765` if it is missing. A file that names another server is left alone, and `setup` prints the `connect --url` command.
+- **It offers the editors.** In a terminal, it asks once whether to run `agent-memory connect --editor` for the editors it found, and `--no-input` skips the question. `connect` shows its diff and asks again.
+
+`data/server/memories.sqlite` in that folder is the store. Back it up. `setup` never runs `docker compose down -v` and never deletes `data/`. It is safe to run again, and running it again is the upgrade step.
+
+The commands for logs and for stopping are printed at the end. They look like this, with your folder:
+
+```
+docker compose -p agent-memory-server -f <folder>/compose.yaml logs
+docker compose -p agent-memory-server -f <folder>/compose.yaml down
+```
+
+### Files Docker can't mount
+
+Docker has to bind-mount `data/` from the folder. Two setups can't do that with the default folder, and `setup` says so when `up` fails with a mount error:
+
+- **Snap Docker** (Ubuntu's `snap install docker`) can't mount hidden folders under your home, and `~/.local/share` is one.
+- **Docker Desktop** mounts only the folders it shares. A custom `XDG_DATA_HOME` outside its file-sharing list isn't one of them.
+
+The fix is a folder Docker can see. It is remembered, so you pass it once:
+
+```
+agent-memory setup --dir ~/agent-memory-server
+```
+
+### Without `setup`
+
+For your own folder layout, or to see each step, do what `setup` does by hand:
+
+```
 mkdir agent-memory-server && cd agent-memory-server
 curl -fsSLO https://raw.githubusercontent.com/roune/agent-memory/v0.1.0/compose.yaml
 mkdir -p data/server data/qdrant
@@ -112,8 +159,38 @@ agent-memory install
 - **Create `data/server` first, and write `.env`.** On Linux, Docker creates a missing bind folder owned by root, and the server runs as the ids in `.env` (1000:1000 without them), so it couldn't write `memories.sqlite`. `scripts/setup` does both in a clone.
 - **`data/` next to `compose.yaml` is the store.** Back up `data/server/memories.sqlite`.
 - **`connect` writes `~/.config/agent-memory/server`.** `scripts/setup` writes it in a clone.
+- **Don't run it beside `setup`'s server.** A folder called `agent-memory-server` gets the compose project name `agent-memory-server`, the same one `setup` uses, and both publish port 8765. `setup` refuses to start when it sees that project running from another folder, and says which one. Pass `--dir` with this folder to let `setup` manage it.
 
-To upgrade, download `compose.yaml` from the new tag, then run `docker compose pull` and `docker compose up -d`. Then run `uv tool upgrade roune-agent-memory`.
+To upgrade by hand, download `compose.yaml` from the new tag, then run `docker compose pull` and `docker compose up -d`. Then upgrade the CLI as the table below says.
+
+## Upgrades
+
+| Install | Upgrade the CLI | Then |
+| --- | --- | --- |
+| uv from git | `uv tool upgrade roune-agent-memory` | `agent-memory setup` |
+| a clone | `git pull` | `./scripts/setup` |
+
+The other ways to install the CLI will appear here as they exist.
+
+- **`setup` is the upgrade for the server.** It rewrites `compose.yaml` for the new version, keeps `.env` and `data/`, pulls the new image and restarts. The server moves to the new image only then.
+- **The CLI tells you when they differ.** `/v1/health` reports the server's `version`. `agent-memory setup` and `agent-memory review` compare it with the CLI's own, and print one line when they differ: `the server runs 0.2.0 and this CLI is 0.3.0: run agent-memory setup to upgrade the server`. A server whose `/v1/health` has no version is older than 0.2.0, and the line says so. `capture`, `git-hook` and `sync --quiet` never ask, so the hooks stay fast and silent. `review` asks with a short timeout and says nothing when the server doesn't answer.
+- **A server you started another way** (the manual steps, a team host) is upgraded the way you started it.
+- **The hooks keep working.** They run the command as it was called, which uv's tool bin link keeps across an upgrade (see [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages)).
+
+### If Qdrant won't start after an upgrade
+
+Qdrant may not read storage written more than one minor version back, which a CLI that skipped releases can cause. `memories.sqlite` is the source of truth and Qdrant is derived from it, so rebuild Qdrant's storage from the rows. In the server folder (`agent-memory setup --print-dir`):
+
+```
+compose="docker compose -p agent-memory-server"
+$compose stop
+mv data/qdrant data/qdrant.old
+mkdir data/qdrant
+$compose run --rm --no-build -T server agent-memory-server reindex
+$compose up -d --no-build
+```
+
+`reindex` embeds every row that the new storage lacks, and takes the server's lock, which is why the server is stopped first (see [server.md](server.md#embedding)). Delete `data/qdrant.old` once the server answers. In a clone, use `docker compose` without `-p`, and without `--no-build`.
 
 ### Why auth is off here, and when it must not be
 
@@ -223,4 +300,4 @@ Only the repository owner does these steps. Pushing a tag is the release.
 
 7. **Optionally, write a GitHub release** for the tag, with `compose.yaml` and `compose.team.yaml` attached. The commands above download them from the tag, so the release isn't required.
 
-A tag-only workflow can't run in a PR. So on every PR, `test.yml`'s `release-image` job runs the same build for both platforms. It pushes to a registry on the runner instead of GHCR, then pulls each platform and runs `scripts/image-health` on it. It also runs the no-clone `compose.yaml` steps and `compose.team.yaml` against that image. The steps a PR can't cover are the push to GHCR, the native arm64 runner, and the package's visibility.
+A tag-only workflow can't run in a PR. So on every PR, `test.yml`'s `release-image` job runs the same build for both platforms. It pushes to a registry on the runner instead of GHCR, then pulls each platform and runs `scripts/image-health` on it. It also runs the no-clone `compose.yaml` steps and `compose.team.yaml` against that image. Last, it installs the built wheel and runs `agent-memory setup` twice against that image, with a temporary `HOME`: it checks `/v1/health`, the CLI's server file, and that a memory written before the second run is still there after it. The steps a PR can't cover are the push to GHCR, the native arm64 runner, and the package's visibility.

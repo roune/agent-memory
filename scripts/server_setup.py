@@ -93,6 +93,15 @@ def health_ok(url=URL):
     return True
 
 
+def fetch_health(url=URL):
+    """url's /v1/health answer as a dict, or None when it can't be read."""
+    try:
+        health = server_client.Client(url, timeout=2.0).health()
+    except (server_client.ServerError, server_client.ServerUnreachable):
+        return None
+    return health if isinstance(health, dict) else None
+
+
 def probe_port(url=URL):
     """Who answers on the port: "agent-memory" for a health answer, "other" for any listener, else None."""
     if health_ok(url):
@@ -117,6 +126,7 @@ class Deps:
     run: Callable = run_docker
     which: Callable = shutil.which
     health: Callable = health_ok
+    health_answer: Callable = fetch_health
     port_holder: Callable = probe_port
     sleep: Callable = time.sleep
     clock: Callable = time.monotonic
@@ -614,6 +624,10 @@ def setup(options, deps):
     start(folder, deps)
     wait_for_health(folder, deps)
     deps.out(f"The agent-memory server is ready at {URL}, from {folder}.")
+    # A custom AGENT_MEMORY_IMAGE can run another version than the pin; say so.
+    warning = server_client.version_line(deps.health_answer(URL), deps.version)
+    if warning:
+        deps.err(warning)
 
     cli = connect_cli(deps)
     tools = [tool for tool in deps.present_tools() if tool not in editors.NO_MCP]

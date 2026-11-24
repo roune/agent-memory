@@ -15,6 +15,25 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# One server at a time can publish 127.0.0.1:8765. If `agent-memory setup`'s
+# project (agent-memory-server) runs from another folder, or another server
+# answers, say how to stop it, instead of Docker's "port is already allocated".
+# ls prints a JSON array; tr puts each project on its own line.
+projects="$(docker compose ls -a --format json 2>/dev/null | tr '}' '\n' || true)"
+other="$(printf '%s\n' "$projects" | grep -E '"Name": *"agent-memory-server"' | grep -vF "$PWD/compose.yaml" || true)"
+if [ -n "$other" ]; then
+  echo "Port 8765 is taken by the agent-memory-server compose project, which agent-memory setup runs from another folder." >&2
+  echo "Stop it with: docker compose -p agent-memory-server down" >&2
+  echo "Then run ./scripts/setup again. Its data stays in that folder's data/." >&2
+  exit 1
+fi
+if curl -fsS "$URL/v1/health" >/dev/null 2>&1 && [ -z "$(docker compose ps -q 2>/dev/null || true)" ]; then
+  echo "Another agent-memory server already answers on $URL, and it isn't this clone's." >&2
+  echo "Stop it with 'docker compose down' in the clone that runs it, or 'docker compose -p agent-memory-server down' if agent-memory setup runs it." >&2
+  echo "Then run ./scripts/setup again." >&2
+  exit 1
+fi
+
 # data/server must exist before Docker starts: on Linux a missing bind
 # directory is created owned by root, and the server couldn't write to it.
 mkdir -p data/qdrant data/server

@@ -305,6 +305,21 @@ class Client:
         return self.request("POST", "/v1/admin/import", {"memories": list(memories), "rejections": list(rejections)})
 
 
+def version_line(health, cli):
+    """One line when the server's /v1/health version differs from the CLI's, else "".
+
+    A health answer with no version comes from a server older than 0.2.0.
+    """
+    if not isinstance(health, dict):
+        return ""
+    seen = health.get("version")
+    if not seen:
+        return f"the server runs a version older than 0.2.0 and this CLI is {cli}: run `agent-memory setup` to upgrade the server"
+    if seen == cli:
+        return ""
+    return f"the server runs {seen} and this CLI is {cli}: run `agent-memory setup` to upgrade the server"
+
+
 def explain(error):
     """One line for a person, with what to do next."""
     if isinstance(error, ServerError):

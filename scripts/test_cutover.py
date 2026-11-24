@@ -860,9 +860,30 @@ class SetupTest(unittest.TestCase):
         self.bin = Path(self.tmp.name) / "bin"
         self.bin.mkdir()
         self.log = Path(self.tmp.name) / "calls.log"
-        for name in ("docker", "curl"):
+        # docker prints what a test puts in ls.json (compose ls) and ps.txt (compose ps -q), and marks the
+        # `up`. curl fails until the `up`, or while a test's holder file says another server answers.
+        self.listing = Path(self.tmp.name) / "ls.json"
+        self.ps = Path(self.tmp.name) / "ps.txt"
+        self.holder = Path(self.tmp.name) / "holder"
+        self.up = Path(self.tmp.name) / "up"
+        scripts = {
+            "docker": f"""#!/bin/sh
+echo "docker $@" >> {self.log}
+case "$*" in
+  "compose ls"*) cat {self.listing} 2>/dev/null ;;
+  "compose ps"*) cat {self.ps} 2>/dev/null ;;
+  "compose up"*) touch {self.up} ;;
+esac
+exit 0
+""",
+            "curl": f"""#!/bin/sh
+echo "curl $@" >> {self.log}
+[ -f {self.up} ] || [ -f {self.holder} ]
+""",
+        }
+        for name, text in scripts.items():
             tool = self.bin / name
-            tool.write_text(f'#!/bin/sh\necho "{name} $@" >> {self.log}\n', encoding="utf-8")
+            tool.write_text(text, encoding="utf-8")
             tool.chmod(0o755)
 
     def setup_run(self):
@@ -874,8 +895,10 @@ class SetupTest(unittest.TestCase):
         result = self.setup_run()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text().splitlines()
-        self.assertEqual(calls[0], "docker compose up -d --build")
-        self.assertEqual(calls[1], "curl -fsS http://127.0.0.1:8765/v1/health")
+        # The port checks come first: the project list, then a health probe that fails here.
+        self.assertEqual(calls[:2], ["docker compose ls -a --format json", "curl -fsS http://127.0.0.1:8765/v1/health"])
+        self.assertEqual(calls[2], "docker compose up -d --build")
+        self.assertEqual(calls[3], "curl -fsS http://127.0.0.1:8765/v1/health")
         server = self.home / ".config" / "agent-memory" / "server"
         self.assertEqual(mode_bits(server), 0o600)
         self.assertIn("url = http://127.0.0.1:8765", server.read_text())
@@ -896,6 +919,54 @@ class SetupTest(unittest.TestCase):
         (config / "database").write_text("mode = per-repo\n", encoding="utf-8")
         self.setup_run()
         self.assertIn("mode = per-repo", (config / "server").read_text())
+
+    def refused(self):
+        result = self.setup_run()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertNotIn("docker compose up -d --build", self.log.read_text())
+        self.assertFalse((self.clone / "data").exists(), "a refusal writes nothing")
+        return result.stderr
+
+    def test_a_setup_project_in_another_folder_is_named_with_the_command_that_stops_it(self):
+        self.listing.write_text(
+            '[{"Name":"other","Status":"running(1)","ConfigFiles":"/x/compose.yaml"},'
+            '{"Name":"agent-memory-server","Status":"running(2)","ConfigFiles":"/home/me/.local/share/agent-memory/server/compose.yaml"}]\n'
+        )
+        said = self.refused()
+        self.assertIn("agent-memory-server", said)
+        self.assertIn("docker compose -p agent-memory-server down", said)
+        self.assertNotIn("already allocated", said)
+
+    def test_a_stopped_setup_project_counts_too(self):
+        self.listing.write_text('[{"Name":"agent-memory-server","Status":"exited(2)","ConfigFiles":"/srv/compose.yaml"}]\n')
+        self.assertIn("docker compose -p agent-memory-server down", self.refused())
+
+    def test_a_clone_folder_named_agent_memory_server_is_its_own_project(self):
+        self.listing.write_text(f'[{{"Name":"agent-memory-server","Status":"running(2)","ConfigFiles":"{self.clone}/compose.yaml"}}]\n')
+        result = self.setup_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker compose up -d --build", self.log.read_text())
+
+    def test_another_server_answering_on_the_port_is_named(self):
+        self.holder.write_text("")
+        said = self.refused()
+        self.assertIn("already answers", said)
+        self.assertIn("docker compose down", said)
+
+    def test_this_clones_own_running_server_is_restarted_not_refused(self):
+        self.holder.write_text("")
+        self.ps.write_text("abc123\n")
+        result = self.setup_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker compose up -d --build", self.log.read_text())
+
+    def test_the_script_is_posix_sh(self):
+        text = (SCRIPTS / "setup").read_text()
+        self.assertTrue(text.startswith("#!/bin/sh\n"))
+        for bashism in ("[[", "<<<", "local "):
+            self.assertNotIn(bashism, text)
+        if shutil.which("dash"):
+            subprocess.run(["dash", "-n", str(SCRIPTS / "setup")], check=True)
 
 
 class ComposeTest(unittest.TestCase):

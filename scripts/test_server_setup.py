@@ -131,6 +131,7 @@ class SetupCase(unittest.TestCase):
             run=self.docker,
             which=lambda name: f"/usr/local/bin/{name}",
             health=lambda url: True,
+            health_answer=lambda url: self.answer,
             port_holder=self.probe,
             sleep=lambda seconds: self.time.__setitem__(0, self.time[0] + seconds),
             clock=lambda: self.time[0],
@@ -141,6 +142,8 @@ class SetupCase(unittest.TestCase):
             connect_editors=self.connect,
         )
         self.holder = None
+        # What /v1/health says after the wait: this CLI's own version, so no warning.
+        self.answer = {"status": "ok", "version": PINNED}
 
     def probe(self):
         self.probed.append(True)
@@ -734,6 +737,40 @@ class EditorOfferTest(SetupCase):
         self.assertIn("agent-memory connect --editor cursor,claude-code", result)
         self.assertIn("no server is configured", err)
         self.assertIn("Next steps", out)
+
+
+class VersionWarningTest(SetupCase):
+    def test_a_matching_version_says_nothing(self):
+        result, out, err = self.setup()
+        self.assertEqual(result, 0)
+        self.assertNotIn("this CLI is", out + err)
+
+    def test_a_different_version_gives_the_one_line(self):
+        self.answer = {"status": "ok", "version": "0.1.9"}
+        result, out, err = self.setup()
+        self.assertEqual(result, 0)
+        self.assertIn(
+            f"the server runs 0.1.9 and this CLI is {PINNED}: run `agent-memory setup` to upgrade the server",
+            err,
+        )
+
+    def test_a_missing_version_says_older_than_0_2_0(self):
+        self.answer = {"status": "ok"}
+        _, _, err = self.setup()
+        self.assertIn(f"the server runs a version older than 0.2.0 and this CLI is {PINNED}: run `agent-memory setup` to upgrade the server", err)
+
+    def test_an_unreadable_answer_says_nothing(self):
+        self.answer = None
+        result, out, err = self.setup()
+        self.assertEqual(result, 0)
+        self.assertNotIn("this CLI is", out + err)
+
+    def test_the_real_reader_sees_the_stub_servers_version(self):
+        stub = StubServer()
+        self.addCleanup(stub.close)
+        stub.version = "9.9.9"
+        self.assertEqual(server_setup.fetch_health(stub.url)["version"], "9.9.9")
+        self.assertIsNone(server_setup.fetch_health("http://127.0.0.1:1"))
 
 
 class EditorFilesTest(SetupCase):

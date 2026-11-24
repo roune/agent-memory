@@ -2793,9 +2793,27 @@ def review_alive(state):
     return True
 
 
+def warn_server_version():
+    """Tell a person on stderr when the server runs another version than this CLI. Says nothing when it can't ask.
+
+    Only review calls this, never a hook: capture, git-hook and sync --quiet must stay fast and silent.
+    """
+    try:
+        config = server_client.read_config()
+        if config is None:
+            return
+        health = server_client.Client(config["url"], config["token"], PAGE_TIMEOUT).health()
+        line = server_client.version_line(health, cli_version())
+    except (server_client.ConfigError, server_client.ServerError, server_client.ServerUnreachable, OSError):
+        return
+    if line:
+        print(line, file=sys.stderr)
+
+
 def review(args):
     warn_legacy()
     sync_first(quiet=False)
+    warn_server_version()
     state_path = review_state_path()
     if state_path.is_file():
         state = read_json(state_path)
