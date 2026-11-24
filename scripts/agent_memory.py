@@ -2234,19 +2234,22 @@ def render_failed(failed):
             rows.append(f"<li><code>{html.escape(path.name)}</code>: not readable.</li>")
             continue
         body = item.get("body") if isinstance(item.get("body"), dict) else {}
-        what = "Memory" if item.get("op") == "memory" else "Rejection"
+        what = {"memory": "Memory", "rejection": "Rejection"}.get(item.get("op"), "Item")
         error = f"{item.get('status') or ''} {item.get('error') or ''}".strip()
         detail = ""
         if item.get("op") == "memory":
             detail = f"<pre>{html.escape(str(body.get('text') or '')[:2000])}</pre>"
         elif body.get("shas"):
             detail = f"<p class=\"meta\">{html.escape(body.get('repo') or '')}: {html.escape(', '.join(body['shas']))}</p>"
-        if item.get("status") == 409:
-            stored_id = html.escape(item.get("stored_id") or "that id")
+        if outbox.is_conflict(item):
+            stored_id = html.escape(item["stored_id"])
             detail += (
                 f'<p class="meta">The server already keeps {stored_id} with this text:</p>'
                 f"<pre>{html.escape(str(item.get('stored') or ''))}</pre>"
-                '<p class="meta">A newer note replaces it through Supersedes.</p>'
+                '<p class="meta">Choose one: <code>agent-memory sync --resolve '
+                f"{html.escape(path.stem)} supersede</code> sends the queued text as a new memory "
+                f"that supersedes {stored_id}, and <code>agent-memory sync --resolve "
+                f"{html.escape(path.stem)} drop</code> keeps {stored_id} as it is.</p>"
             )
         rows.append(
             f"<li>{what} for <code>{html.escape(body.get('repo') or '')}</code>, queued "
@@ -2254,9 +2257,10 @@ def render_failed(failed):
             f"{detail}<p class=\"meta\">File: <code>{html.escape(path.name)}</code></p></li>"
         )
     return (
-        '<div class="banner bad"><strong>Failed</strong>: the server refused these. Fix the cause, '
-        "then run <code>agent-memory sync --retry-failed</code>, or delete the file from "
-        "<code>outbox/failed/</code>."
+        '<div class="banner bad"><strong>Failed</strong>: the server refused these. For a 409, choose '
+        "with <code>agent-memory sync --resolve &lt;item&gt; supersede|drop</code>. For another error, "
+        "fix the cause, then run <code>agent-memory sync --retry-failed</code>, or drop it with "
+        "<code>agent-memory sync --resolve &lt;item&gt; drop</code>."
         f'<ul>{"".join(rows)}</ul></div>'
     )
 
@@ -3144,6 +3148,14 @@ def sync_cmd(args):
     root = store_root()
     if not args.quiet:
         warn_legacy()
+    if getattr(args, "resolve", None):
+        if args.quiet:
+            print("sync: --quiet doesn't go with --resolve, which says what it did", file=sys.stderr)
+            return 2
+        return resolve_failed(root, *args.resolve, replace_link=getattr(args, "replace_link", False))
+    if getattr(args, "replace_link", False):
+        print("sync: --replace-link goes with --resolve <item> supersede", file=sys.stderr)
+        return 2
     try:
         report = outbox.sync(root, client_for, retry=args.retry_failed)
     except OSError as error:
@@ -3159,8 +3171,52 @@ def sync_cmd(args):
     else:
         for line in lines:
             print(line)
+        details = outbox.describe_failed(root)
+        if details:
+            print()
+            print(f"In {outbox.failed_root(root)}:")
+            for line in details:
+                print(line)
     left = outbox.summary(root)
-    return 1 if left["queued"] or report.failed else 0
+    return 1 if left["queued"] or left["failed"] or report.failed else 0
+
+
+def resolve_failed(root, name, choice, replace_link=False):
+    """sync --resolve: settle one item in outbox/failed/. Exit 1 when it stays there."""
+    try:
+        done = outbox.resolve(root, name, choice, client_for, replace_link=replace_link)
+    except outbox.ResolveError as error:
+        print(f"resolve: {error}", file=sys.stderr)
+        return 1
+    except (server_client.ServerError, server_client.ServerUnreachable) as error:
+        print(f"resolve: {server_client.explain(error)}. The item stays in {outbox.failed_root(root)}.", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"resolve failed: {error}", file=sys.stderr)
+        return 1
+    item = done["item"] or {}
+    if done["choice"] == "drop":
+        body = item.get("body") if isinstance(item.get("body"), dict) else {}
+        if item.get("stored_id"):
+            print(f"dropped {done['name']}: the server keeps {item['stored_id']} as it is")
+        else:
+            print(f"dropped {done['name']}")
+        if item.get("op") == "memory" and body.get("text"):
+            print("The queued text was:")
+            print(body["text"])
+        elif item.get("op") == "rejection" and body.get("shas"):
+            print(f"It rejected, in {body.get('repo') or '?'}: {', '.join(map(str, body['shas']))}")
+        elif done.get("raw") or item.get("raw"):
+            print("The file held:")
+            print(done.get("raw") or item.get("raw"))
+    elif done["already"]:
+        print(f"{done['id']} already keeps this text; removed {done['name']}")
+    else:
+        sent = f"sent as {done['id']}" if done.get("id") else "sent"
+        print(f"{sent}, which supersedes {done['supersedes']}; removed {done['name']}")
+        if done.get("dropped_link"):
+            print(f"note: the queued memory named {done['dropped_link']} in supersedes; it now supersedes {done['supersedes']}")
+    return 0
 
 
 def describe_caller(who):
@@ -3513,8 +3569,23 @@ def build_parser():
     migrate_parser.set_defaults(func=migrate_cmd)
 
     sync_parser = sub.add_parser("sync", help="send the outbox to the server, in order")
-    sync_parser.add_argument(
+    sync_how = sync_parser.add_mutually_exclusive_group()
+    sync_how.add_argument(
         "--retry-failed", action="store_true", help="move outbox/failed/ back into the queue first"
+    )
+    sync_how.add_argument(
+        "--resolve",
+        nargs=2,
+        metavar=("ITEM", "CHOICE"),
+        help=(
+            "settle one item in outbox/failed/ (sync lists them): supersede sends a 409's queued text "
+            "as a new memory that supersedes the stored one; drop deletes the item"
+        ),
+    )
+    sync_parser.add_argument(
+        "--replace-link",
+        action="store_true",
+        help="with --resolve <item> supersede: replace the supersedes link the queued memory already has",
     )
     sync_parser.add_argument("--quiet", action="store_true", help="write to capture.log only (hooks)")
     sync_parser.set_defaults(func=sync_cmd)

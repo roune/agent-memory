@@ -94,13 +94,19 @@ flowchart TD
   send -- "401, 403, 3xx" --> keep["stop for that server:<br/>keep its whole queue"]
   send -- "403, code identity" --> failed
   send -- "409" --> failed409["outbox/failed/,<br/>with the stored text"]
+  failed409 -- "sync --resolve" --> choice["supersede: new memory,<br/>supersedes the stored one<br/>drop: keep the stored one"]
   send -- "other 4xx" --> failed["outbox/failed/,<br/>with the error"]
 ```
 
 - `agent-memory sync` sends the queue in order. It runs at the start of `review`, `land` and `list`, and detached after the hooks. A lock file (`outbox/.lock`) makes sure one runs at a time: a second one waits, then finds the queue already sent.
 - A server that is down costs one timeout, not one per item. Items for another server in per-repo mode keep going.
 - A revoked or rotated token is fixed with `agent-memory connect`. Nothing approved is set aside meanwhile.
-- `agent-memory sync --retry-failed` moves `outbox/failed/` back into the queue, in its old place, and sends it. Delete a file from `outbox/failed/` to drop that item.
+- `agent-memory sync` also lists each item in `outbox/failed/`: its error and its queued text, and for a 409 the stored text next to it.
+- `agent-memory sync --retry-failed` moves `outbox/failed/` back into the queue, in its old place, and sends it. That fixes a 400 or an identity 403 after a fix, but not a 409: a kept memory is never edited, so a resend gets 409 again.
+- `agent-memory sync --resolve <item> supersede|drop` settles one failed item; `<item>` is its file name, with or without `.json`.
+  - **supersede** (a 409 only) sends the queued text as a new memory under `<session id>-2`, or the next number that is free, with `supersedes` set to the stored memory. If that memory was replaced since, it follows `superseded_by` and supersedes the newest one, so the chain stays in one line. If a newer memory in that chain, or the id it would take, already has the queued text, an earlier resolve got through, and nothing more is sent. Items still queued for that server go first, so the order is kept; while some wait, supersede refuses. If the queued memory already names another one in `supersedes`, supersede refuses unless you add `--replace-link`, because a memory has one `supersedes`. The item is deleted only once the server has kept the new memory. When the server doesn't answer, the item stays.
+  - **drop** deletes the item and prints what it held: the text, the rejected commits, or the raw file. For a 409 the server keeps the stored memory as it is. It works for any failed item, an unreadable one included.
+- Nothing leaves `outbox/failed/` on its own, so a text approved offline isn't lost until you pick one.
 - `sync` exits 1 while anything waits or failed.
 - While something waits for a server, Approve queues behind it, so the order is kept.
 
