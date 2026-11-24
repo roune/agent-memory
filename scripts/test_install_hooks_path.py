@@ -260,6 +260,82 @@ class CursorFolderTest(Case):
         self.assertIn("git hooks left in place", out)
         remove_all.assert_called_once()
 
+    def older_install(self, repo, folder, command=None):
+        """What install wrote before this fix: plain files in Cursor's folder, with no record."""
+        with mock.patch.object(agent_memory, "git_hook_layout", lambda r: (folder, None)), \
+                mock.patch.object(agent_memory, "read_git_hooks_record", lambda: {}), \
+                mock.patch.object(agent_memory, "write_git_hooks_record", lambda record: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            agent_memory.write_git_hooks(str(repo), command or self.tool)
+
+    def test_cursors_link_an_older_install_renamed_is_given_back(self):
+        repo = self.repo()
+        folder = self.cursor_folder(repo)
+        os.symlink(".dispatcher", folder / "post-commit")  # Cursor's own link
+        self.older_install(repo, folder)
+        self.assertTrue((folder / "post-commit.agent-memory-user").is_symlink())
+
+        code, out = self.install_git(repo)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(os.readlink(folder / "post-commit"), ".dispatcher")
+        self.assertFalse(os.path.lexists(folder / "post-commit.agent-memory-user"))
+        self.assertNotIn(str(folder / "post-commit"), json.loads(agent_memory.git_hooks_record_path().read_text())[str(repo)]["links"])
+        self.commit(repo)
+        self.assertEqual(self.ran().count("new git-hook --event post-commit"), 1)
+
+    def test_plain_install_moves_an_older_install_out_of_cursors_folder(self):
+        # Same command as now, no record: only the clone or config can find it.
+        repo = self.repo()
+        folder = self.cursor_folder(repo)
+        self.older_install(repo, folder)
+        code, out = self.run_cli("config", str(repo))
+        self.assertIn(f"The git hooks are files in {folder}", out)
+        self.assertIn(f"agent-memory config {repo} --git-hooks true", out)
+        self.assertEqual(self.run_cli("config", str(repo), "--git-hooks", "true")[0], 0)
+        self.assertEqual(os.readlink(folder / "post-commit"), ".dispatcher")
+        self.assertNotIn("The git hooks are files", self.run_cli("config", str(repo))[1])
+
+    def test_a_known_repo_with_an_older_install_moves_on_plain_install(self):
+        repo = self.repo()
+        folder = self.cursor_folder(repo)
+        self.older_install(repo, folder)
+        agent_memory.write_git_hooks_record({str(repo): {"dirs": [str(folder)], "links": []}})
+        self.tools = ["claude-code"]
+        code, out = self.run_cli("install", "--yes")
+        self.assertEqual(code, 0, out)
+        for name in ("post-commit", "post-merge"):
+            self.assertEqual(os.readlink(folder / name), ".dispatcher")
+
+    def test_a_missing_dispatcher_is_refused(self):
+        repo = self.repo()
+        folder = self.cursor_folder(repo)
+        (folder / ".dispatcher").unlink()
+        before = tree(folder)
+        code, out = self.install_git(repo)
+        self.assertNotEqual(code, 0)
+        self.assertIn("its .dispatcher is missing", out)
+        self.assertEqual(tree(folder), before)
+
+    def test_an_original_path_naming_cursors_folder_is_refused(self):
+        repo = self.repo()
+        folder = self.cursor_folder(repo)
+        (folder / ".cursor-original-hooks-path").write_text(str(folder), encoding="utf-8")
+        before = tree(folder)
+        code, out = self.install_git(repo)
+        self.assertNotEqual(code, 0)
+        self.assertIn("names Cursor's own folder", out)
+        self.assertEqual(tree(folder), before)
+
+    def test_a_relative_original_path_in_a_linked_worktree_is_a_clear_error(self):
+        repo = self.repo()
+        self.commit(repo, "init")
+        self.cursor_folder(repo, original=".git/hooks")
+        worktree = self.base / "wt"
+        git(repo, "worktree", "add", "-q", "-b", "wt", str(worktree))
+        code, out = self.install_git(worktree)
+        self.assertNotEqual(code, 0)
+        self.assertIn("could not create the git hooks directory", out)
+
     def test_no_original_path_is_refused_and_nothing_is_written(self):
         repo = self.repo()
         folder = self.cursor_folder(repo, original="")
@@ -290,6 +366,16 @@ class OtherHooksPathTest(Case):
         self.assertEqual(code, 0, out)
         self.assertIn(f"core.hooksPath is {repo / '.githooks'}, not", out)
         self.assertTrue((repo / ".githooks" / "post-commit").is_file())
+
+    def test_a_relative_hooks_path_from_a_subfolder_is_the_work_tree_one(self):
+        repo = self.repo()
+        git(repo, "config", "core.hooksPath", ".githooks")
+        (repo / "a" / "b").mkdir(parents=True)
+        code, out = self.install_git(repo / "a" / "b")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((repo / ".githooks" / "post-commit").is_file())
+        self.assertFalse((repo / "a" / "b" / ".githooks").exists())
+        self.assertIn(f"not {repo / '.git' / 'hooks'}.", out)
 
     def test_the_default_hooks_path_says_nothing_extra(self):
         repo = self.repo()
@@ -355,6 +441,22 @@ class RepointTest(Case):
         self.assertEqual(code, 0, out)
         for name in ("post-commit", "post-merge"):
             self.assertEqual(agent_memory.git_hook_command(repo / ".git" / "hooks" / name), self.tool)
+        self.assertNotIn("still run", out)
+
+    def test_a_submodule_is_repointed_after_an_upgrade(self):
+        lib = self.repo("lib")
+        self.commit(lib, "lib")
+        top = self.repo("top")
+        git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "sub")
+        sub = top / "sub"
+        self.use(self.command(self.base / "older-bin" / "agent-memory", "older"))
+        self.assertEqual(self.install_git(sub)[0], 0)
+        self.use(self.tool)
+        self.tools = ["claude-code"]
+        code, out = self.run_cli("install", "--yes")
+        self.assertEqual(code, 0, out)
+        hooks = agent_memory.git_hooks_dir(str(sub))
+        self.assertEqual(agent_memory.git_hook_command(hooks / "post-commit"), self.tool)
         self.assertNotIn("still run", out)
 
     def test_hooks_that_could_not_be_repointed_are_named_after_the_writes(self):

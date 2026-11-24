@@ -212,7 +212,8 @@ def git_hooks_dir(repo):
     if custom:
         path = Path(os.path.expanduser(custom))
         if not path.is_absolute():
-            path = Path(repo) / path
+            # git runs hooks from the work tree root, whichever subfolder names the repo.
+            path = Path(git_root(repo)) / path
         return path
     found = run(["git", "rev-parse", "--git-path", "hooks"], repo).strip()
     if not found:
@@ -327,7 +328,10 @@ def git_hooks_record_key(repo):
     if not common:
         return str(resolved)
     common_dir = Path(os.path.realpath(resolved / common))
-    return str(common_dir.parent if common_dir.name == ".git" else common_dir)
+    if common_dir.name == ".git":
+        return str(common_dir.parent)
+    # A submodule or --separate-git-dir: the work tree, so git commands still run there.
+    return run(["git", "rev-parse", "--show-toplevel"], str(resolved)) or str(common_dir)
 
 
 def write_git_hooks_record(record):
@@ -359,7 +363,8 @@ def _check_cursor_dir(scripts_dir, cursor_dir):
     for name in GIT_HOOK_NAMES:
         path = cursor_dir / name
         moved = cursor_dir / f"{name}.agent-memory-user"
-        if moved.exists() or moved.is_symlink():
+        # A link to the dispatcher there is Cursor's, renamed by an older install: write_git_hooks puts it back.
+        if not _dispatches(moved, cursor_dir) and (moved.exists() or moved.is_symlink()):
             raise SystemExit(
                 f"an older agent-memory install moved a hook aside to {moved}. Move it to {scripts_dir / name} "
                 "or delete it, then run this again."
@@ -376,7 +381,7 @@ def _check_cursor_dir(scripts_dir, cursor_dir):
 
 def _default_hooks_dir(repo):
     common = run(["git", "rev-parse", "--git-common-dir"], repo)
-    return Path(repo) / common / "hooks" if common else None
+    return Path(os.path.realpath(Path(repo) / common / "hooks")) if common else None
 
 
 def _write_hook_scripts(hooks_dir, command):
@@ -392,7 +397,10 @@ def _write_hook_scripts(hooks_dir, command):
                 raise SystemExit(f"could not read {path}: {error}") from error
             if GIT_HOOK_MARKER not in txt and user_path.exists():
                 raise SystemExit(f"{path} is not an agent-memory hook and {user_path.name} already exists")
-    hooks_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SystemExit(f"could not create the git hooks directory {hooks_dir}: {error}") from error
     bin_quoted = sh_quote(command)
     for name in GIT_HOOK_NAMES:
         path = hooks_dir / name
@@ -456,6 +464,13 @@ def write_git_hooks(repo, command=None):
         try:
             for name in GIT_HOOK_NAMES:
                 path = cursor_dir / name
+                moved = cursor_dir / f"{name}.agent-memory-user"
+                if _dispatches(moved, cursor_dir):
+                    # An older install renamed Cursor's own link: give it back, unrecorded.
+                    if not path.is_symlink() and git_hook_command(path) is not None:
+                        path.unlink()
+                    moved.rename(path)
+                    continue
                 if _dispatches(path, cursor_dir):
                     continue  # Cursor's link, or ours from before (already recorded)
                 if path.is_file():
@@ -512,6 +527,18 @@ def remove_git_hooks(repo):
             seen.add(os.path.realpath(base))
             _remove_hook_scripts(base)
     write_git_hooks_record(record)
+
+
+def git_hooks_in_cursor_folder(repo):
+    """Cursor's folder, when our hooks are plain files in it (an older install), else None."""
+    _, cursor_dir = git_hook_layout(repo)
+    if cursor_dir is None:
+        return None
+    for name in GIT_HOOK_NAMES:
+        path = cursor_dir / name
+        if not path.is_symlink() and git_hook_command(path) is not None:
+            return cursor_dir
+    return None
 
 
 def git_hooks_still_run(repo, command):
@@ -2816,7 +2843,7 @@ def repoint_git_hooks(command, repos, rewrite=True):
         # Outside a repo, git config would still answer with a global core.hooksPath.
         if run(["git", "rev-parse", "--is-inside-work-tree"], repo) != "true":
             continue
-        if not git_hooks_still_run(repo, command):
+        if not git_hooks_still_run(repo, command) and not (rewrite and git_hooks_in_cursor_folder(repo)):
             continue
         if rewrite:
             try:
@@ -2860,6 +2887,12 @@ def config_cmd(args):
             print(f"git_hooks (installed): {show['git_hooks_installed']}")
             print(f"auto_approve: {show['auto_approve']}")
             print(f"capture: {show['capture']}")
+            stale_dir = git_hooks_in_cursor_folder(repo_s)
+            if stale_dir is not None:
+                print(
+                    f"The git hooks are files in {stale_dir}, which Cursor manages and can rebuild without them. "
+                    f"Run `agent-memory config {repo_s} --git-hooks true` to move them out."
+                )
         return 0
 
     updates = {}
@@ -2941,13 +2974,18 @@ def uninstall(args):
         shutil.rmtree(extension.parent)
     print("removed agent-memory hooks")
 
+    # Keep going on an error: the other repos and the MCP entries below are removed either way.
     try:
-        for repo_s in list(read_git_hooks_record()):
+        recorded = list(read_git_hooks_record())
+    except SystemExit as error:
+        print(f"git hooks left in place: {error}")
+        recorded = []
+    for repo_s in recorded:
+        try:
             remove_git_hooks(repo_s)
             print(f"removed agent-memory git hooks (post-commit, post-merge) for {repo_s}")
-    except SystemExit as error:
-        # Keep going: the MCP entries below are removed either way.
-        print(f"git hooks left in place: {error}")
+        except (SystemExit, OSError) as error:
+            print(f"git hooks for {repo_s} left in place: {error}")
 
     try:
         removed = editors.remove_all(HOME)
