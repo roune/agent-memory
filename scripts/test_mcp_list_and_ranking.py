@@ -6,7 +6,6 @@ suite; the /mcp half needs the server extra (scripts/test-server). No test
 needs Docker or a model: FakeQdrant and a scripted embedder stand in.
 """
 
-import importlib.util
 import logging
 import sys
 import tempfile
@@ -18,8 +17,6 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-HAVE_SERVER = all(importlib.util.find_spec(name) for name in ("starlette", "httpx", "mcp"))
-
 from agent_memory_server import mcp_tools
 from agent_memory_server.embedding import Embedding
 from agent_memory_server.mcp_tools import QueryError
@@ -27,15 +24,9 @@ from agent_memory_server.qdrant import Qdrant
 from agent_memory_server.store import ServerStore
 from server_doubles import FakeQdrant, HashEmbedder
 
-if HAVE_SERVER:
-    from starlette.testclient import TestClient
-
-    from agent_memory_server.app import create_app
-    from agent_memory_server.settings import Settings
+import test_server_mcp
 
 REPO = "github.com/example/proj"
-BASE = "http://127.0.0.1:8765"
-PROTOCOL = "2025-06-18"
 
 # The query sits on the x axis; each text's angle from it sets its score.
 QUERY = "how does this tool work end to end"
@@ -157,10 +148,23 @@ class ListPagingTest(StoreCase):
         self.assertEqual(ids(page["memories"]), ["miguel-decision-n000"])
         self.assertIsNone(page["next_offset"])
 
+    def test_rows_with_the_same_time_page_in_one_order_whichever_index_is_used(self):
+        # Same occurred_at for all: the repo filter reads memory_repo_occurred, no filter scans.
+        for index in range(6):
+            self.keep(session_id=f"t{index}")
+        expected = [f"miguel-decision-t{index}" for index in reversed(range(6))]
+        for given in ({}, {"repo": REPO}, {"team": "Platform"}):
+            with self.subTest(given=given):
+                pages = [mcp_tools.list_memories(self.store, limit=2, offset=skip, **given) for skip in (0, 2, 4)]
+                self.assertEqual([hit for page in pages for hit in ids(page["memories"])], expected)
+
     def test_bad_offsets_are_tool_errors(self):
         self.assertEqual(mcp_tools.list_memories(self.store, offset=None)["offset"], 0)
         self.assertEqual(mcp_tools.list_memories(self.store, offset="3")["offset"], 3)
-        for bad in (-1, "many", True, [1]):
+        self.assertEqual(mcp_tools.list_memories(self.store, offset=2.0)["offset"], 2)
+        self.assertEqual(mcp_tools.list_memories(self.store, offset=mcp_tools.MAX_OFFSET)["memories"], [])
+        # 10**30 reached SQLite and raised OverflowError, past the tool's error handling.
+        for bad in (-1, "many", True, [1], 1.5, 10**30, mcp_tools.MAX_OFFSET + 1, float("inf")):
             with self.subTest(bad=bad), self.assertRaisesRegex(QueryError, "offset"):
                 mcp_tools.list_memories(self.store, offset=bad)
 
@@ -239,46 +243,28 @@ class SearchSupersedeTest(StoreCase):
         self.assertEqual(order, ["miguel-decision-v1"])
 
 
-@unittest.skipUnless(HAVE_SERVER, "needs the server extra (scripts/test-server)")
-class McpHttpTest(StoreCase):
+class McpHttpTest(test_server_mcp.McpCase):
+    """/mcp through McpCase's helpers, with the scripted embedder and this file's memories."""
+
+    def make_embedder(self):
+        return ScriptedEmbedder()
+
+    def keep(self, **changes):
+        return StoreCase.keep(self, **changes)
+
+    keep_many = StoreCase.keep_many
+
     def setUp(self):
         super().setUp()
-        settings = Settings(data_dir=self.data, models_dir=self.data / "models", auth="off")
-        self.client = TestClient(create_app(settings, self.store, self.embedding, retry_seconds=0), base_url=BASE)
-        self.client.__enter__()
-        self.addCleanup(self.client.__exit__, None, None, None)
-        self.ids = iter(range(1, 1000))
-        self.session = self.open_session()
-
-    def rpc(self, method, params=None, session=None, notify=False):
-        headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": PROTOCOL}
-        if session:
-            headers["Mcp-Session-Id"] = session
-        message = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            message["params"] = params
-        if not notify:
-            message["id"] = next(self.ids)
-        return self.client.post("/mcp", json=message, headers=headers)
-
-    def open_session(self):
-        started = self.rpc(
-            "initialize",
-            {"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}},
-        )
-        self.assertEqual(started.status_code, 200, started.text)
-        session = started.headers["mcp-session-id"]
-        self.rpc("notifications/initialized", session=session, notify=True)
-        return session
+        self.session, _ = self.open_session()
 
     def call(self, name, **arguments):
-        response = self.rpc("tools/call", {"name": name, "arguments": arguments}, session=self.session)
-        self.assertEqual(response.status_code, 200, response.text)
-        return response.json()["result"]
+        return super().call(self.session, name, **arguments)
 
     def test_list_tool_takes_offset_and_echoes_since(self):
         self.keep_many(3)
-        tools = {tool["name"]: tool for tool in self.rpc("tools/list", session=self.session).json()["result"]["tools"]}
+        listed = self.rpc("tools/list", session=self.session).json()["result"]["tools"]
+        tools = {tool["name"]: tool for tool in listed}
         self.assertIn("offset", tools["list"]["inputSchema"]["properties"])
         self.assertIn("next_offset", tools["list"]["description"])
         self.assertIn("superseded one comes right after", tools["search"]["description"])
@@ -288,9 +274,11 @@ class McpHttpTest(StoreCase):
         second = self.call("list", repo=REPO, since="2026-11-01", limit=2, offset=first["next_offset"])
         self.assertEqual(ids(second["structuredContent"]["memories"]), ["miguel-decision-n000"])
         self.assertIsNone(second["structuredContent"]["next_offset"])
-        refused = self.call("list", offset=-1)
-        self.assertTrue(refused["isError"])
-        self.assertIn("offset", refused["content"][0]["text"])
+        for bad in (-1, 10**30):
+            with self.subTest(bad=bad):
+                refused = self.call("list", offset=bad)
+                self.assertTrue(refused["isError"])
+                self.assertIn("offset must be from 0", refused["content"][0]["text"])
 
     def test_search_tool_puts_v2_before_v1(self):
         self.keep(session_id="v1", text="v1: the laptop store")

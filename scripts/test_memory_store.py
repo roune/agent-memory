@@ -123,7 +123,7 @@ class MemoryStoreTest(unittest.TestCase):
                 EXPLAIN QUERY PLAN
                 SELECT id FROM memory
                 WHERE team = ? AND occurred_at >= ?
-                ORDER BY occurred_at DESC
+                ORDER BY occurred_at DESC, id DESC
                 """,
                 ("Platform", since),
             ).fetchall()

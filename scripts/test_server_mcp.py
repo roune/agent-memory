@@ -68,7 +68,10 @@ class StoreCase(unittest.TestCase):
         self.data = Path(self.tmp.name)
         self.store = ServerStore(self.data / "memories.sqlite")
         self.fake = FakeQdrant()
-        self.embedding = Embedding(self.store, HashEmbedder(), Qdrant("http://qdrant:6333", transport=self.fake))
+        self.embedding = Embedding(self.store, self.make_embedder(), Qdrant("http://qdrant:6333", transport=self.fake))
+
+    def make_embedder(self):
+        return HashEmbedder()
 
     def keep(self, **changes):
         outcome, stored = self.store.write_memory(memory(**changes), "test")

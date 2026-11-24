@@ -28,6 +28,7 @@ log = logging.getLogger("agent_memory_server")
 FILTER_KEYS = ("repo", "domain", "kind", "org", "team", "person")
 SEARCH_LIMIT = (10, 50)
 LIST_LIMIT = (20, 100)
+MAX_OFFSET = 2**62
 MAX_QUERY = 2000
 
 INSTRUCTIONS = """\
@@ -102,17 +103,21 @@ def search_body(vector, filters, limit):
 
 
 def clamp_offset(offset):
-    """A whole number of rows to skip, 0 when missing. Negative is refused, not clamped."""
+    """A whole number of rows to skip, 0 when missing. Out of range is refused, not clamped.
+
+    MAX_OFFSET keeps offset + limit inside SQLite's 64-bit integer, which
+    would otherwise raise OverflowError past the tool's error handling.
+    """
     if offset is None or offset == "":
         return 0
-    if isinstance(offset, bool):
+    if isinstance(offset, bool) or (isinstance(offset, float) and not offset.is_integer()):
         raise QueryError(f"offset must be a whole number, not {offset!r}")
     try:
         number = int(offset)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise QueryError(f"offset must be a whole number, not {offset!r}") from None
-    if number < 0:
-        raise QueryError(f"offset must be 0 or more, not {number}")
+    if not 0 <= number <= MAX_OFFSET:
+        raise QueryError(f"offset must be from 0 to {MAX_OFFSET}, not {number}")
     return number
 
 
@@ -304,7 +309,9 @@ def build_server(store, embedding):
             "until are ISO-8601 times with a zone, such as 2026-08-01T00:00:00+00:00, or a date "
             "such as 2026-08-01 (midnight UTC). limit is the page size (at most 100) and offset "
             "skips that many rows; pass next_offset back as offset for the next page, and stop "
-            "when it is null. filter echoes the filters that applied, since and until in UTC. "
+            "when it is null. A memory approved while you page shifts later rows down, so a page "
+            "can repeat a row from the one before. filter echoes the filters that applied, since "
+            "and until in UTC. "
             + FILTER_HELP
         ),
         annotations=read_only,
