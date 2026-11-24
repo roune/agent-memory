@@ -31,7 +31,7 @@ One executable, four thin adapters, and an installer that asks once.
 | `agent-memory capture` | Reads the adapter’s JSON on stdin, writes the inbox bundle, exits 0. |
 | `agent-memory review` | Opens the browser UI on `127.0.0.1`. Approve and reject happen there. |
 | `agent-memory install` | Writes the user-level adapter for each tool the person selects. |
-| `agent-memory uninstall` | Removes only the entries this tool added: hooks, and the MCP entries `connect --editor` wrote. |
+| `agent-memory uninstall` | Removes only the entries this tool added: editor hooks, the git hooks it recorded, and the MCP entries `connect --editor` wrote. |
 
 The adapters are a few lines each. They do not embed, and they do not import a vector client. Cursor, Claude Code, and Codex call a shell snippet. Pi calls the same executable from an extension, because Pi’s API is an event listener rather than `hooks.json`.
 

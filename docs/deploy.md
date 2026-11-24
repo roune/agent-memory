@@ -40,7 +40,7 @@ The rest of the clone's `data/` stays where it is: the server's `data/server`, Q
    - From a clone, run `git pull` first, so the clone's own code is the new one too, then `./scripts/install`. It removes the old `~/.local/bin/agent-memory` link to the clone, then runs `uv tool install --editable .`.
    - Without a clone, run `uv tool install git+https://github.com/roune/agent-memory`. If `~/.local/bin/agent-memory` is the old link into a clone, remove it first. uv won't replace a file it didn't write.
 2. Run `agent-memory install`. It updates the hooks it wrote, where they are, to run the installed command, and moves the old clone's state.
-3. In each repository with git hooks, run `agent-memory config <repo> --git-hooks true`, so those hooks run the installed command too. `install` reminds you, naming the clone. Until then they run `<clone>/bin/agent-memory`. If that clone wasn't pulled, its old code files bundles in `<clone>/inbox` and auto-approved items in `<clone>/outbox`. The next `agent-memory` command moves them, because the clone is recorded, but do this step anyway.
+3. Git hooks: `install` also points the git hooks at the installed command in every repository it knows: the ones recorded in `~/.config/agent-memory/git-hooks` (each `install --git-repo` and `config --git-hooks true` adds one), and the old clone itself. After it has written everything, it names each repository whose git hooks still run another command. In each one, and in any repository set up before the record existed, run `agent-memory config <repo> --git-hooks true`. Until then those hooks run `<clone>/bin/agent-memory`. If that clone wasn't pulled, its old code files bundles in `<clone>/inbox` and auto-approved items in `<clone>/outbox`. The next `agent-memory` command moves them, because the clone is recorded.
 
 `agent-memory install` updates only the entries it wrote:
 
@@ -48,6 +48,21 @@ The rest of the clone's `data/` stays where it is: the server's `data/server`, Q
 - For Cursor and Pi, those are the files that carry the `agent-memory-hook` line: `~/.cursor/hooks/agent-memory.sh` and `~/.pi/agent/extensions/agent-memory/index.ts`.
 
 Each entry keeps its place and its other keys, such as a `timeout`. Every other hook stays as it is. If a file at one of those paths has no marker, install stops before it writes anything and says which file it is.
+
+## Git hooks in a folder Cursor manages
+
+Cursor can set a repository's `core.hooksPath` to `~/.cursor/agent-hooks/<id>/`. It owns that folder: hook names there link to its `.dispatcher`, which runs the hooks path the repository had before (named in `.cursor-original-hooks-path`, usually `.git/hooks`) and then Cursor's own `<hook>.cursor*` files. A file written into that folder can vanish when Cursor rebuilds it.
+
+So when `install --git-repo` or `config --git-hooks true` finds that folder, it:
+
+- writes `post-commit` and `post-merge` into the hooks path Cursor recorded, which survives a rebuild and still runs if Cursor resets `core.hooksPath`;
+- links `post-commit` and `post-merge` in Cursor's folder to `.dispatcher`, as Cursor links its own hooks, when they aren't linked already;
+- moves hooks an older install wrote into Cursor's folder out of it;
+- changes none of Cursor's files, and stops before writing anything if Cursor recorded no hooks path, its dispatcher is missing, or another file holds one of those names.
+
+`agent-memory config <repo>` reports `installed: False` if Cursor drops a link; run `config <repo> --git-hooks true` again. `config --git-hooks false` and `uninstall` remove only the scripts and links recorded in `~/.config/agent-memory/git-hooks`. A `Co-authored-by` trailer on commits in such a repository comes from Cursor's `commit-msg.cursor.co-author`, not from agent-memory.
+
+Any other `core.hooksPath` outside the repository's `.git/hooks` gets the hooks as before, and install names the folder, since another tool may manage it.
 
 The hooks run the command as it was called. For a tool install that's `~/.local/bin/agent-memory`, or uv's tool bin folder, which survives `uv tool upgrade agent-memory`. Run from a clone without the tool install, the hooks run `<clone>/bin/agent-memory`, as before.
 

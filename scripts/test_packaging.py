@@ -432,7 +432,8 @@ class InstallTest(CliTemp):
         old_layout(self.old_clone)
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"Git hooks set up from {self.old_clone} still run", result.stdout)
+        # The old clone has no git hooks, so nothing is said about them.
+        self.assertNotIn("still run", result.stdout)
         late = self.old_clone / "inbox" / "git" / "late" / "bundle.json"
         late.parent.mkdir(parents=True)
         late.write_text('{"session_id": "late"}\n')
