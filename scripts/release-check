@@ -38,11 +38,14 @@ def problems(tag, root=ROOT):
     if tag != f"v{expected}":
         found.append(f"the tag is {tag}, but pyproject.toml says version {expected}: tag v{expected}")
     for name in COMPOSE_FILES:
+        if not (root / name).is_file():
+            found.append(f"{name} is missing")
+            continue
         pins = PIN.findall((root / name).read_text(encoding="utf-8"))
         if pins != [expected]:
             shown = ", ".join(pins) or "none"
             found.append(f"{name} pins {IMAGE} at {shown}; it should pin {expected}")
-    if (root / PACKAGED).read_bytes() != (root / "compose.yaml").read_bytes():
+    if (root / PACKAGED).is_file() and (root / "compose.yaml").is_file() and (root / PACKAGED).read_bytes() != (root / "compose.yaml").read_bytes():
         found.append(f"{PACKAGED} differs from compose.yaml; copy it: cp compose.yaml {PACKAGED}")
     return found
 

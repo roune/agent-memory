@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -518,7 +519,7 @@ class InstallScriptTest(Temp):
 
 
 class ReleaseCheckTest(Temp):
-    """scripts/release-check: the tag, pyproject.toml and both compose files name one version."""
+    """scripts/release-check: the tag, pyproject.toml and the compose files, packaged copy included, name one version."""
 
     def setUp(self):
         super().setUp()
@@ -574,7 +575,7 @@ class ReleaseCheckTest(Temp):
         self.assertNotIn("pins", result.stderr)
 
     def test_a_packaged_copy_pinning_another_version_is_refused(self):
-        # The root file moves with it, so only the copy's pin is wrong and the bytes still match.
+        # The copy differs from the root file here too, so both messages appear.
         path = self.copy / "scripts" / "agent_memory_assets" / "compose.yaml"
         path.write_text(path.read_text().replace(f"agent-memory-server:{self.version()}", "agent-memory-server:0.0.9"))
         result = self.check(f"v{self.version()}")
@@ -591,7 +592,15 @@ class PackagedComposeTest(unittest.TestCase):
     def test_compose_text_reads_it_through_importlib_resources(self):
         import agent_memory_assets
 
+        self.assertEqual(agent_memory_assets.compose_bytes(), (ROOT / "compose.yaml").read_bytes())
         self.assertEqual(agent_memory_assets.compose_text(), (ROOT / "compose.yaml").read_text(encoding="utf-8"))
+
+    def test_every_package_in_pyproject_is_allowed_into_the_docker_build(self):
+        with open(ROOT / "pyproject.toml", "rb") as handle:
+            packages = tomllib.load(handle)["tool"]["setuptools"]["packages"]
+        lines = (ROOT / ".dockerignore").read_text().splitlines()
+        for package in packages:
+            self.assertIn(f"!scripts/{package}/", lines)
 
 
 class ComposeFilesTest(unittest.TestCase):

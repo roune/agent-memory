@@ -12,5 +12,10 @@ from importlib import resources
 COMPOSE = "compose.yaml"
 
 
+def compose_bytes():
+    # Bytes, not text: setup writes and hashes exactly these, and decoding can change newlines.
+    return resources.files(__package__).joinpath(COMPOSE).read_bytes()
+
+
 def compose_text():
-    return resources.files(__package__).joinpath(COMPOSE).read_text(encoding="utf-8")
+    return compose_bytes().decode("utf-8")
