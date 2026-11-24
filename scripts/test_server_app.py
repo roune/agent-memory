@@ -5,11 +5,15 @@ Under the plain python3 these tests are skipped.
 """
 
 import importlib.util
+import json
 import logging
+import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +23,7 @@ if str(SCRIPTS) not in sys.path:
 
 HAVE_STARLETTE = all(importlib.util.find_spec(name) for name in ("starlette", "httpx"))
 HAVE_MCP = importlib.util.find_spec("mcp") is not None
+HAVE_UVICORN = importlib.util.find_spec("uvicorn") is not None
 
 from agent_memory_server.embedding import Embedding
 from agent_memory_server.qdrant import Qdrant
@@ -226,7 +231,7 @@ class ImportRouteTest(AppCase):
             "/v1/admin/import",
             {"memories": [self.row("v1", "2026-11-01T00:00:00+00:00")], "rejections": [{"repo": REPO, "sha": A}]},
         )
-        self.assertEqual(first.json(), {"written": 1, "skipped": 0, "rejections": 1, "newer": [], "embedded": True})
+        self.assertEqual(first.json(), {"written": 1, "skipped": 0, "rejections": 1, "newer": []})
         newer = self.post("/v1/admin/import", {"memories": [self.row("v2", "2026-11-02T00:00:00+00:00")]})
         older = self.post("/v1/admin/import", {"memories": [self.row("v0", "2026-10-01T00:00:00+00:00")]})
         self.assertEqual((newer.json()["written"], older.json()["skipped"]), (1, 1))
@@ -236,6 +241,78 @@ class ImportRouteTest(AppCase):
         self.assertEqual(self.fake.payloads(self.embedding.collection)["miguel-learning-old"]["text"], "v2")
         bad = self.post("/v1/admin/import", {"memories": [{**self.row("x", "2026-11-03T00:00:00+00:00"), "transcript_path": "t"}]})
         self.assertEqual(bad.status_code, 400)
+
+
+class BlockingEmbedder(HashEmbedder):
+    """Holds embed_documents until release is set, like a cold model on a slow machine."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def embed_documents(self, texts):
+        self.started.set()
+        self.release.wait(10)
+        return super().embed_documents(texts)
+
+
+@unittest.skipUnless(HAVE_STARLETTE and HAVE_UVICORN, "needs the server extra (scripts/test-server)")
+class ImportOverHttpTest(unittest.TestCase):
+    """A real uvicorn server, because the TestClient waits for background work before it returns."""
+
+    def test_import_answers_before_the_batch_is_embedded(self):
+        import uvicorn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        data = Path(tmp.name)
+        settings = Settings(data_dir=data, models_dir=data / "models", auth="off", allowed_hosts=(f"127.0.0.1:{port}",))
+        store = ServerStore(settings.db_path)
+        model = BlockingEmbedder()
+        embedding = Embedding(store, model, Qdrant("http://qdrant:6333", transport=FakeQdrant()))
+        server = uvicorn.Server(
+            uvicorn.Config(create_app(settings, store, embedding, retry_seconds=0), host="127.0.0.1", port=port, log_level="error")
+        )
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        def stop():
+            model.release.set()
+            server.should_exit = True
+            thread.join(10)
+
+        self.addCleanup(stop)
+        deadline = time.monotonic() + 10
+        while not server.started:
+            self.assertLess(time.monotonic(), deadline, "uvicorn did not start")
+            time.sleep(0.02)
+
+        rows = [
+            {**body(session_id=f"s{n}"), "id": f"miguel-learning-{n}", "person": "miguel", "updated_at": "2026-11-01T00:00:00+00:00", "commits": []}
+            for n in range(3)
+        ]
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/admin/import",
+            data=json.dumps({"memories": rows}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            answer = json.load(response)
+        self.assertEqual(answer["written"], 3)
+        self.assertFalse(model.release.is_set())
+        self.assertTrue(model.started.wait(5), "the import did not start embedding")
+        self.assertEqual(store.count_pending(embedding.collection), 3)
+
+        model.release.set()
+        deadline = time.monotonic() + 5
+        while store.count_pending(embedding.collection):
+            self.assertLess(time.monotonic(), deadline, "the rows were not embedded after the reply")
+            time.sleep(0.02)
 
 
 class AuthOnTest(AppCase):
