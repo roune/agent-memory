@@ -18,7 +18,7 @@ The vector database belongs to this tool. A setup script creates it in this repo
 Tags on every memory:
 
 - `repo` — normalized remote project id (`host/owner/name`, e.g. `github.com/roune/agent-memory` from `origin`, or `repo=` in `.agent-memory.toml` when there is no `origin`)
-- `tool` — `cursor`, `claude-code`, `codex`, `pi`, or `git` (for bundles filed by `land`)
+- `tool` — `cursor`, `claude-code`, `codex`, `pi`, `git` (for bundles filed by `land` and the git hooks), or `note` (for `agent-memory note`)
 - `session_id` — the harness session, a `note` id, or a stable id from `land`
 - `domain` — `code`, `architecture`, or `operations`
 - `org`, `team`, `person` — who is keeping the note (defaults from `~/.config/agent-memory/identity`; overridable per document on the review form)
