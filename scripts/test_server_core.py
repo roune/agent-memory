@@ -268,6 +268,21 @@ class EmbeddingTest(ServerCase):
         self.assertTrue(self.store.is_embedded("tester-change-s1", embedding.collection))
         self.assertEqual(self.store.count_pending(embedding.collection), 0)
 
+    def test_stop_ends_an_embed_after_the_batch_in_hand(self):
+        embedding = Embedding(self.store, self.model, self.qdrant, batch_size=2)
+        for n in range(5):
+            self.store.write_memory(document(session_id=f"s{n}"), "local")
+        embed_documents = self.model.embed_documents
+
+        def stop_during_the_first_batch(texts):
+            embedding.stop()
+            return embed_documents(texts)
+
+        self.model.embed_documents = stop_during_the_first_batch
+        embedding.embed_pending()
+        self.assertEqual(len(self.fake.payloads(embedding.collection)), 2)
+        self.assertEqual(self.store.count_pending(embedding.collection), 3)
+
     def test_superseding_embeds_the_old_row_again(self):
         embedding = self.embedding()
         self.store.write_memory(document(session_id="s1"), "local")

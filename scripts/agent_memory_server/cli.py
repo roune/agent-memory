@@ -61,10 +61,26 @@ def _parser():
     return parser
 
 
+# On SIGTERM uvicorn waits for open connections to finish. A client that keeps
+# a request open would hold it there until Docker's 10-second stop timeout
+# kills the process (exit 137). After this many seconds uvicorn cancels what is
+# left and runs the lifespan shutdown, inside Docker's window. uvicorn then
+# re-raises the SIGTERM, so Docker shows exit 143, a normal stop.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
 def _uvicorn(app, host, port):
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port, log_level="info", server_header=False, proxy_headers=False)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        server_header=False,
+        proxy_headers=False,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
 
 
 def _embedder(settings, environ, given):

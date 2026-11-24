@@ -182,6 +182,9 @@ def create_app(settings, store, embedding, retry_seconds=None):
             async with sessions.run():
                 yield
         finally:
+            # The retry task may be inside an embed in a threadpool thread, which
+            # cancel() can't interrupt; stop() ends it after its current batch.
+            embedding.stop()
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
