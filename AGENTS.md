@@ -1,8 +1,12 @@
 # Agent brief
 
-This repo ships two things. The `agent-memory` CLI files coding-agent sessions and git history into a local inbox (`capture`, `land`, the git hooks), and lets a person keep or drop each one (`review`). It sends what was kept to the server, through the outbox when the server is down (`sync`), copies an old laptop store into the server (`migrate`), and points the CLI and editors at a server (`connect`). The agent-memory server in Docker stores approved memories in `memories.sqlite`, takes writes on the `/v1` API, embeds each write into Qdrant, and answers read-only MCP (`search`, `get`, `list`) over streamable HTTP at `/mcp`.
+This repo ships two things: the `agent-memory` CLI and the agent-memory server in Docker.
 
-The vector engine is Qdrant server, which only the agent-memory server container in `compose.yaml` can reach. The default embedding model is `BAAI/bge-small-en-v1.5` through fastembed at a pinned revision, run inside that server. Other models plug in through `scripts/embedder.py`. See [docs/vector-engine.md](docs/vector-engine.md), [docs/embedding-model.md](docs/embedding-model.md), and [docs/server-plan.md](docs/server-plan.md).
+The CLI files coding-agent sessions and git history into a local inbox (`capture`, `land`, the git hooks). On the review page a person approves or rejects each one (`review`). Approve sends the note to the server. When the server is down the note waits in the outbox, and `sync` sends it. `migrate` copies an old laptop store into the server, and `connect` points the CLI and editors at a server.
+
+The server stores approved memories in `memories.sqlite` and takes writes on the `/v1` API. It embeds each write into Qdrant, and answers read-only MCP (`search`, `get`, `list`) over streamable HTTP at `/mcp`.
+
+The vector engine is Qdrant server, which only the agent-memory server container in `compose.yaml` can reach. The default embedding model is `BAAI/bge-small-en-v1.5` through fastembed at a pinned revision, run inside that server. Other models plug in through `scripts/embedder.py`. See [docs/vector-engine.md](docs/vector-engine.md) and [docs/embedding-model.md](docs/embedding-model.md).
 
 ## Working here
 
@@ -17,7 +21,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 scripts/test-server
 ```
 
-The first needs only the standard library and skips the tests that need Starlette or the MCP SDK. The second runs the whole suite under `uv run --extra server`, so nothing is skipped. CI runs both.
+The first needs only the standard library and skips the tests that need Starlette or the MCP SDK. The second runs the whole suite under `uv run --extra server`, so nothing is skipped. CI runs both. The tests make throwaway git repos, so git needs a `user.name` and `user.email`.
 
 One PR per piece, each small enough to review on its own.
 
@@ -29,5 +33,5 @@ One PR per piece, each small enough to review on its own.
 - Install hooks into `~/.cursor`, `~/.claude`, `~/.codex`, or Pi.
 - Commit transcripts, inbox dumps, or anything under `data/`.
 - Reopen the decisions in [docs/context.md](docs/context.md). Those are locked.
-- Add a write tool to the MCP server. Writes go through the authenticated `/v1` API, which only the review flow calls.
+- Add a write tool to the MCP server. Writes go through the `/v1` API, which only the CLI calls: review, `sync`, the git hooks, and `migrate`. With auth on, every write needs a token.
 - Build automatic retrieval: no session-start hook that injects memories into a session. Query is on demand only, through the server's read-only MCP tools.
