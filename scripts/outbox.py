@@ -387,10 +387,16 @@ def _newest(client, stored_id, text):
         if not newer or newer in chain:
             return current, None
         current = newer
-    return current, None
+    # Too long to follow: supersede the last memory that was read.
+    return chain[-1], None
 
 
-def resolve(store_root, name, choice, client_for):
+def _label(item):
+    op = (item or {}).get("op")
+    return op if op in OPS else "item"
+
+
+def resolve(store_root, name, choice, client_for, replace_link=False):
     """Settle one item in outbox/failed/. Returns what was done, as a dict.
 
     drop deletes the item: for a 409 the server keeps the memory it has. It
@@ -402,6 +408,13 @@ def resolve(store_root, name, choice, client_for):
     that replaces it. The server stamps superseded_by on that one. The item is
     deleted only once the server has kept the new memory; when the server
     doesn't answer, it stays where it is.
+
+    The queue for that server goes first, so the order is kept: a note approved
+    after the 409 that supersedes the same memory lands before this one. While
+    items still wait for that server, supersede refuses.
+
+    A memory has one supersedes. When the queued memory already names another
+    one there, supersede refuses unless replace_link says to replace that link.
     """
     if choice not in CHOICES:
         raise ResolveError(f"choose {' or '.join(CHOICES)}, not {choice!r}")
@@ -409,23 +422,39 @@ def resolve(store_root, name, choice, client_for):
         path = _failed_path(store_root, name)
         item = _read(path)
         if choice == "drop":
+            raw = None if item is not None else path.read_text(encoding="utf-8", errors="replace")
             path.unlink()
-            return {"choice": "drop", "item": item, "name": path.stem}
+            return {"choice": "drop", "item": item, "name": path.stem, "raw": raw}
         if not is_conflict(item):
             status = (item or {}).get("status") or "unreadable"
             raise ResolveError(
                 f"supersede is for a memory that got a 409, and {path.stem} failed with {status}: "
                 "fix the cause and run agent-memory sync --retry-failed, or drop it"
             )
-        client = client_for(item["server_url"])
+        url = item["server_url"]
         body = dict(item["body"])
+        replaced = str(body.get("supersedes") or "").strip()
+        if replaced and not replace_link:
+            raise ResolveError(
+                f"{path.stem} already supersedes {replaced}, and a memory has one supersedes. "
+                f"Add --replace-link to supersede {item['stored_id']} instead, so {replaced} stays without "
+                "superseded_by, or drop it and approve a new note"
+            )
+        drain(store_root, client_for)
+        waiting = pending_for(store_root, url)
+        if waiting:
+            raise ResolveError(
+                f"{waiting} item{'s' if waiting != 1 else ''} for {url} still wait in the outbox, and they go first; "
+                "run agent-memory sync once the server takes them"
+            )
+        client = client_for(url)
         text = memory_rules.clean_text(str(body.get("text") or ""))
         target, already = _newest(client, item["stored_id"], text)
+        done = {"choice": "supersede", "item": item, "name": path.stem, "supersedes": None, "dropped_link": None, "already": True}
         if already:
             path.unlink()
-            return {"choice": "supersede", "item": item, "name": path.stem, "id": already, "supersedes": None, "already": True}
+            return {**done, "id": already}
         base = str(body.get("session_id") or "").strip()
-        replaced = str(body.get("supersedes") or "").strip()
         for number in range(2, 2 + SUFFIXES):
             body["session_id"] = f"{base}-{number}"
             body["supersedes"] = target
@@ -433,6 +462,11 @@ def resolve(store_root, name, choice, client_for):
                 answer = send(client, {"op": "memory", "body": body})
             except server_client.ServerError as error:
                 if error.status == 409:
+                    stored = memory_rules.clean_text(str((error.body.get("stored") or {}).get("text") or ""))
+                    if stored == text:
+                        # That id already holds this text: an earlier resolve the chain walk didn't reach.
+                        path.unlink()
+                        return {**done, "id": error.body.get("id") or body["session_id"]}
                     continue
                 raise
             path.unlink()
@@ -464,7 +498,7 @@ def describe_failed(store_root):
             out.append(f"{name}: not readable. Drop it with agent-memory sync --resolve {name} drop")
             continue
         body = item.get("body") if isinstance(item.get("body"), dict) else {}
-        what = "memory" if item.get("op") == "memory" else "rejection"
+        what = _label(item)
         out.append(f"{name}: {what} for {body.get('repo') or '?'}, queued {item.get('created_at') or '?'}")
         if not is_conflict(item):
             out.append(f"  failed ({item.get('status')}): {item.get('error') or ''}")
@@ -484,6 +518,12 @@ def describe_failed(store_root):
         out.append(_indent(item.get("stored")))
         if memory_rules.clean_text(str(body.get("text") or "")) == memory_rules.clean_text(str(item.get("stored") or "")):
             out.append("  The texts are the same; another field differs (kind, domain, commits, links or the time).")
+        linked = str(body.get("supersedes") or "").strip()
+        if linked:
+            out.append(
+                f"  It supersedes {linked}. A memory has one supersedes, so supersede needs --replace-link, "
+                f"and {linked} then stays without superseded_by."
+            )
         out.append("  Choose one:")
         out.append(
             f"    agent-memory sync --resolve {name} supersede   "
