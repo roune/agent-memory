@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import hashlib
@@ -1331,6 +1332,90 @@ def resolve_transcript(payload, repo, session_id):
     return None
 
 
+# How much of a large transcript's head and tail transcript_times reads first,
+# and how far it widens a window that holds no timestamped line (one huge line).
+TRANSCRIPT_TIME_WINDOW = 1 << 20
+TRANSCRIPT_TIME_LIMIT = 8 << 20
+
+
+def _transcript_line_time(line):
+    """The top-level "timestamp" of one JSONL line, in UTC, or None."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    value = entry.get("timestamp") if isinstance(entry, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def transcript_times(path):
+    """The first and last times a JSONL transcript records, as UTC text, or None for each.
+
+    Claude Code and Codex put an ISO time on each line's top-level "timestamp".
+    Cursor's agent transcript has none, so the caller falls back to now. Only
+    the times are read: nothing else from the transcript reaches the bundle. A
+    large file is read at its head and its tail only, to keep a hook fast. A
+    window that holds no whole line (one huge line) widens, up to
+    TRANSCRIPT_TIME_LIMIT.
+    """
+
+    def found(lines):
+        return [t for t in map(_transcript_line_time, lines or []) if t is not None]
+
+    head = tail = None
+    window = TRANSCRIPT_TIME_WINDOW
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            while True:
+                if size <= 2 * window:
+                    handle.seek(0)
+                    head = tail = handle.read().splitlines()
+                    break
+                if not head:
+                    handle.seek(0)
+                    head = handle.read(window).splitlines()[:-1]
+                if not tail:
+                    handle.seek(size - window)
+                    tail = handle.read(window).splitlines()[1:]
+                if (head and tail) or window >= TRANSCRIPT_TIME_LIMIT:
+                    break
+                window *= 2
+    except OSError:
+        return None, None
+
+    def text(moment):
+        return moment.replace(microsecond=0).isoformat()
+
+    first = found(head)
+    last = first if tail is head else found(tail)
+    return (text(min(first)) if first else None, text(max(last)) if last else None)
+
+
+def session_times(first_at, last_at, previous):
+    """started_at and ended_at for a capture: the transcript's, else the earlier capture's or now.
+
+    When only one side came from the transcript (a line too long to read), the
+    start is kept no later than the end, so the landing check still has a window.
+    """
+    ended = last_at or now()
+    started = first_at or previous.get("started_at") or now()
+    try:
+        if datetime.fromisoformat(started) > datetime.fromisoformat(ended):
+            started = ended
+    except (TypeError, ValueError):
+        pass
+    return started, ended
+
+
 def session_dir(tool, session_id):
     return inbox_root() / tool / session_id
 
@@ -1365,7 +1450,7 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     cfg = read_repo_config(repo)
     if not cfg.get("auto_approve"):
         return
-    started = previous.get("started_at")
+    started = previous.get("captured_at") or previous.get("started_at")
     if not started:
         log("capture session-end: auto_approve left inbox; session has no earlier capture")
         return
@@ -1487,12 +1572,21 @@ def write_capture(args, payload):
             copy_name = "transcript"
 
     message = payload.get("last_assistant_message") or previous.get("last_assistant_message") or ""
+    # The session's own times, so an old transcript captured late keeps its dates.
+    source = transcript
+    if source is None and copy_name and (folder / copy_name).is_file():
+        source = folder / copy_name
+    first_at, last_at = transcript_times(source) if source is not None else (None, None)
+    started_at, ended_at = session_times(first_at, last_at, previous)
     bundle = {
         "tool": tool,
         "session_id": session_id,
         "repo": repo,
-        "started_at": previous.get("started_at") or now(),
-        "ended_at": now(),
+        "started_at": started_at,
+        # The first capture of this session id. A resumed or forked transcript can
+        # start days earlier, so auto-approve keeps to this time, not started_at.
+        "captured_at": previous.get("captured_at") or previous.get("started_at") or now(),
+        "ended_at": ended_at,
         "event": event,
         "closed": previous.get("closed", False) or event.lower() in END_EVENTS,
         "transcript_copy": copy_name,
@@ -1967,6 +2061,18 @@ PAGE = """<!DOCTYPE html>
 <p class="meta">__LEAD__</p>
 __BANNER__
 __ITEMS__
+<script>
+// The long-text note follows the textarea as you type. Without JS it shows
+// how the text was when the page loaded.
+document.querySelectorAll("textarea[data-long-chars]").forEach(function (area) {
+  var note = area.form && area.form.querySelector("[data-long-note]");
+  if (!note) return;
+  var limit = parseInt(area.getAttribute("data-long-chars"), 10);
+  var update = function () { note.hidden = Array.from(area.value).length <= limit; };
+  area.addEventListener("input", update);
+  update();
+});
+</script>
 </body>
 </html>
 """
@@ -2241,14 +2347,19 @@ def render_page(items, include_all, status=None, done=""):
             if message:
                 message_block = f"<pre>{html.escape(message[:4000])}</pre>"
             text_label = "Context of this commit" if kind == "change" else "Keep this text"
-            long_note = ""
-            if len(draft.get("text") or "") > LONG_TEXT_CHARS:
-                long_note = (
-                    '<p class="meta">This text is long. The embedding reads only about '
-                    "the first 512 tokens. Trim it, or keep what matters first.</p>"
-                )
+            # Rendered for every form, and hidden while the text is short. The
+            # page script follows the textarea; without JS it shows the load state.
+            hidden = "" if len(draft.get("text") or "") > LONG_TEXT_CHARS else " hidden"
+            long_note = (
+                f'<p class="meta" data-long-note aria-live="polite"{hidden}>This text is long. '
+                "The embedding reads only about the first 512 tokens. "
+                "Trim it, or keep what matters first.</p>"
+            )
             iden = read_identity()
+            # As approve does: the bundle's own id, else the origin of its repo.
             rr_default = (land_meta.get("remote_repo") or "").strip()
+            if not rr_default and item.get("repo") and Path(str(item["repo"])).is_dir():
+                rr_default = git_remote_repo_id(str(item["repo"]))
             remote_d = html.escape(rr_default)
             occurred_default = html.escape(item.get("ended_at") or "")
             record_val = ""
@@ -2285,7 +2396,7 @@ def render_page(items, include_all, status=None, done=""):
 <label>Kind <select name="kind">{select_options(kinds, kind)}</select></label>
 <label>Domain <select name="domain">{select_options(DOMAINS, domain)}</select></label>
 {extra_fields}
-<label>{text_label} <textarea name="text">{draft_text}</textarea></label>
+<label>{text_label} <textarea name="text" data-long-chars="{LONG_TEXT_CHARS}">{draft_text}</textarea></label>
 {long_note}
 <button type="submit">Approve</button>
 </form>
@@ -2448,16 +2559,58 @@ def review(args):
             continue
     if server is None:
         raise SystemExit(f"no free port from {port}")
-    write_json(state_path, {"pid": os.getpid(), "port": port})
-    url = f"http://127.0.0.1:{port}"
-    print(url)
-    webbrowser.open(url)
+    stop_on_signals()
     try:
+        write_json(state_path, {"pid": os.getpid(), "port": port})
+        url = f"http://127.0.0.1:{port}"
+        print(url)
+        webbrowser.open(url)
         server.serve_forever()
     finally:
-        if state_path.is_file():
-            state_path.unlink()
+        # serve_forever only ends by an exception, so the process exits next.
+        # The handlers stay, and a later signal is ignored while this runs.
+        server.server_close()
+        drop_review_state(state_path)
     return 0
+
+
+def _stop_review(signum, frame):
+    # A second signal (a closed terminal can send two) must not cut the cleanup short.
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None and signal.getsignal(number) is _stop_review:
+            signal.signal(number, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
+def stop_on_signals():
+    """`kill <pid>` and a closed terminal stop the page through its finally, as Ctrl-C does.
+
+    A SIGHUP that is ignored (nohup) stays ignored.
+    """
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        if name == "SIGHUP" and signal.getsignal(number) == signal.SIG_IGN:
+            continue
+        signal.signal(number, _stop_review)
+
+
+def drop_review_state(state_path):
+    """Remove review.json if it still names this process, not a page started since.
+
+    A file that is no longer JSON (a kill while it was written) goes too, or the
+    next review would refuse to start on it.
+    """
+    try:
+        state = read_json(state_path)
+    except OSError:
+        return
+    except SystemExit:
+        state = None
+    if state is None or (isinstance(state, dict) and state.get("pid") == os.getpid()):
+        state_path.unlink(missing_ok=True)
 
 
 def present_tools():
