@@ -516,7 +516,9 @@ class Store:
         """Metadata query. Team, org, and repo each use their composite index.
 
         team and org together are an AND. Asking both populations is two calls.
-        A missing occurred_at does not match since or until.
+        A missing occurred_at does not match since or until. Rows with the same
+        occurred_at come in id order, newest-first like the rest, whichever
+        index the query uses, so offset pages don't overlap or skip.
         """
         clauses = []
         params = []
@@ -555,7 +557,7 @@ class Store:
                    look_at, supersedes, superseded_by, updates
             FROM memory
             {where}
-            ORDER BY occurred_at DESC
+            ORDER BY occurred_at DESC, id DESC
             LIMIT ? OFFSET ?
         """
         try:

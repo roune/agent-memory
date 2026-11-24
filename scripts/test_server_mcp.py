@@ -68,7 +68,10 @@ class StoreCase(unittest.TestCase):
         self.data = Path(self.tmp.name)
         self.store = ServerStore(self.data / "memories.sqlite")
         self.fake = FakeQdrant()
-        self.embedding = Embedding(self.store, HashEmbedder(), Qdrant("http://qdrant:6333", transport=self.fake))
+        self.embedding = Embedding(self.store, self.make_embedder(), Qdrant("http://qdrant:6333", transport=self.fake))
+
+    def make_embedder(self):
+        return HashEmbedder()
 
     def keep(self, **changes):
         outcome, stored = self.store.write_memory(memory(**changes), "test")
@@ -199,7 +202,7 @@ class GetAndListTest(StoreCase):
         self.keep(session_id="other", repo=OTHER, kind="decision", team="Infra")
         listed = mcp_tools.list_memories(self.store, repo=REPO, since="2026-08-01T00:00:00+00:00")
         self.assertEqual([hit["document_id"] for hit in listed["memories"]], ["miguel-learning-new"])
-        self.assertEqual(listed["filter"], {"repo": REPO})
+        self.assertEqual(listed["filter"], {"repo": REPO, "since": "2026-08-01T00:00:00+00:00"})
         until = mcp_tools.list_memories(self.store, until="2026-08-01T00:00:00+00:00")
         self.assertEqual([hit["document_id"] for hit in until["memories"]], ["miguel-learning-old"])
         self.assertEqual(len(mcp_tools.list_memories(self.store, repo=" ", since="")["memories"]), 3)
@@ -363,7 +366,7 @@ class McpAuthTest(McpCase):
         self.assertEqual(refused.status_code, 403)
         self.assertIn("read", refused.json()["error"])
         session, _ = self.open_session(token=self.reader)
-        self.assertEqual(self.call(session, "list", token=self.reader)["structuredContent"], {"filter": {}, "memories": []})
+        self.assertEqual(self.call(session, "list", token=self.reader)["structuredContent"], {"filter": {}, "limit": 20, "offset": 0, "memories": [], "next_offset": None})
         # A session doesn't outlive its token: each request is checked again.
         self.assertEqual(self.rpc("tools/list", session=session).status_code, 401)
         self.assertEqual(self.rpc("tools/list", session=session, token=self.writer).status_code, 403)

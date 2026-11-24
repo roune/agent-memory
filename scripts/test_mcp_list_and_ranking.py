@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""MCP list paging and its echoed filter, and search ordering across a supersede.
+
+Battle test v0.1.0, findings 10 and 8. The functions run on the plain python3
+suite; the /mcp half needs the server extra (scripts/test-server). No test
+needs Docker or a model: FakeQdrant and a scripted embedder stand in.
+"""
+
+import logging
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from agent_memory_server import mcp_tools
+from agent_memory_server.embedding import Embedding
+from agent_memory_server.mcp_tools import QueryError
+from agent_memory_server.qdrant import Qdrant
+from agent_memory_server.store import ServerStore
+from server_doubles import FakeQdrant, HashEmbedder
+
+import test_server_mcp
+
+REPO = "github.com/example/proj"
+
+# The query sits on the x axis; each text's angle from it sets its score.
+QUERY = "how does this tool work end to end"
+VECTORS = {
+    "query: " + QUERY: [1.0, 0.0],
+    "v1: the laptop store": [1.0, 0.10],  # closest: the stale note scores highest
+    "v2: the server": [1.0, 0.30],
+    "v3: the server, with tokens": [1.0, 0.50],
+    "no auto retrieval": [1.0, 0.20],
+    "unrelated": [0.0, 1.0],
+}
+
+
+class ScriptedEmbedder(HashEmbedder):
+    """Fixed two-dimensional vectors for known texts, so the scores are chosen by the test."""
+
+    def __init__(self):
+        super().__init__(dimension=2, model="test/scripted")
+
+    def _vector(self, text):
+        return VECTORS.get(text) or super()._vector(text)
+
+
+def memory(**changes):
+    base = {
+        "kind": "decision",
+        "domain": "architecture",
+        "text": "a note",
+        "repo": REPO,
+        "tool": "git",
+        "session_id": "s1",
+        "org": "Acme",
+        "team": "Platform",
+        "person": "miguel",
+        "occurred_at": "2026-11-20T10:00:00+00:00",
+    }
+    base.update(changes)
+    base.setdefault("id", f"{base['person']}-{base['kind']}-{base['session_id']}")
+    return base
+
+
+def ids(hits):
+    return [hit["document_id"] for hit in hits]
+
+
+class StoreCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        quiet = logging.NullHandler()
+        logging.getLogger("agent_memory_server").addHandler(quiet)
+        self.addCleanup(logging.getLogger("agent_memory_server").removeHandler, quiet)
+        self.data = Path(self.tmp.name)
+        self.store = ServerStore(self.data / "memories.sqlite")
+        self.embedding = Embedding(self.store, ScriptedEmbedder(), Qdrant("http://qdrant:6333", transport=FakeQdrant()))
+
+    def keep(self, **changes):
+        outcome, stored = self.store.write_memory(memory(**changes), "test")
+        self.assertEqual(outcome, "created")
+        self.embedding.embed_pending()
+        return stored["document_id"]
+
+    def keep_many(self, count):
+        """count memories, one minute apart, newest last."""
+        for index in range(count):
+            self.keep(
+                session_id=f"n{index:03d}",
+                occurred_at=f"2026-11-{1 + index // 1440:02d}T{index // 60 % 24:02d}:{index % 60:02d}:00+00:00",
+            )
+
+
+class ListFilterEchoTest(StoreCase):
+    def test_filter_echoes_since_and_until_as_utc_bounds(self):
+        self.keep(session_id="s1")
+        listed = mcp_tools.list_memories(self.store, repo=REPO, kind="decision", since="2026-11-20")
+        self.assertEqual(
+            listed["filter"], {"repo": REPO, "kind": "decision", "since": "2026-11-20T00:00:00+00:00"}
+        )
+        both = mcp_tools.list_memories(self.store, since="2026-11-20T11:00:00+01:00", until="2026-11-21T00:00:00Z")
+        self.assertEqual(both["filter"], {"since": "2026-11-20T10:00:00+00:00", "until": "2026-11-21T00:00:00+00:00"})
+
+    def test_blank_bounds_are_not_echoed(self):
+        self.assertEqual(mcp_tools.list_memories(self.store, since="", until=None, repo=" ")["filter"], {})
+
+
+class ListPagingTest(StoreCase):
+    def test_offset_pages_past_the_newest_hundred(self):
+        self.keep_many(130)
+        seen = []
+        offset = 0
+        pages = 0
+        while offset is not None:
+            page = mcp_tools.list_memories(self.store, repo=REPO, limit=100, offset=offset)
+            self.assertEqual(page["offset"], offset)
+            seen += ids(page["memories"])
+            offset = page["next_offset"]
+            pages += 1
+        self.assertEqual(pages, 2)
+        self.assertEqual(len(seen), 130)
+        self.assertEqual(len(set(seen)), 130)
+        self.assertEqual(seen[0], "miguel-decision-n129")
+        self.assertEqual(seen[-1], "miguel-decision-n000")
+
+    def test_next_offset_is_null_on_the_last_page_even_when_it_is_full(self):
+        self.keep_many(4)
+        first = mcp_tools.list_memories(self.store, limit=2)
+        self.assertEqual((first["offset"], first["next_offset"]), (0, 2))
+        last = mcp_tools.list_memories(self.store, limit=2, offset=2)
+        self.assertEqual(ids(last["memories"]), ["miguel-decision-n001", "miguel-decision-n000"])
+        self.assertIsNone(last["next_offset"])
+        self.assertEqual(mcp_tools.list_memories(self.store, offset=10)["memories"], [])
+        # limit is clamped to 100; the result says so, and next_offset follows the clamped size.
+        clamped = mcp_tools.list_memories(self.store, limit=500)
+        self.assertEqual((clamped["limit"], clamped["next_offset"]), (100, None))
+        self.assertEqual(mcp_tools.list_memories(self.store, limit=3)["next_offset"], 3)
+        self.assertIsNone(mcp_tools.list_memories(self.store, limit=5)["next_offset"])
+
+    def test_paging_keeps_the_filters(self):
+        self.keep_many(3)
+        self.keep(session_id="other", repo="github.com/example/other")
+        page = mcp_tools.list_memories(self.store, repo=REPO, limit=2, offset=2)
+        self.assertEqual(ids(page["memories"]), ["miguel-decision-n000"])
+        self.assertIsNone(page["next_offset"])
+
+    def test_rows_with_the_same_time_page_in_one_order_whichever_index_is_used(self):
+        # Same occurred_at for all: the repo filter reads memory_repo_occurred, no filter scans.
+        for index in range(6):
+            self.keep(session_id=f"t{index}")
+        expected = [f"miguel-decision-t{index}" for index in reversed(range(6))]
+        for given in ({}, {"repo": REPO}, {"team": "Platform"}):
+            with self.subTest(given=given):
+                pages = [mcp_tools.list_memories(self.store, limit=2, offset=skip, **given) for skip in (0, 2, 4)]
+                self.assertEqual([hit for page in pages for hit in ids(page["memories"])], expected)
+
+    def test_bad_offsets_are_tool_errors(self):
+        self.assertEqual(mcp_tools.list_memories(self.store, offset=None)["offset"], 0)
+        self.assertEqual(mcp_tools.list_memories(self.store, offset="3")["offset"], 3)
+        self.assertEqual(mcp_tools.list_memories(self.store, offset=2.0)["offset"], 2)
+        self.assertEqual(mcp_tools.list_memories(self.store, offset=mcp_tools.MAX_OFFSET)["memories"], [])
+        # 10**30 reached SQLite and raised OverflowError, past the tool's error handling.
+        for bad in (-1, "many", True, [1], 1.5, 10**30, mcp_tools.MAX_OFFSET + 1, float("inf")):
+            with self.subTest(bad=bad), self.assertRaisesRegex(QueryError, "offset"):
+                mcp_tools.list_memories(self.store, offset=bad)
+
+
+class SupersedesFirstTest(unittest.TestCase):
+    """The ordering on its own, with hits as search builds them."""
+
+    @staticmethod
+    def hit(document_id, score, superseded_by=None):
+        found = {"document_id": document_id, "score": score}
+        if superseded_by:
+            found["superseded_by"] = superseded_by
+        return found
+
+    def test_a_superseded_hit_moves_to_just_after_its_newer_hit(self):
+        results = [self.hit("x", 0.9), self.hit("v1", 0.8, "v2"), self.hit("y", 0.7), self.hit("v2", 0.6)]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["x", "y", "v2", "v1"])
+
+    def test_scores_and_hits_are_unchanged(self):
+        results = [self.hit("v1", 0.8, "v2"), self.hit("v2", 0.6)]
+        ordered = mcp_tools.supersedes_first(results)
+        self.assertEqual(sorted(ordered, key=lambda hit: hit["document_id"]), results)
+
+    def test_without_its_newer_hit_a_superseded_hit_keeps_its_place(self):
+        results = [self.hit("v1", 0.8, "elsewhere"), self.hit("x", 0.7)]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["v1", "x"])
+
+    def test_a_chain_comes_out_newest_first_at_the_newest_place(self):
+        results = [self.hit("v1", 0.9, "v2"), self.hit("x", 0.8), self.hit("v2", 0.7, "v3"), self.hit("v3", 0.6)]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["x", "v3", "v2", "v1"])
+
+    def test_two_old_hits_of_one_newer_keep_their_score_order(self):
+        results = [self.hit("a", 0.9, "new"), self.hit("b", 0.8, "new"), self.hit("new", 0.5)]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["new", "a", "b"])
+
+    def test_an_old_hit_below_its_newer_hit_never_moves_up(self):
+        # Opus review: v1 used to be pulled up to second place, above x and y.
+        results = [self.hit("v2", 0.9), self.hit("x", 0.8), self.hit("y", 0.7), self.hit("v1", 0.6, "v2")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["v2", "x", "y", "v1"])
+        chain = [self.hit("v3", 0.9), self.hit("x", 0.8), self.hit("v2", 0.5, "v3"), self.hit("v1", 0.95, "v2")]
+        chain.sort(key=lambda hit: hit["score"], reverse=True)
+        self.assertEqual(ids(mcp_tools.supersedes_first(chain)), ["v3", "x", "v2", "v1"])
+
+    def test_an_old_hit_already_below_its_newer_hit_stays_put(self):
+        results = [self.hit("new", 0.9), self.hit("x", 0.8), self.hit("a", 0.7, "new"), self.hit("b", 0.6, "zz")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["new", "x", "a", "b"])
+
+    def test_links_that_loop_move_a_hit_at_most_once(self):
+        results = [self.hit("a", 0.9, "b"), self.hit("x", 0.8), self.hit("b", 0.7, "a"), self.hit("s", 0.6, "s")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(results)), ["x", "b", "a", "s"])
+        into = [self.hit("c", 0.9, "a"), self.hit("a", 0.8, "b"), self.hit("b", 0.7, "a")]
+        self.assertEqual(ids(mcp_tools.supersedes_first(into)), ["b", "a", "c"])
+
+
+class SearchSupersedeTest(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.keep(session_id="v1", text="v1: the laptop store")
+        self.keep(session_id="v2", text="v2: the server", supersedes="miguel-decision-v1")
+        self.keep(session_id="no-auto", text="no auto retrieval")
+        self.keep(session_id="other", text="unrelated")
+
+    def test_the_superseded_v1_comes_after_v2_though_it_scores_higher(self):
+        found = mcp_tools.search(self.store, self.embedding, QUERY, repo=REPO)
+        order = ids(found["results"])
+        scores = {hit["document_id"]: hit["score"] for hit in found["results"]}
+        self.assertGreater(scores["miguel-decision-v1"], scores["miguel-decision-v2"])
+        self.assertLess(order.index("miguel-decision-v2"), order.index("miguel-decision-v1"))
+        self.assertEqual(order.index("miguel-decision-v1"), order.index("miguel-decision-v2") + 1)
+        # Nothing is hidden, and both links are there.
+        self.assertEqual(len(order), 4)
+        by_id = {hit["document_id"]: hit for hit in found["results"]}
+        self.assertEqual(by_id["miguel-decision-v1"]["superseded_by"], "miguel-decision-v2")
+        self.assertEqual(by_id["miguel-decision-v2"]["supersedes"], "miguel-decision-v1")
+        # A hit that supersedes nothing keeps its score place ahead of v2.
+        self.assertEqual(order[0], "miguel-decision-no-auto")
+
+    def test_a_chain_of_three_reads_newest_first(self):
+        self.keep(session_id="v3", text="v3: the server, with tokens", supersedes="miguel-decision-v2")
+        order = ids(mcp_tools.search(self.store, self.embedding, QUERY)["results"])
+        start = order.index("miguel-decision-v3")
+        self.assertEqual(order[start : start + 3], ["miguel-decision-v3", "miguel-decision-v2", "miguel-decision-v1"])
+
+    def test_when_the_newer_one_is_cut_by_the_limit_the_old_one_still_shows(self):
+        order = ids(mcp_tools.search(self.store, self.embedding, QUERY, limit=1)["results"])
+        self.assertEqual(order, ["miguel-decision-v1"])
+
+
+class McpHttpTest(test_server_mcp.McpCase):
+    """/mcp through McpCase's helpers, with the scripted embedder and this file's memories."""
+
+    def make_embedder(self):
+        return ScriptedEmbedder()
+
+    def keep(self, **changes):
+        return StoreCase.keep(self, **changes)
+
+    keep_many = StoreCase.keep_many
+
+    def setUp(self):
+        super().setUp()
+        self.session, _ = self.open_session()
+
+    def call(self, name, **arguments):
+        return super().call(self.session, name, **arguments)
+
+    def test_list_tool_takes_offset_and_echoes_since(self):
+        self.keep_many(3)
+        listed = self.rpc("tools/list", session=self.session).json()["result"]["tools"]
+        tools = {tool["name"]: tool for tool in listed}
+        self.assertIn("offset", tools["list"]["inputSchema"]["properties"])
+        self.assertIn("next_offset", tools["list"]["description"])
+        self.assertIn("superseded one never comes first", tools["search"]["description"])
+        first = self.call("list", repo=REPO, since="2026-11-01", limit=2)["structuredContent"]
+        self.assertEqual(first["filter"], {"repo": REPO, "since": "2026-11-01T00:00:00+00:00"})
+        self.assertEqual(first["limit"], 2)
+        self.assertEqual(first["next_offset"], 2)
+        second = self.call("list", repo=REPO, since="2026-11-01", limit=2, offset=first["next_offset"])
+        self.assertEqual(ids(second["structuredContent"]["memories"]), ["miguel-decision-n000"])
+        self.assertIsNone(second["structuredContent"]["next_offset"])
+        for bad in (-1, 10**30):
+            with self.subTest(bad=bad):
+                refused = self.call("list", offset=bad)
+                self.assertTrue(refused["isError"])
+                self.assertIn("offset must be from 0", refused["content"][0]["text"])
+
+    def test_search_tool_puts_v2_before_v1(self):
+        self.keep(session_id="v1", text="v1: the laptop store")
+        self.keep(session_id="v2", text="v2: the server", supersedes="miguel-decision-v1")
+        order = ids(self.call("search", query=QUERY)["structuredContent"]["results"])
+        self.assertEqual(order, ["miguel-decision-v2", "miguel-decision-v1"])
+
+
+if __name__ == "__main__":
+    unittest.main()

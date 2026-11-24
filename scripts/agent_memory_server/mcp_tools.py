@@ -7,7 +7,9 @@ go through the /v1 API, which only the review flow calls.
 
 Superseded memories are returned like any other, with superseded_by naming
 the newer one. Nothing is hidden: a supersede may come from another org, so
-the reader sees both notes and decides.
+the reader sees both notes and decides. When search finds both sides of a
+supersede, the old one moves down to just after the newer one, so the newer
+note is read first (supersedes_first).
 
 Everything above build_server() is standard library, so the plain python3
 suite tests it. build_server() needs the server extra.
@@ -26,6 +28,7 @@ log = logging.getLogger("agent_memory_server")
 FILTER_KEYS = ("repo", "domain", "kind", "org", "team", "person")
 SEARCH_LIMIT = (10, 50)
 LIST_LIMIT = (20, 100)
+MAX_OFFSET = 2**62
 MAX_QUERY = 2000
 
 INSTRUCTIONS = """\
@@ -99,6 +102,57 @@ def search_body(vector, filters, limit):
     return body
 
 
+def clamp_offset(offset):
+    """A whole number of rows to skip, 0 when missing. Out of range is refused, not clamped.
+
+    MAX_OFFSET keeps offset + limit inside SQLite's 64-bit integer, which
+    would otherwise raise OverflowError past the tool's error handling.
+    """
+    if offset is None or offset == "":
+        return 0
+    if isinstance(offset, bool) or (isinstance(offset, float) and not offset.is_integer()):
+        raise QueryError(f"offset must be a whole number, not {offset!r}")
+    try:
+        number = int(offset)
+    except (TypeError, ValueError, OverflowError):
+        raise QueryError(f"offset must be a whole number, not {offset!r}") from None
+    if not 0 <= number <= MAX_OFFSET:
+        raise QueryError(f"offset must be from 0 to {MAX_OFFSET}, not {number}")
+    return number
+
+
+def supersedes_first(results):
+    """results in score order, except that a superseded hit never comes before its newer hit.
+
+    A hit moves only when its superseded_by is a hit that scored lower: then it
+    goes to just after that newer hit. So it only ever moves down, nothing is
+    dropped, no score changes, and the others keep their order. A chain
+    v1 -> v2 -> v3, scored in that order, comes out v3, v2, v1 at v3's place.
+    When the newer hit already comes first, or isn't a hit, the old one keeps
+    its place; its superseded_by says to get the newer one. Because a move
+    always points further down the list, links that loop can't move a hit
+    twice.
+    """
+    position = {hit["document_id"]: index for index, hit in enumerate(results)}
+    older = {}
+    for index, hit in enumerate(results):
+        newer = hit.get("superseded_by")
+        if position.get(newer, -1) > index:
+            older.setdefault(newer, []).append(hit)
+    moved = {hit["document_id"] for hits in older.values() for hit in hits}
+    ordered = []
+
+    def place(hit):
+        ordered.append(hit)
+        for old in older.get(hit["document_id"], ()):
+            place(old)
+
+    for hit in results:
+        if hit["document_id"] not in moved:  # a moved hit is placed after its newer hit
+            place(hit)
+    return ordered
+
+
 def search(store, embedding, query, limit=None, **given):
     """Semantic search over the active collection. Hits come back in get's shape, plus score."""
     text = _optional(query)
@@ -137,7 +191,7 @@ def search(store, embedding, query, limit=None, **given):
     except StoreError as error:
         raise QueryError(str(error)) from None
     results = [{**rows[document_id], "score": score} for document_id, score in scores.items() if document_id in rows]
-    return {"query": text, "filter": filters, "results": results, "not_yet_searchable": waiting}
+    return {"query": text, "filter": filters, "results": supersedes_first(results), "not_yet_searchable": waiting}
 
 
 def get(store, document_id):
@@ -153,18 +207,34 @@ def get(store, document_id):
     return found
 
 
-def list_memories(store, since=None, until=None, limit=None, **given):
-    """Metadata query, newest occurred_at first. No ranking."""
+def list_memories(store, since=None, until=None, limit=None, offset=None, **given):
+    """Metadata query, newest occurred_at first. No ranking.
+
+    filter echoes every filter that applied, since and until as the UTC bounds
+    compared. limit is the page size used, after clamping. next_offset is the
+    offset of the next page, or None when this page is the last one.
+    """
     filters = filters_from(**given)
     try:
         bounds = {"since": rules.time_filter(since, "since"), "until": rules.time_filter(until, "until")}
     except ValueError as error:
         raise QueryError(str(error)) from None
+    size = clamp_limit(limit, LIST_LIMIT)
+    skip = clamp_offset(offset)
     try:
-        hits = store.query_memories(**filters, **bounds, limit=clamp_limit(limit, LIST_LIMIT))
+        hits = store.query_memories(**filters, **bounds, limit=size, offset=skip)
+        # A full page may be the last one: look one row further.
+        more = len(hits) == size and bool(store.query_memories(**filters, **bounds, limit=1, offset=skip + size))
     except (StoreError, ValueError) as error:
         raise QueryError(str(error)) from None
-    return {"filter": filters, "memories": hits}
+    echoed = {**filters, **{name: bound for name, bound in bounds.items() if bound is not None}}
+    return {
+        "filter": echoed,
+        "limit": size,
+        "offset": skip,
+        "memories": hits,
+        "next_offset": skip + size if more else None,
+    }
 
 
 FILTER_HELP = (
@@ -200,7 +270,9 @@ def build_server(store, embedding):
         description=(
             "Semantic search over approved memories, best match first. Each hit has document_id, "
             "score, text, kind, domain, repo, commits, pull_request, occurred_at, person, org and "
-            "team, and superseded_by or supersedes when set. " + FILTER_HELP
+            "team, and superseded_by or supersedes when set. When a hit and the memory that "
+            "supersedes it are both found, the superseded one never comes first: if it scored "
+            "higher, it moves down to just after the newer one. Both are returned. " + FILTER_HELP
         ),
         annotations=read_only,
     )
@@ -232,7 +304,13 @@ def build_server(store, embedding):
         description=(
             "List approved memories by metadata, newest first. No semantic ranking. since and "
             "until are ISO-8601 times with a zone, such as 2026-08-01T00:00:00+00:00, or a date "
-            "such as 2026-08-01 (midnight UTC). " + FILTER_HELP
+            "such as 2026-08-01 (midnight UTC). limit is the page size (at most 100; the result "
+            "says the one used) and offset "
+            "skips that many rows; pass next_offset back as offset for the next page, and stop "
+            "when it is null. A memory approved while you page shifts later rows down, so a page "
+            "can repeat a row from the one before. filter echoes the filters that applied, since "
+            "and until in UTC. "
+            + FILTER_HELP
         ),
         annotations=read_only,
     )
@@ -246,9 +324,10 @@ def build_server(store, embedding):
         since: str | None = None,
         until: str | None = None,
         limit: int = LIST_LIMIT[0],
+        offset: int = 0,
     ) -> dict[str, Any]:
         return await answer(
-            list_memories, store, since=since, until=until, limit=limit,
+            list_memories, store, since=since, until=until, limit=limit, offset=offset,
             repo=repo, domain=domain, kind=kind, org=org, team=team, person=person,
         )
 
