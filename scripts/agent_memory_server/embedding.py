@@ -115,6 +115,13 @@ class Embedding:
         self._lock = threading.Lock()
         # One caller at a time uses the model: embed-on-write and search share it.
         self._model_lock = threading.Lock()
+        # Set at shutdown. A thread in the threadpool can't be cancelled, so an
+        # embed checks this between batches and stops after the one in hand.
+        self._stopping = threading.Event()
+
+    def stop(self):
+        """Make a running embed_all_pending return after its current batch. Rows left stay pending."""
+        self._stopping.set()
 
     def check_state(self):
         """Raise EmbeddingMismatch when memories.sqlite's active embedder is another one."""
@@ -144,10 +151,13 @@ class Embedding:
             self.store.set_embedding_state(self.description)
 
     def embed_all_pending(self):
-        """Embed every row the collection lacks. Returns how many were embedded. Raises on failure."""
+        """Embed every row the collection lacks. Returns how many were embedded. Raises on failure.
+
+        After stop() it returns once the batch in hand is stored, leaving the rest pending.
+        """
         done = 0
         seen = set()
-        while True:
+        while not self._stopping.is_set():
             documents = self.store.pending_for(self.collection, limit=self.batch_size)
             pairs = [(document["id"], document["updated_at"]) for document in documents]
             if not documents or seen.issuperset(pairs):
@@ -158,6 +168,7 @@ class Embedding:
             self.qdrant.upsert(self.collection, points_for(documents, vectors, self.description))
             self.store.mark_embedded_in(self.collection, pairs)
             done += len(documents)
+        return done
 
     def embed_query(self, text):
         """One query vector from the configured embedder, checked against its dimension."""

@@ -182,7 +182,10 @@ def build_server(store, embedding):
     from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import ToolAnnotations
 
-    server = MCPServer("agent-memory", instructions=INSTRUCTIONS)
+    # subscriptions=False: the tools are read-only and fixed, so there is nothing
+    # to notify. The SDK's default subscriptions/listen stream stays open until
+    # the client leaves, and on SIGTERM uvicorn waits for it before anything else.
+    server = MCPServer("agent-memory", instructions=INSTRUCTIONS, subscriptions=False)
     read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 
     async def answer(work, *args, **kwargs):
