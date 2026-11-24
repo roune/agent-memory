@@ -1190,8 +1190,10 @@ def resolve_transcript(payload, repo, session_id):
     return None
 
 
-# How much of a large transcript's head and tail transcript_times reads.
+# How much of a large transcript's head and tail transcript_times reads first,
+# and how far it widens a window that holds no timestamped line (one huge line).
 TRANSCRIPT_TIME_WINDOW = 1 << 20
+TRANSCRIPT_TIME_LIMIT = 8 << 20
 
 
 def _transcript_line_time(line):
@@ -1218,26 +1220,58 @@ def transcript_times(path):
     Claude Code and Codex put an ISO time on each line's top-level "timestamp".
     Cursor's agent transcript has none, so the caller falls back to now. Only
     the times are read: nothing else from the transcript reaches the bundle. A
-    large file is read at its head and its tail only, to keep a hook fast.
+    large file is read at its head and its tail only, to keep a hook fast. A
+    window that holds no whole line (one huge line) widens, up to
+    TRANSCRIPT_TIME_LIMIT.
     """
+
+    def found(lines):
+        return [t for t in map(_transcript_line_time, lines or []) if t is not None]
+
+    head = tail = None
+    window = TRANSCRIPT_TIME_WINDOW
     try:
         with open(path, "rb") as handle:
             size = os.fstat(handle.fileno()).st_size
-            if size <= 2 * TRANSCRIPT_TIME_WINDOW:
-                head = tail = handle.read().splitlines()
-            else:
-                head = handle.read(TRANSCRIPT_TIME_WINDOW).splitlines()[:-1]
-                handle.seek(size - TRANSCRIPT_TIME_WINDOW)
-                tail = handle.read().splitlines()[1:]
+            while True:
+                if size <= 2 * window:
+                    handle.seek(0)
+                    head = tail = handle.read().splitlines()
+                    break
+                if not head:
+                    handle.seek(0)
+                    head = handle.read(window).splitlines()[:-1]
+                if not tail:
+                    handle.seek(size - window)
+                    tail = handle.read(window).splitlines()[1:]
+                if (head and tail) or window >= TRANSCRIPT_TIME_LIMIT:
+                    break
+                window *= 2
     except OSError:
         return None, None
-    first = [t for t in map(_transcript_line_time, head) if t is not None]
-    last = [t for t in map(_transcript_line_time, tail) if t is not None]
 
     def text(moment):
         return moment.replace(microsecond=0).isoformat()
 
+    first = found(head)
+    last = first if tail is head else found(tail)
     return (text(min(first)) if first else None, text(max(last)) if last else None)
+
+
+def session_times(first_at, last_at, previous):
+    """started_at and ended_at for a capture: the transcript's, else the earlier capture's or now.
+
+    When only one side came from the transcript (a line too long to read), the
+    start is kept no later than the end, so the landing check still has a window.
+    """
+    ended = last_at or now()
+    started = first_at or previous.get("started_at") or now()
+    try:
+        if datetime.fromisoformat(started) > datetime.fromisoformat(ended):
+            started = ended
+    except (TypeError, ValueError):
+        pass
+    return started, ended
 
 
 def session_dir(tool, session_id):
@@ -1274,7 +1308,7 @@ def maybe_auto_approve_session(repo, cwd, bundle_path, previous):
     cfg = read_repo_config(repo)
     if not cfg.get("auto_approve"):
         return
-    started = previous.get("started_at")
+    started = previous.get("captured_at") or previous.get("started_at")
     if not started:
         log("capture session-end: auto_approve left inbox; session has no earlier capture")
         return
@@ -1401,12 +1435,16 @@ def write_capture(args, payload):
     if source is None and copy_name and (folder / copy_name).is_file():
         source = folder / copy_name
     first_at, last_at = transcript_times(source) if source is not None else (None, None)
+    started_at, ended_at = session_times(first_at, last_at, previous)
     bundle = {
         "tool": tool,
         "session_id": session_id,
         "repo": repo,
-        "started_at": first_at or previous.get("started_at") or now(),
-        "ended_at": last_at or now(),
+        "started_at": started_at,
+        # The first capture of this session id. A resumed or forked transcript can
+        # start days earlier, so auto-approve keeps to this time, not started_at.
+        "captured_at": previous.get("captured_at") or previous.get("started_at") or now(),
+        "ended_at": ended_at,
         "event": event,
         "closed": previous.get("closed", False) or event.lower() in END_EVENTS,
         "transcript_copy": copy_name,
@@ -2286,7 +2324,7 @@ def review(args):
             continue
     if server is None:
         raise SystemExit(f"no free port from {port}")
-    previous = stop_on_signals()
+    stop_on_signals()
     try:
         write_json(state_path, {"pid": os.getpid(), "port": port})
         url = f"http://127.0.0.1:{port}"
@@ -2294,40 +2332,49 @@ def review(args):
         webbrowser.open(url)
         server.serve_forever()
     finally:
-        for number, handler in previous.items():
-            signal.signal(number, handler)
+        # serve_forever only ends by an exception, so the process exits next.
+        # The handlers stay, and a later signal is ignored while this runs.
         server.server_close()
         drop_review_state(state_path)
     return 0
 
 
 def _stop_review(signum, frame):
+    # A second signal (a closed terminal can send two) must not cut the cleanup short.
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None and signal.getsignal(number) is _stop_review:
+            signal.signal(number, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 
 def stop_on_signals():
     """`kill <pid>` and a closed terminal stop the page through its finally, as Ctrl-C does.
 
-    Returns the handlers it replaced. A SIGHUP that is ignored (nohup) stays ignored.
+    A SIGHUP that is ignored (nohup) stays ignored.
     """
-    replaced = {}
     for name in ("SIGTERM", "SIGHUP"):
         number = getattr(signal, name, None)
         if number is None:
             continue
         if name == "SIGHUP" and signal.getsignal(number) == signal.SIG_IGN:
             continue
-        replaced[number] = signal.signal(number, _stop_review)
-    return replaced
+        signal.signal(number, _stop_review)
 
 
 def drop_review_state(state_path):
-    """Remove review.json if it still names this process, not a page started since."""
+    """Remove review.json if it still names this process, not a page started since.
+
+    A file that is no longer JSON (a kill while it was written) goes too, or the
+    next review would refuse to start on it.
+    """
     try:
         state = read_json(state_path)
-    except (OSError, SystemExit):
+    except OSError:
         return
-    if isinstance(state, dict) and state.get("pid") == os.getpid():
+    except SystemExit:
+        state = None
+    if state is None or (isinstance(state, dict) and state.get("pid") == os.getpid()):
         state_path.unlink(missing_ok=True)
 
 

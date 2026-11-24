@@ -187,6 +187,59 @@ class CaptureDatesTest(Base):
             ("2026-07-01T00:00:00+00:00", "2026-07-01T05:00:00+00:00"),
         )
 
+    def test_a_huge_last_line_widens_the_tail_window(self):
+        module = load_module("agent_memory_huge_line_test")
+        module.TRANSCRIPT_TIME_WINDOW = 256
+        path = self.root / "huge.jsonl"
+        pad = [{"type": "progress", "pad": "x" * 40} for _ in range(10)]
+        write_jsonl(
+            path,
+            [{"type": "user", "timestamp": "2026-07-01T00:00:00Z"}]
+            + pad
+            + [{"type": "assistant", "timestamp": "2026-07-01T05:00:00Z", "result": "y" * 900}],
+        )
+        self.assertGreater(path.stat().st_size, 2 * module.TRANSCRIPT_TIME_WINDOW)
+        self.assertEqual(
+            module.transcript_times(path),
+            ("2026-07-01T00:00:00+00:00", "2026-07-01T05:00:00+00:00"),
+        )
+
+    def test_auto_approve_keeps_to_the_first_capture_not_the_transcript_start(self):
+        """A resumed transcript can start long before this session id was first seen."""
+        (self.repo / ".agent-memory.toml").write_text("auto_approve = true\n", encoding="utf-8")
+        transcript = self.root / "resumed.jsonl"
+        write_jsonl(
+            transcript,
+            [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z"},
+                {"type": "assistant", "timestamp": "2026-01-01T00:10:00Z"},
+            ],
+        )
+        payload = {"session_id": "r1", "cwd": str(self.repo), "transcript_path": str(transcript)}
+        first = self.capture("claude-code", "Stop", payload)
+        self.assertEqual(first["started_at"], "2026-01-01T00:00:00+00:00")
+        # Someone else's commit, after the transcript's start but before this session ran.
+        env = dict(os.environ, GIT_AUTHOR_DATE="2026-03-01T00:00:00Z", GIT_COMMITTER_DATE="2026-03-01T00:00:00Z")
+        (self.repo / "other.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "add", "other.txt"], cwd=self.repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "not this session"], cwd=self.repo, check=True, env=env)
+        ended = self.capture("claude-code", "SessionEnd", payload)
+        self.assertIn("HEAD is older than this session", (self.store / "capture.log").read_text())
+        self.assertNotIn("draft", ended)
+        self.assertGreater(parse(ended["captured_at"]), datetime(2026, 1, 2, tzinfo=timezone.utc))
+        self.assertEqual(ended["captured_at"], first["captured_at"])
+
+    def test_the_start_is_never_after_the_end(self):
+        module = load_module("agent_memory_session_times_test")
+        end = "2026-07-01T05:00:00+00:00"
+        # Only the end was read (a first line too long for the window): no later start.
+        self.assertEqual(module.session_times(None, end, {}), (end, end))
+        self.assertEqual(
+            module.session_times(None, end, {"started_at": "2026-07-01T01:00:00+00:00"}),
+            ("2026-07-01T01:00:00+00:00", end),
+        )
+        self.assertEqual(module.session_times(None, end, {"started_at": "garbage"}), ("garbage", end))
+
     def test_unreadable_or_odd_lines_give_no_times(self):
         module = load_module("agent_memory_odd_times_test")
         path = self.root / "odd.jsonl"
@@ -201,6 +254,7 @@ class CaptureDatesTest(Base):
 class ReviewPageTest(Base):
     def page(self, item):
         module = load_module("agent_memory_page_test")
+        module.HOME = self.home
         os.environ["AGENT_MEMORY_DIR"] = str(self.store)
         page = module.render_page([item], True)
         return module, page, page.split('action="/approve"', 1)[1].split("</form>", 1)[0]
@@ -311,6 +365,8 @@ class ReviewStopTest(Base):
         self.stop_with(signal.SIGTERM)
 
     def test_sighup_removes_review_json(self):
+        if signal.getsignal(signal.SIGHUP) == signal.SIG_IGN:
+            self.skipTest("SIGHUP is ignored here (nohup), and the page keeps it ignored")
         self.stop_with(signal.SIGHUP)
 
     def test_a_newer_pages_review_json_is_left(self):
@@ -320,6 +376,13 @@ class ReviewStopTest(Base):
         module.drop_review_state(state)
         self.assertTrue(state.exists())
         state.write_text(json.dumps({"pid": os.getpid(), "port": 1}), encoding="utf-8")
+        module.drop_review_state(state)
+        self.assertFalse(state.exists())
+
+    def test_a_half_written_review_json_is_dropped(self):
+        module = load_module("agent_memory_bad_state_test")
+        state = self.store / "review.json"
+        state.write_text('{"pid": ', encoding="utf-8")
         module.drop_review_state(state)
         self.assertFalse(state.exists())
 
