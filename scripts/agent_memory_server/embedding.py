@@ -53,11 +53,13 @@ def _label(description):
 def ensure_collection(qdrant, description):
     """Create the collection with its metadata if it is missing, and add any missing payload index.
 
-    Raises EmbeddingMismatch when it exists with another vector size.
+    Returns True when it created the collection. Raises EmbeddingMismatch when it exists with
+    another vector size.
     """
     name = description["collection"]
     info = qdrant.collection(name)
-    if info is None:
+    created = info is None
+    if created:
         metadata = {key: description[key] for key in ("provider", "model", "revision", "dimension", "distance")}
         qdrant.create_collection(name, description["dimension"], description["distance"], metadata)
         info = qdrant.collection(name) or {}
@@ -72,6 +74,7 @@ def ensure_collection(qdrant, description):
     for field, schema in memory_points.PAYLOAD_INDEXES.items():
         if field not in existing:
             qdrant.create_index(name, field, schema)
+    return created
 
 
 def points_for(documents, vectors, description):

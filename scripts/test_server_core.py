@@ -476,7 +476,7 @@ class CommandTest(ServerCase):
         self.store.write_memory(document(), "local")
         code, _, _, out = self.run_cli(["reindex"])
         self.assertEqual(code, 0)
-        self.assertIn("embedded 1 into", out[0])
+        self.assertIn(f"embedded 1 memory into {describe(self.model)['collection']}", out)
         self.assertEqual(self.run_cli(["reindex", "--yes"])[0], 2)
         self.assertEqual(self.run_cli(["reindex", "--include-legacy"])[0], 2)
 
