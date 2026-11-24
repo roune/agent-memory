@@ -9,6 +9,12 @@
 # reindex takes the server's lock, so the server is stopped first and started
 # again afterwards, whatever reindex answers. Every other flag is refused,
 # --repo among them: the server embeds all repos into one collection.
+#
+# Two Compose quirks, both seen with Docker Desktop 20.10.12 / Compose 2.2.3:
+# - `docker compose start server` (and plain `docker start`) can hang for good,
+#   so the server comes back with `docker compose up -d server`.
+# - `docker compose run` without -T, from a shell with no terminal (a script, an
+#   agent), drops everything the container prints, so reindex runs with -T.
 
 set -eu
 
@@ -42,8 +48,30 @@ if [ -n "$prune" ]; then
   set -- "$@" --prune --yes --include-legacy
 fi
 
+# Interrupted (Ctrl-C) after the stop: start the server again before leaving.
+# Compose 2.2.3 leaves the one-off reindex container running on Ctrl-C (with or
+# without -T). It keeps the lock, so the server restarts until that reindex ends.
+interrupted() {
+  trap - INT TERM
+  echo "scripts/embed: interrupted, starting the server again. A reindex container left running keeps" >&2
+  echo "the lock, and the server starts once it ends (docker compose ps -a, docker compose logs server)." >&2
+  docker compose up -d server
+  exit 130
+}
+trap interrupted INT TERM
 docker compose stop server
-status=0
-docker compose run --rm server agent-memory-server reindex "$@" || status=$?
-docker compose start server
+reindex_status=0
+docker compose run --rm -T server agent-memory-server reindex "$@" || reindex_status=$?
+trap - INT TERM
+status=$reindex_status
+docker compose up -d server || {
+  echo "scripts/embed: the server did not start again. Run: docker compose up -d server" >&2
+  [ "$status" -ne 0 ] || status=1
+}
+if [ "$reindex_status" -ne 0 ]; then
+  # up -d recreates the container when .env changed. With a new embedder there and
+  # no reindex done, the server refuses to start and keeps restarting.
+  echo "scripts/embed: reindex failed, so the active embedder was not switched. If .env now names" >&2
+  echo "another embedder, the server refuses to start until reindex succeeds: docker compose logs server" >&2
+fi
 exit "$status"

@@ -769,11 +769,15 @@ class TokenWithAuthOffTest(ReviewPageCase):
 class EmbedWrapperTest(unittest.TestCase):
     """scripts/embed with a docker on PATH that only records its arguments."""
 
-    def run_embed(self, *args):
+    def run_embed(self, *args, run_code=0, up_code=0, interrupt=False):
         with tempfile.TemporaryDirectory() as folder:
             log = Path(folder) / "docker.log"
             docker = Path(folder) / "docker"
-            docker.write_text(f'#!/bin/sh\necho "$@" >> {log}\n', encoding="utf-8")
+            docker.write_text(
+                f'#!/bin/sh\necho "$@" >> {log}\n'
+                f'case "$2" in run) {"kill -INT $PPID; " if interrupt else ""}exit {run_code} ;; up) exit {up_code} ;; esac\n',
+                encoding="utf-8",
+            )
             docker.chmod(0o755)
             env = dict(os.environ, PATH=folder + os.pathsep + os.environ.get("PATH", ""))
             result = subprocess.run([str(SCRIPTS / "embed"), *args], env=env, text=True, capture_output=True)
@@ -786,17 +790,52 @@ class EmbedWrapperTest(unittest.TestCase):
         self.assertIn("--repo is not supported", result.stderr)
         self.assertEqual(calls, [])
 
-    def test_rebuild_stops_reindexes_and_starts(self):
+    def test_rebuild_stops_reindexes_and_starts_with_up(self):
+        # `up -d`, not `start`: `docker compose start` hung with Compose 2.2.3. -T keeps reindex's
+        # output, which `run` dropped there when the shell had no terminal.
         result, calls = self.run_embed("--rebuild")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             calls,
-            ["compose stop server", "compose run --rm server agent-memory-server reindex --rebuild", "compose start server"],
+            [
+                "compose stop server",
+                "compose run --rm -T server agent-memory-server reindex --rebuild",
+                "compose up -d server",
+            ],
         )
+
+    def test_a_failed_reindex_still_starts_the_server_and_keeps_its_code(self):
+        result, calls = self.run_embed("--rebuild", run_code=3)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(calls[-1], "compose up -d server")
+        self.assertIn("refuses to start until reindex succeeds: docker compose logs server", result.stderr)
+
+    def test_a_good_reindex_prints_no_failure_hint(self):
+        result, _ = self.run_embed("--rebuild")
+        self.assertEqual(result.stderr, "")
+
+    def test_a_failed_restart_after_a_good_reindex_does_not_blame_reindex(self):
+        result, _ = self.run_embed("--rebuild", up_code=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("reindex failed", result.stderr)
+
+    def test_an_interrupted_reindex_still_starts_the_server(self):
+        result, calls = self.run_embed("--rebuild", interrupt=True)
+        self.assertEqual(result.returncode, 130)
+        self.assertIn("interrupted, starting the server again", result.stderr)
+        self.assertEqual(calls[-1], "compose up -d server")
+        self.assertEqual(calls.count("compose up -d server"), 1)
+
+    def test_a_failed_restart_says_how_to_start_the_server(self):
+        result, _ = self.run_embed("--rebuild", up_code=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Run: docker compose up -d server", result.stderr)
+        result, _ = self.run_embed("--rebuild", run_code=3, up_code=1)
+        self.assertEqual(result.returncode, 3, "reindex's own failure code wins")
 
     def test_prune_drops_the_legacy_collection_too(self):
         _, calls = self.run_embed("--prune")
-        self.assertEqual(calls[1], "compose run --rm server agent-memory-server reindex --prune --yes --include-legacy")
+        self.assertEqual(calls[1], "compose run --rm -T server agent-memory-server reindex --prune --yes --include-legacy")
 
     def test_plain_embed_only_says_approve_embeds(self):
         result, calls = self.run_embed()

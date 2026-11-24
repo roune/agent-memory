@@ -315,9 +315,13 @@ agent-memory-server token create | list | revoke
 
 ```
 docker compose stop server
-docker compose run --rm server agent-memory-server reindex
-docker compose start server
+docker compose run --rm -T server agent-memory-server reindex
+docker compose up -d server
 ```
+
+Start the server again with `up -d`, not `docker compose start server`: with Docker Desktop 20.10.12 and Compose 2.2.3, `start` (and a plain `docker start`) sometimes hung for good, while `up -d server` worked. `up -d` also recreates the container when `compose.yaml` or `.env` changed, so a new `AGENT_MEMORY_EMBEDDER` takes effect, where `start` would reuse the old container's settings. If reindex failed after such a change, the server refuses to start, and keeps restarting until a reindex succeeds; `scripts/embed` says so, and `docker compose logs server` shows why. `-T` keeps reindex's output: on that Compose, `run` without `-T` printed nothing when the shell had no terminal, as in a script or an agent's shell.
+
+`reindex` prints a line for each step: the collection it dropped (with `--rebuild`), created or reused, how many memories it embedded, the collection's point count, the active collection, and with `--prune` the collections it would delete or deleted.
 
 `scripts/embed --rebuild` runs those three steps with `reindex --rebuild`, and `scripts/embed --prune` with `reindex --prune --yes --include-legacy`. It refuses every other flag, `--repo` among them, and goes away one release after the cutover.
 

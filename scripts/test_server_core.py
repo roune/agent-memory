@@ -401,7 +401,7 @@ class ReindexTest(ServerCase):
         lines = []
         reindex(self.store, self.model, self.qdrant, prune=True, out=lines.append)
         self.assertIn("would delete: memories-old-8-00000000", lines)
-        self.assertTrue(any(line.startswith("keeping memories:") for line in lines))
+        self.assertTrue(any(line.startswith("keeping memories,") for line in lines))
         reindex(self.store, self.model, self.qdrant, prune=True, yes=True, out=lines.append)
         active = describe(self.model)["collection"]
         self.assertEqual(sorted(self.fake.collections), sorted([active, "memories", "unrelated"]))
@@ -491,7 +491,7 @@ class CommandTest(ServerCase):
         self.store.write_memory(document(), "local")
         code, _, _, out = self.run_cli(["reindex"])
         self.assertEqual(code, 0)
-        self.assertIn("embedded 1 into", out[0])
+        self.assertIn(f"embedded 1 memory into {describe(self.model)['collection']}", out)
         self.assertEqual(self.run_cli(["reindex", "--yes"])[0], 2)
         self.assertEqual(self.run_cli(["reindex", "--include-legacy"])[0], 2)
 

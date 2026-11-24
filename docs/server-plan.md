@@ -117,7 +117,7 @@ agent-memory-server token revoke <id>
 agent-memory-server reindex [--rebuild] [--prune [--yes]]
 ```
 
-You run `token` with `docker compose exec server …`, and `reindex` with `docker compose run --rm server …` while the server is stopped (see [Switching models](#switching-models)). `token create` prints the secret once, as `am_…`. It refuses a `--person` that already has active tokens unless you pass `--same-person`, so two people can't share a name by accident. Tokens are never managed over HTTP, except for the read-only child token that `POST /v1/tokens` mints.
+You run `token` with `docker compose exec server …`, and `reindex` with `docker compose run --rm -T server …` while the server is stopped (see [Switching models](#switching-models)). `token create` prints the secret once, as `am_…`. It refuses a `--person` that already has active tokens unless you pass `--same-person`, so two people can't share a name by accident. Tokens are never managed over HTTP, except for the read-only child token that `POST /v1/tokens` mints.
 
 ### Requests from browsers
 
@@ -181,9 +181,9 @@ def load_embedder(config, models_dir, backend=None) -> Embedder
 
 1. Stop the server: `docker compose stop server`.
 2. Set the new embedder in `.env`.
-3. Run `docker compose run --rm server agent-memory-server reindex`. It takes the server lock, creates or opens the collection for the configured embedder, and embeds every row that is pending for that collection. It checks that the point count matches the row count, then switches `embedding_state` over. `--rebuild` drops that collection first and embeds everything again.
-4. Start the server: `docker compose start server`.
-5. **Switching back** to an earlier model is the same three steps. `reindex` embeds only the rows that the older collection is missing, because `memory_embedding` is kept per collection.
+3. Run `docker compose run --rm -T server agent-memory-server reindex`. It takes the server lock, creates or opens the collection for the configured embedder, and embeds every row that is pending for that collection. It checks that the point count matches the row count, then switches `embedding_state` over. `--rebuild` drops that collection first and embeds everything again.
+4. Start the server: `docker compose up -d server`. (`docker compose start server` hung with Compose 2.2.3; see [server.md](server.md#commands).)
+5. **Switching back** to an earlier model is the same four steps. `reindex` embeds only the rows that the older collection is missing, because `memory_embedding` is kept per collection.
 6. **Prune** with `reindex --prune --yes`. It lists, then deletes, every collection whose name starts with `memories` and isn't the active one. That includes the legacy `memories` collection from before the server. Without `--yes`, it only lists them.
 
 For 86 rows this takes seconds.
@@ -244,7 +244,7 @@ The last bullet replaces "Build retrieval…". It carries over the wording from 
 | `flush` | Removed. For one release it prints "use `agent-memory sync`". |
 | `connect` (new) | See below. |
 | `migrate` (new) | See [Moving the existing store](#moving-the-existing-store). |
-| `scripts/embed` | Approve embeds now, so plain `scripts/embed` only says so. With `--rebuild` or `--prune`, it runs `docker compose stop server`, then `docker compose run --rm server agent-memory-server reindex` with those flags, then `docker compose start server`. Other flags, `--repo` among them, are refused. One release later it is removed. |
+| `scripts/embed` | Approve embeds now, so plain `scripts/embed` only says so. With `--rebuild` or `--prune`, it runs `docker compose stop server`, then `docker compose run --rm -T server agent-memory-server reindex` with those flags, then `docker compose up -d server`, whatever reindex answers. Other flags, `--repo` among them, are refused. One release later it is removed. |
 
 ### The outbox
 
