@@ -155,6 +155,9 @@ jobs:
       - name: brew audit
         run: brew audit --strict --new roune/ci/agent-memory
       - name: Again by the short name, after brew trust, as the README's second path
+        # The full-name install above trusts the formula by itself (its log says
+        # "Trusted formula"), so this shows the documented commands work, not that
+        # the short name needs the trust step.
         run: |
           brew uninstall agent-memory
           brew trust --formula roune/ci/agent-memory
