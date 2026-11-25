@@ -2,6 +2,12 @@
 
 Status: approved by Miguel on 24 November 2026, after his interview answers the same day and an Opus review of this plan. Each PR below says what it builds.
 
+Amended on 25 November 2026, while the PRs were built:
+
+- **Homebrew is tested in CI, not on a laptop.** Miguel chose this. The formula's source is a template in this repo, `packaging/homebrew/agent-memory.rb`. A macOS CI job installs it from a locally built sdist on every PR. The release job renders it and opens the bump PR on the tap. So PR 4a holds only the tap's scaffolding, and the manual fallback renders with `scripts/homebrew-formula` instead of `brew bump-formula-pr`.
+- **mise works with `mise activate`, not with shims.** Shims are refused by PR 1's install check. A later release could accept them.
+- **The version warning names the right fix.** A newer server says to upgrade the CLI. A remote server is named without the `setup` advice.
+
 This plan covers how someone installs and starts agent-memory without a clone. Today that takes a uv install from git and then about seven manual steps from [deploy.md](deploy.md#one-laptop-without-a-clone): make a folder, download `compose.yaml`, create the data folders, write `.env`, pull, start, and connect. The plan replaces those steps with one command, `agent-memory setup`, and makes the CLI installable from PyPI and a Homebrew tap.
 
 It ends in an ordered list of PRs, one per piece, in the style of [server-plan.md](server-plan.md). Each PR can be reviewed on its own. `python3 -m unittest discover -s scripts -p 'test_*.py'` and `scripts/test-server` pass at every commit.
