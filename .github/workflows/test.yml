@@ -114,6 +114,71 @@ jobs:
           "$UV_TOOL_DIR/roune-agent-memory/bin/python" -c "import agent_memory; print(agent_memory.__file__)" \
             | grep -qx "$GITHUB_WORKSPACE/scripts/agent_memory.py"
 
+  homebrew:
+    # The formula in packaging/homebrew, installed from this commit's sdist the
+    # way the tap installs it from PyPI's. release.yml's homebrew job renders
+    # the same template with PyPI's URL and opens the tap PR, so a formula that
+    # fails here would fail there. The URL is file://, so the audit runs
+    # without --online; the tap's own CI runs that one on the bump PR.
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: The sdist, and the formula for it
+        run: |
+          uv build --sdist --out-dir "$RUNNER_TEMP/dist"
+          version=$(python3 scripts/release-check --version)
+          # Homebrew reads the version from this file name, so the path keeps it.
+          sdist="$RUNNER_TEMP/dist/roune_agent_memory-$version.tar.gz"
+          test -f "$sdist"
+          sha=$(shasum -a 256 "$sdist" | cut -d' ' -f1)
+          python3 scripts/homebrew-formula --local --url "file://$sdist" --sha256 "$sha" --out "$RUNNER_TEMP/agent-memory.rb"
+          cat "$RUNNER_TEMP/agent-memory.rb"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: A local tap with that formula
+        run: |
+          brew tap-new --no-git roune/ci
+          tap=$(brew --repository roune/ci)
+          mkdir -p "$tap/Formula"
+          cp "$RUNNER_TEMP/agent-memory.rb" "$tap/Formula/agent-memory.rb"
+          # The command the docs give for a tapped formula. A throwaway runner trusts its own tap.
+          brew trust --formula roune/ci/agent-memory
+          echo "BREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+      - name: Install from source
+        run: brew install --build-from-source --verbose roune/ci/agent-memory
+      - name: brew test
+        run: brew test --verbose roune/ci/agent-memory
+      - name: brew audit
+        run: brew audit --strict --new roune/ci/agent-memory
+      - name: agent-memory install points the hooks at the prefix's bin, not the Cellar
+        env:
+          HOME: ${{ runner.temp }}/brew-home
+          XDG_DATA_HOME: ${{ runner.temp }}/brew-home/.local/share
+          XDG_CONFIG_HOME: ${{ runner.temp }}/brew-home/.config
+        run: |
+          mkdir -p "$HOME/.claude"
+          cli="$BREW_PREFIX/bin/agent-memory"
+          test "$(command -v agent-memory)" = "$cli"
+          # The file the link leads to sits in the versioned Cellar folder, which an upgrade replaces.
+          realpath "$cli" | tee /dev/stderr | grep -q "/Cellar/agent-memory/$VERSION/"
+          test "$("$cli" --version)" = "agent-memory $VERSION"
+          "$cli" install --yes
+          python3 -c "
+          import json, os
+          hooks = json.load(open(os.path.expanduser('~/.claude/settings.json')))['hooks']
+          command = hooks['Stop'][0]['hooks'][0]['command']
+          expected = os.environ['BREW_PREFIX'] + '/bin/agent-memory capture --tool claude-code --event stop'
+          assert command == expected, (command, expected)
+          assert 'Cellar' not in command, command
+          print('hook:', command)
+          "
+
   server:
     # The whole suite with the server extra, so nothing is skipped.
     runs-on: ubuntu-latest
