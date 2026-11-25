@@ -105,6 +105,13 @@ The PyPI package exists from v0.2.0. Until then, and for the unreleased main, in
 ### Other ways to install the CLI
 
 - **pipx:** `pipx install roune-agent-memory`.
+- **The install script** (from v0.2.0), for a machine with neither uv nor Homebrew:
+
+  ```
+  curl -LsSf https://github.com/roune/agent-memory/releases/latest/download/install.sh | sh
+  ```
+
+  Read it first: it is `scripts/install.sh`, attached to each release with the version filled in. If uv is missing it asks before installing it, through uv's own installer with `UV_NO_MODIFY_PATH=1`, so no shell file is edited. Without a terminal to ask on, it prints the uv command and stops; add `--yes` to say yes ahead: `curl -LsSf <url> | sh -s -- --yes`. Then it installs `roune-agent-memory` pinned to the release's version with `uv tool install`, and prints `agent-memory setup` and `agent-memory install` as the next steps, plus an `export PATH=…` line when uv's bin folder isn't on `PATH`. It never runs them. A copy from a clone needs `--version <version>`.
 - **Try without installing:** `uvx --from roune-agent-memory agent-memory setup` starts the server from a throwaway copy. `agent-memory install` refuses such a run, so install the CLI before you connect hooks.
 - **mise:** `mise use -g pipx:roune-agent-memory`. mise's pipx backend uses uv when uv is installed.
   - With `mise activate`, `PATH` holds a versioned folder, `…/mise/installs/pipx-roune-agent-memory/<version>/bin`. After a `mise upgrade`, run `agent-memory install` again, so the hooks point at the new version.
@@ -181,9 +188,10 @@ To upgrade by hand, download `compose.yaml` from the new tag, then run `docker c
 | PyPI with pipx | `pipx upgrade roune-agent-memory` | `agent-memory setup` |
 | mise | `mise upgrade pipx:roune-agent-memory` | `agent-memory install`, then `agent-memory setup` |
 | uv from git | `uv tool upgrade roune-agent-memory` | `agent-memory setup` |
+| `install.sh` (from v0.2.0) | run the install command again, which installs the latest release | `agent-memory setup` |
 | a clone | `git pull` | `./scripts/setup` |
 
-Homebrew and `install.sh` will appear here as they exist.
+Homebrew will appear here as it exists.
 
 - **`setup` is the upgrade for the server.** It rewrites `compose.yaml` for the new version, keeps `.env` and `data/`, pulls the new image and restarts. The server moves to the new image only then.
 - **The CLI tells you when they differ.** `/v1/health` reports the server's `version`. `agent-memory setup` and `agent-memory review` compare it with the CLI's own, and print one line when they differ: `the server runs 0.2.0 and this CLI is 0.3.0: run agent-memory setup to upgrade the server`. A server whose `/v1/health` has no version is older than 0.2.0, and the line says so. `capture`, `git-hook` and `sync --quiet` never ask, so the hooks stay fast and silent. `review` asks with a short timeout and says nothing when the server doesn't answer.
@@ -305,6 +313,7 @@ Only the repository owner does these steps. Pushing a tag is the release.
    - `verify` pulls that tag on an amd64 runner and an arm64 runner, and runs `scripts/image-health`. That checks `/v1/health` with auth on, that `/v1/whoami` needs a token, the architecture, and the version label.
    - `build` runs `uv build` and keeps `dist/` as an artifact.
    - `pypi` runs after `verify`, so a release whose image failed never reaches PyPI. It uploads the wheel and the sdist from `build`. An upload can't be taken back: a version can be yanked, never uploaded twice.
+   - `github-release` runs after `pypi`, and is the only job with `contents: write`. It fills the version into a copy of `scripts/install.sh`, then runs `gh release create` for the tag with `--verify-tag` and generated notes, and attaches that `install.sh`, `compose.yaml` and `compose.team.yaml`.
 5. **Make the package public, once.** GHCR creates the package as private on its first push. The no-clone and team setups pull without logging in, so they fail until it is public.
    - Go to github.com/roune → Packages → `agent-memory-server` → Package settings → Danger Zone → Change visibility → Public.
    - The image's `org.opencontainers.image.source` label links the package to this repo, so the workflow's token can push later versions.
@@ -317,6 +326,6 @@ Only the repository owner does these steps. Pushing a tag is the release.
    scripts/image-health ghcr.io/roune/agent-memory-server:0.1.0
    ```
 
-7. **Optionally, write a GitHub release** for the tag, with `compose.yaml` and `compose.team.yaml` attached. The commands above download them from the tag, so the release isn't required.
+7. **The GitHub release is automatic.** `github-release` creates it, so `releases/latest/download/install.sh` points at the new version. Edit the generated notes on GitHub if they need a word. If the job fails after PyPI took the upload, run its steps by hand: fill the version into a copy of `scripts/install.sh`, then `gh release create v<version> --verify-tag --generate-notes install.sh compose.yaml compose.team.yaml`.
 
 A tag-only workflow can't run in a PR. So on every PR, `test.yml`'s `release-image` job runs the same build for both platforms. It pushes to a registry on the runner instead of GHCR, then pulls each platform and runs `scripts/image-health` on it. It also runs the no-clone `compose.yaml` steps and `compose.team.yaml` against that image. Last, it installs the built wheel and runs `agent-memory setup` twice against that image, with a temporary `HOME`: it checks `/v1/health`, the CLI's server file, and that a memory written before the second run is still there after it. The steps a PR can't cover are the push to GHCR, the native arm64 runner, and the package's visibility.
