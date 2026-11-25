@@ -147,15 +147,19 @@ jobs:
           tap=$(brew --repository roune/ci)
           mkdir -p "$tap/Formula"
           cp "$RUNNER_TEMP/agent-memory.rb" "$tap/Formula/agent-memory.rb"
-          # The command the docs give for a tapped formula. A throwaway runner trusts its own tap.
-          brew trust --formula roune/ci/agent-memory
           echo "BREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
-      - name: Install from source
+      - name: Install from source by the full name, with no trust step, as the README's first line
         run: brew install --build-from-source --verbose roune/ci/agent-memory
       - name: brew test
         run: brew test --verbose roune/ci/agent-memory
       - name: brew audit
         run: brew audit --strict --new roune/ci/agent-memory
+      - name: Again by the short name, after brew trust, as the README's second path
+        run: |
+          brew uninstall agent-memory
+          brew trust --formula roune/ci/agent-memory
+          brew install --build-from-source agent-memory
+          test "$(brew list --versions agent-memory)" = "agent-memory $VERSION"
       - name: agent-memory install points the hooks at the prefix's bin, not the Cellar
         env:
           HOME: ${{ runner.temp }}/brew-home

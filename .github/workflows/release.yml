@@ -198,44 +198,25 @@ jobs:
         if: steps.token.outputs.set == 'yes'
         with:
           persist-credentials: false
-      - name: Wait for the sdist on PyPI
-        id: sdist
+      - name: Wait for the sdist on PyPI, and the formula for it
         if: steps.token.outputs.set == 'yes'
-        # The upload has finished, but PyPI's JSON API can lag behind it.
+        # The upload has finished, but PyPI's JSON API can lag behind it, and
+        # can answer 404 or 5xx meanwhile. scripts/homebrew-formula picks the
+        # sdist and its hashed files.pythonhosted.org URL, which
+        # `brew audit --online` wants, and fails until PyPI lists it.
         run: |
-          python3 - <<'PY'
-          import json, os, sys, time, urllib.error, urllib.request
-
-          version = os.environ["VERSION"]
-          api = f"https://pypi.org/pypi/roune-agent-memory/{version}/json"
-          name = f"roune_agent_memory-{version}.tar.gz"
-          deadline = time.monotonic() + 600
-          while True:
-              try:
-                  with urllib.request.urlopen(api, timeout=30) as response:
-                      files = json.load(response)["urls"]
-                  found = [entry for entry in files if entry["packagetype"] == "sdist" and entry["filename"] == name]
-                  if found:
-                      break
-              except urllib.error.HTTPError as error:
-                  if error.code != 404:
-                      raise
-              except urllib.error.URLError as error:
-                  print(f"PyPI didn't answer: {error.reason}")
-              if time.monotonic() > deadline:
-                  sys.exit(f"{name} isn't on PyPI after 10 minutes: {api}")
-              time.sleep(20)
-          # The hashed files.pythonhosted.org URL, which `brew audit --online` wants.
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"url={found[0]['url']}\nsha256={found[0]['digests']['sha256']}\n")
-          print(found[0]["url"])
-          PY
-      - name: The formula for that sdist
-        if: steps.token.outputs.set == 'yes'
-        env:
-          URL: ${{ steps.sdist.outputs.url }}
-          SHA256: ${{ steps.sdist.outputs.sha256 }}
-        run: python3 scripts/homebrew-formula --url "$URL" --sha256 "$SHA256" --out "$RUNNER_TEMP/agent-memory.rb"
+          api="https://pypi.org/pypi/roune-agent-memory/$VERSION/json"
+          for try in $(seq 1 40); do
+            if curl -fsSL --max-time 30 "$api" -o "$RUNNER_TEMP/pypi.json" \
+              && python3 scripts/homebrew-formula --pypi-json "$RUNNER_TEMP/pypi.json" --version "$VERSION" \
+                --out "$RUNNER_TEMP/agent-memory.rb"; then
+              exit 0
+            fi
+            echo "try $try: no sdist for $VERSION on PyPI yet"
+            sleep 15
+          done
+          echo "::error::no sdist for $VERSION on PyPI after 10 minutes: $api"
+          exit 1
       - name: Open the tap PR
         if: steps.token.outputs.set == 'yes'
         env:
@@ -244,38 +225,43 @@ jobs:
           set -eu
           tap=roune/homebrew-tap
           branch="agent-memory-$VERSION"
+          formula="$RUNNER_TEMP/agent-memory.rb"
           # git asks gh for the token, so it never sits in a URL or .git/config.
           gh auth setup-git
           git clone --depth 1 "https://github.com/$tap.git" "$RUNNER_TEMP/tap"
           cd "$RUNNER_TEMP/tap"
-          git switch -c "$branch"
-          mkdir -p Formula
-          cp "$RUNNER_TEMP/agent-memory.rb" Formula/agent-memory.rb
-          git add Formula/agent-memory.rb
-          if git diff --cached --quiet; then
-            echo "::notice::the tap's main already has agent-memory $VERSION"
+          # After publish.yml, main's formula also has a bottle block, which the
+          # template lacks. So compare only url and sha256: when main has this
+          # sdist already, a new PR would only take the bottles away.
+          source_lines() { grep -E '^  (url|sha256) "' "$1" || true; }
+          if [ -f Formula/agent-memory.rb ] && [ "$(source_lines Formula/agent-memory.rb)" = "$(source_lines "$formula")" ]; then
+            echo "::notice::the tap's main has agent-memory $VERSION already"
             exit 0
           fi
+          git switch -c "$branch"
+          mkdir -p Formula
+          cp "$formula" Formula/agent-memory.rb
+          git add Formula/agent-memory.rb
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -q -m "agent-memory $VERSION"
           # A rerun replaces the branch it pushed before.
           git push --force origin "$branch"
-          existing=$(gh pr list --repo "$tap" --head "$branch" --state open --json url --jq '.[0].url // empty')
-          if [ -n "$existing" ]; then
-            echo "the tap PR exists already: $existing"
-            exit 0
+          url=$(gh pr list --repo "$tap" --head "$branch" --state open --json url --jq '.[0].url // empty')
+          if [ -z "$url" ]; then
+            url=$(gh pr create --repo "$tap" --base main --head "$branch" \
+              --title "agent-memory $VERSION" --body "agent-memory $VERSION from roune/agent-memory's release workflow.")
           fi
-          url=$(gh pr create --repo "$tap" --base main --head "$branch" \
-            --title "agent-memory $VERSION" \
-            --body "Sets url and sha256 to the sdist of roune-agent-memory $VERSION on PyPI, from roune/agent-memory's release workflow.")
           number="${url##*/}"
-          gh pr edit "$url" --body "$(cat <<BODY
+          # The body names the PR's own number, so it's written after the PR
+          # exists, the same way for a new PR and a rerun's, which repairs it.
+          cat > "$RUNNER_TEMP/body.md" <<BODY
           Sets url and sha256 to the sdist of roune-agent-memory $VERSION on PyPI, from roune/agent-memory's release workflow (run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
 
           After the tests are green, publish the bottles. \`brew pr-pull\` then pushes this formula and its bottle block to main:
 
               gh workflow run publish.yml --repo $tap -f pull_request=$number
+
+          Afterwards the branch \`$branch\` can be deleted.
           BODY
-          )"
-          echo "tap PR: $url"
+          gh api -X PATCH "repos/$tap/pulls/$number" -F body=@"$RUNNER_TEMP/body.md" --jq .html_url

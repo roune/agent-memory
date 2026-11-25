@@ -4,6 +4,7 @@ The script runs as a subprocess, the way CI and the release job run it. It
 writes only to stdout or to a file in a temporary folder.
 """
 
+import json
 import re
 import subprocess
 import sys
@@ -90,6 +91,69 @@ class RenderTest(unittest.TestCase):
                 self.assertFalse(out.exists())
 
 
+def pypi(files, version="0.2.0"):
+    """PyPI's JSON for a release, cut down to what the script reads."""
+    return {"info": {"name": "roune-agent-memory", "version": version}, "urls": files}
+
+
+SDIST = {
+    "packagetype": "sdist",
+    "filename": "roune_agent_memory-0.2.0.tar.gz",
+    "url": URL,
+    "digests": {"md5": "0" * 32, "sha256": SHA256},
+}
+WHEEL = {
+    "packagetype": "bdist_wheel",
+    "filename": "roune_agent_memory-0.2.0-py3-none-any.whl",
+    "url": URL.replace(".tar.gz", "-py3-none-any.whl"),
+    "digests": {"sha256": "c" * 64},
+}
+
+
+class PyPIJsonTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.json = Path(self.folder.name) / "pypi.json"
+        self.out = Path(self.folder.name) / "agent-memory.rb"
+
+    def render(self, data, version="0.2.0"):
+        self.json.write_text(data if isinstance(data, str) else json.dumps(data))
+        return run("--pypi-json", str(self.json), "--version", version, "--out", str(self.out))
+
+    def test_the_sdist_is_picked_over_the_wheel(self):
+        result = self.render(pypi([WHEEL, SDIST]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.out.read_text(), run("--url", URL, "--sha256", SHA256).stdout)
+        self.assertIn(URL, result.stderr)
+
+    def test_what_isnt_there_yet_or_is_wrong_is_refused_and_nothing_is_written(self):
+        cases = {
+            "only the wheel": pypi([WHEEL]),
+            "no files": pypi([]),
+            "another file name": pypi([dict(SDIST, filename="agent-memory-0.2.0.tar.gz")]),
+            "a url for another file": pypi([dict(SDIST, url=URL.replace("0.2.0.tar.gz", "0.1.0.tar.gz"))]),
+            "another version": pypi([SDIST], version="0.1.0"),
+            "no sha256": pypi([dict(SDIST, digests={"md5": "0" * 32})]),
+            "an http url": pypi([dict(SDIST, url=URL.replace("https://", "http://"))]),
+            "two sdists": pypi([SDIST, SDIST]),
+            "not json": "<html>503 Service Unavailable</html>",
+            "not a release": {"message": "Not Found"},
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                result = self.render(data)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue(result.stderr)
+                self.assertFalse(self.out.exists())
+
+    def test_it_needs_version_and_takes_no_url(self):
+        self.json.write_text(json.dumps(pypi([SDIST])))
+        for args in (["--pypi-json", str(self.json)], ["--pypi-json", str(self.json), "--version", "0.2.0", "--url", URL]):
+            with self.subTest(args):
+                self.assertEqual(run(*args).returncode, 2)
+
+
 class TemplateTest(unittest.TestCase):
     def test_it_is_the_formula_the_plan_describes(self):
         text = TEMPLATE.read_text()
@@ -103,6 +167,14 @@ class TemplateTest(unittest.TestCase):
         self.assertNotRegex(text, r"^  version ", re.MULTILINE)
         self.assertNotIn("post_install", text)
         self.assertIn('refute_path_exists testpath/".claude"', text)
+
+    def test_the_placeholder_url_has_pypis_hashed_shape_and_renders(self):
+        url = re.search(r'^  url "([^"]+)"', TEMPLATE.read_text(), re.MULTILINE).group(1)
+        self.assertRegex(url, r"^https://files\.pythonhosted\.org/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]+/roune_agent_memory-0\.0\.0\.tar\.gz$")
+        sha256 = re.search(r'^  sha256 "([^"]+)"', TEMPLATE.read_text(), re.MULTILINE).group(1)
+        result = run("--url", url, "--sha256", sha256)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, TEMPLATE.read_text())
 
     def test_the_script_stays_out_of_the_wheel_and_the_image(self):
         import tomllib
@@ -134,9 +206,8 @@ class ReleaseJobTest(unittest.TestCase):
 
     def test_homebrew_takes_the_sdist_from_pypi_and_opens_the_tap_pr(self):
         text = job("homebrew")
-        self.assertIn("https://pypi.org/pypi/roune-agent-memory/{version}/json", text)
-        self.assertIn("digests", text)
-        self.assertIn("scripts/homebrew-formula --url", text)
+        self.assertIn("https://pypi.org/pypi/roune-agent-memory/$VERSION/json", text)
+        self.assertIn('scripts/homebrew-formula --pypi-json "$RUNNER_TEMP/pypi.json" --version "$VERSION"', text)
         self.assertNotIn("--local", text)
         self.assertIn("gh pr create --repo \"$tap\"", text)
         self.assertIn("tap=roune/homebrew-tap", text)
@@ -146,6 +217,17 @@ class ReleaseJobTest(unittest.TestCase):
         self.assertIn("gh workflow run publish.yml --repo $tap -f pull_request=$number", text)
         self.assertIn("persist-credentials: false", text)
 
+    def test_a_rerun_keeps_mains_bottles_and_repairs_the_body(self):
+        text = job("homebrew")
+        # Only the url and sha256 lines are compared, so main's bottle block doesn't count as a change.
+        self.assertIn("""grep -E '^  (url|sha256) "'""", text)
+        self.assertNotIn("git diff --cached --quiet", text)
+        # The body goes through a file and the API for a new PR and an open one alike.
+        self.assertIn('-F body=@"$RUNNER_TEMP/body.md"', text)
+        self.assertEqual(text.count("gh api -X PATCH"), 1)
+        self.assertNotIn("gh pr edit", text)
+        self.assertNotIn("$(cat <<", text)
+
     def test_the_homebrew_ci_job_installs_the_rendered_template(self):
         text = (ROOT / ".github" / "workflows" / "test.yml").read_text()
         start = text.index("\n  homebrew:\n")
@@ -154,7 +236,10 @@ class ReleaseJobTest(unittest.TestCase):
         self.assertIn("runs-on: macos-latest", ci)
         self.assertIn("uv build --sdist", ci)
         self.assertIn("scripts/homebrew-formula --local --url \"file://$sdist\"", ci)
-        self.assertIn("brew install --build-from-source", ci)
+        self.assertIn("brew install --build-from-source --verbose roune/ci/agent-memory", ci)
+        # The full name installs before any trust step; the short name after one.
+        self.assertLess(ci.index("roune/ci/agent-memory\n"), ci.index("brew trust --formula roune/ci/agent-memory"))
+        self.assertLess(ci.index("brew trust --formula"), ci.index("brew install --build-from-source agent-memory\n"))
         self.assertIn("brew test", ci)
         self.assertIn("brew audit --strict --new", ci)
         self.assertNotIn("--online", ci.replace("without --online", ""))

@@ -6,7 +6,7 @@ class AgentMemory < Formula
   # Each release sets url and sha256 to its sdist on PyPI, through
   # scripts/homebrew-formula in roune/agent-memory. The version comes from
   # the file name.
-  url "https://files.pythonhosted.org/packages/source/r/roune-agent-memory/roune_agent_memory-0.0.0.tar.gz"
+  url "https://files.pythonhosted.org/packages/00/00/0000/roune_agent_memory-0.0.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "PolyForm-Noncommercial-1.0.0"
 

@@ -2,12 +2,15 @@
 """Render the Homebrew formula for one sdist. Standard library only.
 
     scripts/homebrew-formula --url <sdist url> --sha256 <hex> [--out Formula/agent-memory.rb]
+    scripts/homebrew-formula --pypi-json pypi.json --version 0.2.0 [--out ...]
     scripts/homebrew-formula --local --url file:///tmp/dist/roune_agent_memory-0.1.0.tar.gz --sha256 <hex>
 
 The template is packaging/homebrew/agent-memory.rb. Only its url and sha256
-lines change; every other byte stays. The release job renders it with the
-sdist PyPI serves and opens a PR on roune/homebrew-tap; test.yml's homebrew
-job renders it with a file:// URL to a fresh sdist and installs it.
+lines change; every other byte stays. The release job renders it from
+PyPI's JSON for the release (https://pypi.org/pypi/roune-agent-memory/<version>/json),
+which gives the sdist's hashed files.pythonhosted.org URL that
+`brew audit --online` wants, and opens a PR on roune/homebrew-tap. test.yml's
+homebrew job renders it with a file:// URL to a fresh sdist and installs it.
 
 Homebrew reads the version from the file name, so the URL must end in
 roune_agent_memory-<version>.tar.gz. A file:// URL needs --local, so a
@@ -15,6 +18,7 @@ release can't ship one by mistake.
 """
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -27,6 +31,10 @@ URL_LINE = re.compile(r'^  url "[^"\n]*"$', re.MULTILINE)
 SHA256_LINE = re.compile(r'^  sha256 "[^"\n]*"$', re.MULTILINE)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SDIST_NAME = re.compile(r"roune_agent_memory-[0-9][0-9A-Za-z.]*\.tar\.gz")
+
+
+def sdist_name(version):
+    return f"roune_agent_memory-{version}.tar.gz"
 
 
 def check_url(url, local):
@@ -46,9 +54,38 @@ def check_url(url, local):
 
 
 def check_sha256(value):
-    if not SHA256.fullmatch(value):
+    if not isinstance(value, str) or not SHA256.fullmatch(value):
         raise SystemExit(f"{value!r}: the sha256 must be 64 lowercase hex digits")
     return value
+
+
+def sdist_from_pypi(path, version):
+    """(url, sha256) of the release's sdist in a PyPI JSON file, or SystemExit.
+
+    The release job retries on SystemExit, so an sdist that isn't listed yet,
+    or a body that isn't JSON, only means another try.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+        files = data["urls"]
+        listed = data["info"]["version"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise SystemExit(f"{path}: not PyPI's JSON for a release ({error})")
+    if listed != version:
+        raise SystemExit(f"{path}: PyPI's JSON is for {listed}, not {version}")
+    name = sdist_name(version)
+    found = [entry for entry in files if isinstance(entry, dict) and entry.get("packagetype") == "sdist"]
+    if not found:
+        raise SystemExit(f"{path}: PyPI lists no sdist for {version} yet")
+    matching = [entry for entry in found if entry.get("filename") == name]
+    if len(matching) != 1:
+        names = ", ".join(str(entry.get("filename")) for entry in found)
+        raise SystemExit(f"{path}: expected one sdist named {name}, PyPI lists {names}")
+    entry = matching[0]
+    url = entry.get("url")
+    if not isinstance(url, str) or not url.endswith("/" + name):
+        raise SystemExit(f"{path}: the sdist's url {url!r} doesn't end in {name}")
+    return url, (entry.get("digests") or {}).get("sha256")
 
 
 def replace_once(pattern, line, text, what):
@@ -65,13 +102,24 @@ def render(template, url, sha256):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Render the Homebrew formula for one sdist.")
-    parser.add_argument("--url", required=True, help="the sdist's URL, https://")
-    parser.add_argument("--sha256", required=True, help="the sdist's sha256, 64 hex digits")
+    parser.add_argument("--url", help="the sdist's URL, https://")
+    parser.add_argument("--sha256", help="the sdist's sha256, 64 hex digits")
+    parser.add_argument("--pypi-json", type=Path, help="take url and sha256 from PyPI's JSON for the release, instead")
+    parser.add_argument("--version", help="the release's version; needed with --pypi-json")
     parser.add_argument("--local", action="store_true", help="allow a file:// URL, for a test install")
     parser.add_argument("--out", type=Path, help="write here instead of stdout")
     args = parser.parse_args(argv)
-    url = check_url(args.url, args.local)
-    sha256 = check_sha256(args.sha256)
+    if args.pypi_json:
+        if args.url or args.sha256 or not args.version:
+            parser.error("--pypi-json takes --version, and no --url or --sha256")
+        url, sha256 = sdist_from_pypi(args.pypi_json, args.version)
+        print(f"sdist: {url}\nsha256: {sha256}", file=sys.stderr)
+    elif args.url and args.sha256:
+        url, sha256 = args.url, args.sha256
+    else:
+        parser.error("give --url and --sha256, or --pypi-json and --version")
+    url = check_url(url, args.local)
+    sha256 = check_sha256(sha256)
     formula = render(TEMPLATE.read_text(), url, sha256)
     if args.out:
         args.out.write_text(formula)
