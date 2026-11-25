@@ -188,7 +188,7 @@ To upgrade by hand, download `compose.yaml` from the new tag, then run `docker c
 | PyPI with pipx | `pipx upgrade roune-agent-memory` | `agent-memory setup` |
 | mise | `mise upgrade pipx:roune-agent-memory` | `agent-memory install`, then `agent-memory setup` |
 | uv from git | `uv tool upgrade roune-agent-memory` | `agent-memory setup` |
-| `install.sh` (from v0.2.0) | run the install command again, which installs the latest release | `agent-memory setup` |
+| `install.sh` (from v0.2.0) | run the install command again, which installs the latest release. `uv tool upgrade` doesn't work here: the script pins the version with `==`, and upgrade stays inside the pin | `agent-memory setup` |
 | a clone | `git pull` | `./scripts/setup` |
 
 Homebrew will appear here as it exists.
@@ -326,6 +326,6 @@ Only the repository owner does these steps. Pushing a tag is the release.
    scripts/image-health ghcr.io/roune/agent-memory-server:0.1.0
    ```
 
-7. **The GitHub release is automatic.** `github-release` creates it, so `releases/latest/download/install.sh` points at the new version. Edit the generated notes on GitHub if they need a word. If the job fails after PyPI took the upload, run its steps by hand: fill the version into a copy of `scripts/install.sh`, then `gh release create v<version> --verify-tag --generate-notes install.sh compose.yaml compose.team.yaml`.
+7. **The GitHub release is automatic.** `github-release` creates it, so `releases/latest/download/install.sh` points at the new version. Edit the generated notes on GitHub if they need a word. If the job fails after PyPI took the upload, run its steps by hand: fill the version into a copy of `scripts/install.sh`, then `gh release create v<version> --verify-tag --generate-notes install.sh compose.yaml compose.team.yaml`. If the release exists already, from a partly failed run, attach the files again with `gh release upload --clobber v<version> install.sh compose.yaml compose.team.yaml`. A tag whose version has a letter (`0.3.0rc1`) is marked a prerelease, so `releases/latest` skips it.
 
 A tag-only workflow can't run in a PR. So on every PR, `test.yml`'s `release-image` job runs the same build for both platforms. It pushes to a registry on the runner instead of GHCR, then pulls each platform and runs `scripts/image-health` on it. It also runs the no-clone `compose.yaml` steps and `compose.team.yaml` against that image. Last, it installs the built wheel and runs `agent-memory setup` twice against that image, with a temporary `HOME`: it checks `/v1/health`, the CLI's server file, and that a memory written before the second run is still there after it. The steps a PR can't cover are the push to GHCR, the native arm64 runner, and the package's visibility.

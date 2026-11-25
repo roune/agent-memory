@@ -9,11 +9,18 @@ home folder.
 """
 
 import os
+import select
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
+
+try:
+    import pty
+except ImportError:  # no pty on this platform
+    pty = None
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +31,7 @@ echo "uv $*" >> "$FAKE_LOG"
 case "$1 $2" in
   "tool dir") echo "$HOME/.local/bin" ;;
   "tool install")
+    cat > /dev/null
     mkdir -p "$HOME/.local/bin"
     echo fake > "$HOME/.local/bin/agent-memory"
     ;;
@@ -85,7 +93,7 @@ class InstallShTest(unittest.TestCase):
     def with_uv(self):
         self.put("uv", FAKE_UV)
 
-    def run_script(self, *args, script=None, extra_path="", **env):
+    def run_script(self, *args, script=None, extra_path="", stdin=None, **env):
         environ = {
             "PATH": str(self.tools) + extra_path,
             "HOME": str(self.home),
@@ -94,9 +102,10 @@ class InstallShTest(unittest.TestCase):
         }
         environ.update(env)
         return subprocess.run(
-            ["/bin/sh", str(script or self.script), *args],
+            ["/bin/sh", *(["-s", "--"] if stdin is not None else [str(script or self.script)]), *args],
             env=environ,
-            stdin=subprocess.DEVNULL,
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=60,
@@ -173,6 +182,71 @@ class InstallShTest(unittest.TestCase):
             sorted(snapshot(self.home)),
             [".local", ".local/bin", ".local/bin/agent-memory", ".local/bin/uv"],
         )
+        # The script put uv's folder on its own PATH, but not on the user's.
+        self.assertIn(f'export PATH="{self.home}/.local/bin:$PATH"', result.stdout)
+
+    def test_run_from_a_pipe_nothing_eats_the_rest_of_the_script(self):
+        # curl | sh: the script is stdin, and the fake uv reads stdin.
+        self.put("curl", FAKE_CURL)
+        result = self.run_script("--yes", stdin=self.script.read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls()[-2:], ["uv tool install roune-agent-memory==0.2.0", "uv tool dir --bin"])
+        self.assertIn("agent-memory setup", result.stdout)
+
+    def test_a_truncated_script_runs_nothing(self):
+        self.with_uv()
+        text = self.script.read_text()
+        cut = text[: text.index("\nmain \"$@\"")]
+        result = self.run_script("--yes", stdin=cut)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(snapshot(self.home), {})
+
+    def ask_on_a_terminal(self, answer):
+        """Pipe the script into sh under a pty and answer the question."""
+        self.put("curl", FAKE_CURL)
+        env = {
+            "PATH": str(self.tools),
+            "HOME": str(self.home),
+            "FAKE_LOG": str(self.log),
+            "FAKE_UV_SOURCE": str(self.fake_uv),
+        }
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve("/bin/sh", ["/bin/sh", "-c", f"cat '{self.script}' | sh"], env)
+        out, sent, end = b"", False, time.time() + 30
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                out += data
+            if not sent and b"[y/N]" in out:
+                os.write(fd, answer.encode() + b"\n")
+                sent = True
+        _, status = os.waitpid(pid, 0)
+        os.close(fd)
+        return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
+
+    @unittest.skipIf(pty is None, "no pty on this platform")
+    def test_the_question_is_read_from_the_terminal(self):
+        code, out = self.ask_on_a_terminal("y")
+        self.assertEqual(code, 0, out)
+        self.assertIn("uv tool install roune-agent-memory==0.2.0", self.calls())
+        self.assertIn("installer UV_NO_MODIFY_PATH=1", self.calls())
+
+    @unittest.skipIf(pty is None, "no pty on this platform")
+    def test_no_or_an_empty_answer_installs_nothing_and_prints_the_command(self):
+        for answer in ("n", ""):
+            with self.subTest(answer=answer):
+                code, out = self.ask_on_a_terminal(answer)
+                self.assertEqual(code, 1, out)
+                self.assertIn("env UV_NO_MODIFY_PATH=1 sh", out)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(snapshot(self.home), {})
 
     def test_native_windows_is_refused_with_the_wsl_link(self):
         self.with_uv()
@@ -203,6 +277,8 @@ class ReleaseJobTest(unittest.TestCase):
         self.assertIn("contents: write", job)
         self.assertEqual(text.count("contents: write"), 1)
         self.assertIn("--verify-tag", job)
+        self.assertIn("--prerelease", job)
+        self.assertIn("persist-credentials: false", job)
         self.assertIn("--generate-notes", job)
         for name in ("release/install.sh", "compose.yaml", "compose.team.yaml"):
             self.assertIn(name, job)
