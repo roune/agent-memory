@@ -119,7 +119,7 @@ jobs:
     # way the tap installs it from PyPI's. release.yml's homebrew job renders
     # the same template with PyPI's URL and opens the tap PR, so a formula that
     # fails here would fail there. The URL is file://, so the audit runs
-    # without --online; the tap's own CI runs that one on the bump PR.
+    # without --online; the tap's brew test-bot builds from PyPI's URL on the bump PR.
     runs-on: macos-latest
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
