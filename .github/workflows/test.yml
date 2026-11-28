@@ -37,6 +37,8 @@ jobs:
       - run: uv build --out-dir dist
       - name: PyPI would accept the metadata and the long description
         run: uvx twine check --strict dist/*
+      - name: shellcheck on the install script
+        run: shellcheck -s sh scripts/install.sh
       - name: The wheel and the sdist carry the packaged compose.yaml
         run: |
           unzip -Z1 dist/*.whl | grep -qx 'agent_memory_assets/compose.yaml'

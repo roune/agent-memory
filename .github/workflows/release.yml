@@ -133,3 +133,35 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  github-release:
+    # After pypi, so a release page never points at a version PyPI doesn't have.
+    # The only job that can write to the repository.
+    needs: [check, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: install.sh with this release's version filled in
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -eu
+          mkdir release
+          sed "s/@VERSION@/$VERSION/" scripts/install.sh > release/install.sh
+          grep -qx "VERSION='$VERSION'" release/install.sh
+          sh -n release/install.sh
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A version with a letter (0.3.0rc1, 0.3.0a1) is a prerelease, so
+          # releases/latest never points at it.
+          flag=""
+          if printf '%s' "${TAG#v}" | grep -q '[A-Za-z]'; then flag="--prerelease"; fi
+          gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" $flag \
+            release/install.sh compose.yaml compose.team.yaml
