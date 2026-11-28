@@ -36,6 +36,8 @@ class StubServer:
         self.rejections = set()
         self.requests = []
         self.fail_next = None
+        # What /v1/health reports as "version"; None leaves the field out, as a server older than 0.2.0 does.
+        self.version = None
         # path -> (status, payload), answered every time until removed.
         self.fail_path = {}
         self.redirect_to = None
@@ -73,7 +75,10 @@ class StubServer:
                     if parts.path in stub.fail_path:
                         return self._answer(*stub.fail_path[parts.path])
                     if parts.path == "/v1/health":
-                        return self._answer(200, {"status": "ok", "memories": len(stub.rows)})
+                        health = {"status": "ok", "memories": len(stub.rows)}
+                        if stub.version:
+                            health["version"] = stub.version
+                        return self._answer(200, health)
                     if stub.token and self.headers.get("Authorization") != f"Bearer {stub.token}":
                         return self._answer(401, {"error": "unknown or revoked token"})
                     return self._answer(*stub.route(self.command, parts.path, parse_qs(parts.query), body))

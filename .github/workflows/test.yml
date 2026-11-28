@@ -241,7 +241,10 @@ jobs:
     # one pulled and checked with scripts/image-health, the check release.yml
     # runs on the published image. A tag-only workflow can't run in a PR, so
     # this is the same build and check, one step short of GHCR. It also runs
-    # the no-clone setup and compose.team.yaml against that image.
+    # the no-clone setup and compose.team.yaml against that image, and last of
+    # all `agent-memory setup` from the built wheel. Those steps share port
+    # 8765, so each earlier one ends with `down`, and the last one checks that
+    # nothing holds the port before it starts.
     runs-on: ubuntu-latest
     services:
       registry:
@@ -350,3 +353,47 @@ jobs:
           echo "health check: $state"
           test "$state" = healthy
           docker compose -p team -f compose.team.yaml down
+      - uses: astral-sh/setup-uv@v6
+      - name: agent-memory setup, twice, from the built wheel and this image
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The earlier steps ended with `down`. Setup would refuse a busy port, so fail here with a clear line.
+          test -z "$(docker ps -q --filter publish=8765)" || { docker ps; echo "port 8765 is still held"; exit 1; }
+
+          # A temporary HOME, so setup writes no real config. Docker keeps the real one.
+          export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
+          uv build --wheel --out-dir "$RUNNER_TEMP/wheel"
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP"/wheel/*.whl
+          export HOME="$RUNNER_TEMP/setup-home"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          mkdir -p "$HOME"
+          export AGENT_MEMORY_IMAGE="$IMAGE:$VERSION"
+          cli="$RUNNER_TEMP/venv/bin/agent-memory"
+          folder="$XDG_DATA_HOME/agent-memory/server"
+          test "$("$cli" setup --print-dir)" = "$folder"
+
+          "$cli" setup --no-input 2>&1 | tee first.log
+          # The image was built from this commit, so its version is the CLI's, and setup has no warning to print.
+          if grep -q "this CLI is" first.log; then exit 1; fi
+          curl -sf http://127.0.0.1:8765/v1/health | python3 -c "import json, sys; h = json.load(sys.stdin); assert h['status'] == 'ok' and h['version'] == '$VERSION', h"
+          grep -qx "url = http://127.0.0.1:8765" "$HOME/.config/agent-memory/server"
+          test -f "$folder/data/server/memories.sqlite"
+
+          # One memory through the API, so the second setup has data to keep.
+          curl -sf -X POST -H 'Content-Type: application/json' http://127.0.0.1:8765/v1/memories \
+            -d '{"kind": "learning", "domain": "code", "text": "kept across setup", "repo": "github.com/example/ci", "tool": "git", "session_id": "ci", "org": "CI", "team": "CI", "person": "ci", "occurred_at": "2026-11-20T10:00:00+00:00"}' > written.json
+          id=$(python3 -c "import json; print(json.load(open('written.json'))['id'])")
+          curl -sf "http://127.0.0.1:8765/v1/memories/$id" | grep -q "kept across setup"
+
+          # The upgrade step, run again: the data stays, and the server comes back.
+          "$cli" setup --no-input 2>&1 | tee second.log
+          if grep -q "this CLI is" second.log; then exit 1; fi
+          test -f "$folder/data/server/memories.sqlite"
+          curl -sf "http://127.0.0.1:8765/v1/memories/$id" | grep -q "kept across setup"
+          curl -sf http://127.0.0.1:8765/v1/health | python3 -c "import json, sys; h = json.load(sys.stdin); assert h['status'] == 'ok', h"
+          docker compose -p agent-memory-server -f "$folder/compose.yaml" --project-directory "$folder" down
