@@ -23,7 +23,7 @@ services:
   server:
     # The published image, pinned to this release, as in compose.yaml. There is
     # no `build:` here: a team server runs the published image.
-    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
+    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.2.0}
     restart: unless-stopped
     depends_on:
       - qdrant

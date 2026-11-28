@@ -171,7 +171,7 @@ For your own folder layout, or to see each step, do what `setup` does by hand:
 
 ```
 mkdir my-agent-memory && cd my-agent-memory
-curl -fsSLO https://raw.githubusercontent.com/roune/agent-memory/v0.1.0/compose.yaml
+curl -fsSLO https://raw.githubusercontent.com/roune/agent-memory/v0.2.0/compose.yaml
 mkdir -p data/server data/qdrant
 printf 'AGENT_MEMORY_UID=%s\nAGENT_MEMORY_GID=%s\n' "$(id -u)" "$(id -g)" > .env
 docker compose pull
@@ -181,7 +181,7 @@ agent-memory connect --url http://127.0.0.1:8765
 agent-memory install
 ```
 
-- **`compose.yaml` comes from the release tag** (here `v0.1.0`), so it pins the image of that release.
+- **`compose.yaml` comes from the release tag** (here `v0.2.0`), so it pins the image of that release.
 - **Pull before `up`.** `compose.yaml` keeps `build: .` for clones, and with `build:` set, a plain `up` tries to build a missing image instead of pulling it. There is nothing to build here.
 - **Create `data/server` first, and write `.env`.** On Linux, Docker creates a missing bind folder owned by root, and the server runs as the ids in `.env` (1000:1000 without them), so it couldn't write `memories.sqlite`. `scripts/setup` does both in a clone.
 - **`data/` next to `compose.yaml` is the store.** Back up `data/server/memories.sqlite`.
@@ -240,7 +240,7 @@ One host runs the server with auth on, behind a reverse proxy that adds HTTPS. E
 
 ```
 mkdir agent-memory-server && cd agent-memory-server
-curl -fsSLO https://raw.githubusercontent.com/roune/agent-memory/v0.1.0/compose.team.yaml
+curl -fsSLO https://raw.githubusercontent.com/roune/agent-memory/v0.2.0/compose.team.yaml
 mkdir -p data/server data/qdrant
 cat > .env <<EOF
 AGENT_MEMORY_ALLOWED_HOSTS=memory.acme.internal
