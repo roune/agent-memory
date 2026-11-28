@@ -11,6 +11,8 @@ Use `config` to change git hook policy and auto-approve without reinstalling.
 `migrate` copies the old local memories.sqlite to the server, and `list` reads
 from the server. `connect --editor` registers the server's read-only MCP
 endpoint in Claude Code, Cursor and Codex, with a read token for each.
+`setup` starts the server in Docker for a tool install, without a clone
+(server_setup.py).
 """
 
 import argparse
@@ -3789,6 +3791,24 @@ def connect_cmd(args):
     return 0
 
 
+def connect_found_editors(tools):
+    """connect --editor for these tools, as setup's offer runs it: connect shows its diff and asks again."""
+    return connect_editors(
+        argparse.Namespace(editor=",".join(tools), url="", token_stdin=False, mode=None, repo="", print=False, yes=False)
+    )
+
+
+def setup_cmd(args):
+    # Imported here, so the hooks, which must stay fast, never load it.
+    import server_setup
+
+    deps = server_setup.Deps(version=cli_version(), present_tools=present_tools, connect_editors=connect_found_editors)
+    try:
+        return server_setup.setup(args, deps)
+    except server_setup.SetupFailed as error:
+        raise SystemExit(str(error)) from None
+
+
 def migrate_cmd(args):
     try:
         return memory_migrate.migrate(dry_run=args.dry_run)
@@ -3931,6 +3951,32 @@ def build_parser():
     shown.add_argument("--print", action="store_true", help="with --editor: print the lines and write nothing")
     shown.add_argument("--yes", action="store_true", help="with --editor: write without prompting")
     connect_parser.set_defaults(func=connect_cmd)
+
+    setup_parser = sub.add_parser(
+        "setup",
+        help="start the agent-memory server in Docker, without a clone",
+        description=(
+            "Start the agent-memory server and Qdrant in Docker, from the published image, wait for /v1/health, "
+            "and point the CLI at http://127.0.0.1:8765 if no server is configured. The folder holds compose.yaml, "
+            ".env and data/. Every check runs before anything is written, and a refusal changes nothing. Run it again "
+            "after you upgrade the CLI: it rewrites compose.yaml for the new version, keeps .env and data/, pulls and "
+            "restarts. In a clone, use ./scripts/setup instead."
+        ),
+    )
+    setup_parser.add_argument(
+        "--dir",
+        metavar="PATH",
+        default="",
+        help="the server's folder (default: ${XDG_DATA_HOME:-~/.local/share}/agent-memory/server); remembered for the next run",
+    )
+    setup_parser.add_argument(
+        "--force", action="store_true", help="go ahead when the folder's compose.yaml runs a newer server than this CLI"
+    )
+    setup_parser.add_argument(
+        "--no-input", action="store_true", help="never ask; only print the editor commands"
+    )
+    setup_parser.add_argument("--print-dir", action="store_true", help="print the server's folder and exit")
+    setup_parser.set_defaults(func=setup_cmd)
 
     migrate_parser = sub.add_parser("migrate", help="copy the local memories.sqlite to the connected server")
     migrate_parser.add_argument("--dry-run", action="store_true", help="print the counts and send nothing")

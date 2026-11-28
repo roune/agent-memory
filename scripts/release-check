@@ -13,17 +13,17 @@ it builds anything, and CI runs it on every PR with the current version, so a
 version bump that misses a compose file fails there first.
 """
 
-import re
 import sys
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGE = "ghcr.io/roune/agent-memory-server"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The pin's pattern is shared with `agent-memory setup`, which reads it from the installed package.
+from agent_memory_assets import IMAGE, pins  # noqa: E402
+
 COMPOSE_FILES = ("compose.yaml", "compose.team.yaml", "scripts/agent_memory_assets/compose.yaml")
 PACKAGED = "scripts/agent_memory_assets/compose.yaml"
-# image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
-PIN = re.compile(r"^\s*image:\s*\$\{AGENT_MEMORY_IMAGE:-" + re.escape(IMAGE) + r":([^}\s]+)\}\s*$", re.MULTILINE)
 
 
 def version(root=ROOT):
@@ -41,9 +41,9 @@ def problems(tag, root=ROOT):
         if not (root / name).is_file():
             found.append(f"{name} is missing")
             continue
-        pins = PIN.findall((root / name).read_text(encoding="utf-8"))
-        if pins != [expected]:
-            shown = ", ".join(pins) or "none"
+        found_pins = pins((root / name).read_text(encoding="utf-8"))
+        if found_pins != [expected]:
+            shown = ", ".join(found_pins) or "none"
             found.append(f"{name} pins {IMAGE} at {shown}; it should pin {expected}")
     if (root / PACKAGED).is_file() and (root / "compose.yaml").is_file() and (root / PACKAGED).read_bytes() != (root / "compose.yaml").read_bytes():
         found.append(f"{PACKAGED} differs from compose.yaml; copy it: cp compose.yaml {PACKAGED}")
