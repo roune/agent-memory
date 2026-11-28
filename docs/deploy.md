@@ -104,6 +104,16 @@ The PyPI package exists from v0.2.0. Until then, and for the unreleased main, in
 
 ### Other ways to install the CLI
 
+- **Homebrew** (from v0.2.0), from the tap `roune/homebrew-tap`:
+
+  ```
+  brew install roune/tap/agent-memory
+  ```
+
+  The full name works as it is. To install by the short name, tap it and trust the formula first. Homebrew doesn't ask: it refuses a short-name formula from a third-party tap until it is trusted. So: `brew tap roune/tap`, then `brew trust --formula roune/tap/agent-memory`, then `brew install agent-memory`.
+  Other untrusted taps on the same machine can make `brew install` fail too, in Homebrew's check of installed formulae. `brew trust` those, or untap the ones you don't use.
+
+  The formula installs only the CLI, so Docker is still yours to install. The hooks that `agent-memory install` writes run `$(brew --prefix)/bin/agent-memory`, the link that stays put across upgrades, not the versioned `Cellar/` folder it leads to.
 - **pipx:** `pipx install roune-agent-memory`.
 - **The install script** (from v0.2.0), for a machine with neither uv nor Homebrew:
 
@@ -184,6 +194,7 @@ To upgrade by hand, download `compose.yaml` from the new tag, then run `docker c
 
 | Install | Upgrade the CLI | Then |
 | --- | --- | --- |
+| Homebrew (from v0.2.0) | `brew upgrade agent-memory` | `agent-memory setup` |
 | PyPI with uv (from v0.2.0) | `uv tool upgrade roune-agent-memory` | `agent-memory setup` |
 | PyPI with pipx | `pipx upgrade roune-agent-memory` | `agent-memory setup` |
 | mise | `mise upgrade pipx:roune-agent-memory` | `agent-memory install`, then `agent-memory setup` |
@@ -191,12 +202,10 @@ To upgrade by hand, download `compose.yaml` from the new tag, then run `docker c
 | `install.sh` (from v0.2.0) | run the install command again, which installs the latest release. `uv tool upgrade` doesn't work here: the script pins the version with `==`, and upgrade stays inside the pin | `agent-memory setup` |
 | a clone | `git pull` | `./scripts/setup` |
 
-Homebrew will appear here as it exists.
-
 - **`setup` is the upgrade for the server.** It rewrites `compose.yaml` for the new version, keeps `.env` and `data/`, pulls the new image and restarts. The server moves to the new image only then.
 - **The CLI tells you when they differ.** `/v1/health` reports the server's `version`. `agent-memory setup` and `agent-memory review` compare it with the CLI's own, and print one line when they differ: `the server runs 0.2.0 and this CLI is 0.3.0: run agent-memory setup to upgrade the server`. A server whose `/v1/health` has no version is older than 0.2.0, and the line says so. `capture`, `git-hook` and `sync --quiet` never ask, so the hooks stay fast and silent. `review` asks with a short timeout and says nothing when the server doesn't answer.
 - **A server you started another way** (the manual steps, a team host) is upgraded the way you started it.
-- **The hooks keep working.** They run the command as it was called, which uv's and pipx's bin links keep across an upgrade; mise is the exception (see [mise](#other-ways-to-install-the-cli)). See [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages).
+- **The hooks keep working.** They run the command as it was called, which Homebrew's `$(brew --prefix)/bin` and uv's and pipx's bin links keep across an upgrade; mise is the exception (see [mise](#other-ways-to-install-the-cli)). See [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages).
 
 ### If Qdrant won't start after an upgrade
 
@@ -298,6 +307,12 @@ Only the repository owner does these steps. Pushing a tag is the release.
 - On pypi.org, under Your account → Publishing, add a *pending publisher*: project `roune-agent-memory`, owner `roune`, repository `agent-memory`, workflow `release.yml`, environment `pypi`. It doesn't reserve the name until the first upload, so register it early, which also makes PyPI check the name now.
 - In the repository's Settings → Environments, create an environment called `pypi`. Add a required reviewer if you want a pause before every upload.
 
+**One-time setup for Homebrew**, before the first tag that should open a tap PR. Without it, the `homebrew` job does nothing:
+
+- On GitHub, under Settings → Developer settings → Fine-grained tokens, make a token with access to `roune/homebrew-tap` only, and two repository permissions: Contents, read and write, and Pull requests, read and write.
+- Store it in this repository (`roune/agent-memory`) as the Actions secret `HOMEBREW_TAP_TOKEN`: Settings → Secrets and variables → Actions. A PR opened with the workflow's own `GITHUB_TOKEN` couldn't reach the tap, and wouldn't run the tap's tests.
+- When it expires, make a new one and replace the secret.
+
 1. **Choose the version.** Set it in `pyproject.toml` (`version`), and in the `image:` line of both `compose.yaml` and `compose.team.yaml`. The copy of `compose.yaml` at `scripts/agent_memory_assets/compose.yaml`, which the wheel carries for `agent-memory setup`, must be byte-for-byte the same, so copy it after you edit the root file. Run `uv lock` and `scripts/release-check v<version>`. CI runs the same check on every PR, so a version bump that misses one of these files, or a packaged copy that differs, fails there.
 2. **Merge** to `main`.
 3. **Tag the merge commit and push the tag:**
@@ -313,6 +328,7 @@ Only the repository owner does these steps. Pushing a tag is the release.
    - `verify` pulls that tag on an amd64 runner and an arm64 runner, and runs `scripts/image-health`. That checks `/v1/health` with auth on, that `/v1/whoami` needs a token, the architecture, and the version label.
    - `build` runs `uv build` and keeps `dist/` as an artifact.
    - `pypi` runs after `verify`, so a release whose image failed never reaches PyPI. It uploads the wheel and the sdist from `build`. An upload can't be taken back: a version can be yanked, never uploaded twice.
+   - `homebrew` runs after `pypi`. It waits up to 10 minutes for the sdist to show in PyPI's JSON API, then renders `packaging/homebrew/agent-memory.rb` with that sdist's URL and sha256 through `scripts/homebrew-formula --pypi-json`. If the tap's `main` has that url and sha256 already, it stops there. Otherwise it pushes `Formula/agent-memory.rb` to the branch `agent-memory-<version>` on `roune/homebrew-tap`, as `github-actions[bot]`, and opens a PR there. It skips a prerelease, and does nothing when `HOMEBREW_TAP_TOKEN` is unset.
    - `github-release` runs after `pypi`, and is the only job with `contents: write`. It fills the version into a copy of `scripts/install.sh`, then runs `gh release create` for the tag with `--verify-tag` and generated notes, and attaches that `install.sh`, `compose.yaml` and `compose.team.yaml`.
 5. **Make the package public, once.** GHCR creates the package as private on its first push. The no-clone and team setups pull without logging in, so they fail until it is public.
    - Go to github.com/roune → Packages → `agent-memory-server` → Package settings → Danger Zone → Change visibility → Public.
@@ -327,5 +343,27 @@ Only the repository owner does these steps. Pushing a tag is the release.
    ```
 
 7. **The GitHub release is automatic.** `github-release` creates it, so `releases/latest/download/install.sh` points at the new version. Edit the generated notes on GitHub if they need a word. If the job fails after PyPI took the upload, run its steps by hand: fill the version into a copy of `scripts/install.sh`, then `gh release create v<version> --verify-tag --generate-notes install.sh compose.yaml compose.team.yaml`. If the release exists already, from a partly failed run, attach the files again with `gh release upload --clobber v<version> install.sh compose.yaml compose.team.yaml`. A tag whose version has a letter (`0.3.0rc1`) is marked a prerelease, so `releases/latest` skips it.
+8. **Publish the bottles.** When the tap PR's tests are green, run the command its body gives:
+
+   ```
+   gh workflow run publish.yml --repo roune/homebrew-tap -f pull_request=<N>
+   ```
+
+   That runs `brew pr-pull`, which adds the bottles and pushes the formula to the tap's `main`. The formula reaches `brew install roune/tap/agent-memory` only then: for v0.2.0 the tap has no formula before it, and for later releases people get the previous version until then. `pr-pull` closes the PR and leaves its branch, `agent-memory-<version>`, which you can delete afterwards.
+
+   If the `homebrew` job failed, or the secret wasn't set, open the PR by hand. Render the formula from a checkout of the release tag, so the template is the release's own, with the sdist's hashed URL and sha256 from PyPI's JSON. Then, in a clone of `roune/homebrew-tap`:
+
+   ```
+   git -C <agent-memory clone> switch --detach v<version>
+   curl -fsSL https://pypi.org/pypi/roune-agent-memory/<version>/json -o /tmp/pypi.json
+   git switch -c agent-memory-<version>
+   <agent-memory clone>/scripts/homebrew-formula --pypi-json /tmp/pypi.json --version <version> --out Formula/agent-memory.rb
+   git add Formula/agent-memory.rb
+   git commit -m "agent-memory <version>"
+   git push -u origin agent-memory-<version>
+   gh pr create --repo roune/homebrew-tap --fill
+   ```
 
 A tag-only workflow can't run in a PR. So on every PR, `test.yml`'s `release-image` job runs the same build for both platforms. It pushes to a registry on the runner instead of GHCR, then pulls each platform and runs `scripts/image-health` on it. It also runs the no-clone `compose.yaml` steps and `compose.team.yaml` against that image. Last, it installs the built wheel and runs `agent-memory setup` twice against that image, with a temporary `HOME`: it checks `/v1/health`, the CLI's server file, and that a memory written before the second run is still there after it. The steps a PR can't cover are the push to GHCR, the native arm64 runner, and the package's visibility.
+
+The same goes for Homebrew: `test.yml`'s `homebrew` job, on macOS, renders the formula with a `file://` URL to an sdist built from the PR, installs it from source in a local tap, runs `brew test` and `brew audit --strict --new`, and checks that `agent-memory install` points the hooks at `$(brew --prefix)/bin/agent-memory`. The URL is `file://`, so that audit runs without `--online`. The tap's own tests, `brew test-bot`, build the formula from PyPI's URL on the PR the release opens.

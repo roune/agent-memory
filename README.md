@@ -43,6 +43,7 @@ agent-memory setup
 
 That is on PyPI from v0.2.0. These work too:
 
+- **Homebrew** (from v0.2.0): `brew install roune/tap/agent-memory`. To install it by its short name, `brew tap roune/tap`, then `brew trust --formula roune/tap/agent-memory`, then `brew install agent-memory`. See [deploy.md](docs/deploy.md#other-ways-to-install-the-cli).
 - **pipx:** `pipx install roune-agent-memory`.
 - **The install script**, if you have neither uv nor Homebrew (from v0.2.0): `curl -LsSf https://github.com/roune/agent-memory/releases/latest/download/install.sh | sh`. It installs uv if you say yes, then this release of the CLI, and prints the next steps. It runs neither `setup` nor `install`. Read the script first, it is short: `scripts/install.sh`, attached to each release. To skip the question about uv, end the command with `| sh -s -- --yes`.
 - **mise:** `mise use -g pipx:roune-agent-memory`. Use `mise activate`, not mise's shims, and run `agent-memory install` again after each `mise upgrade`. See [deploy.md](docs/deploy.md#other-ways-to-install-the-cli).
