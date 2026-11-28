@@ -35,10 +35,19 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv lock --check
       - run: uv build --out-dir dist
+      - name: The wheel and the sdist carry the packaged compose.yaml
+        run: |
+          unzip -Z1 dist/*.whl | grep -qx 'agent_memory_assets/compose.yaml'
+          tar tzf dist/*.tar.gz | grep -q 'scripts/agent_memory_assets/compose.yaml'
       - name: Install the wheel without the server extra
         run: |
           uv venv --python 3.12 /tmp/venv
           uv pip install --python /tmp/venv/bin/python dist/*.whl
+          # importlib.resources reads the same bytes from the installed wheel.
+          cd /tmp && /tmp/venv/bin/python -c "
+          import agent_memory_assets, sys
+          sys.exit(0 if agent_memory_assets.compose_bytes() == open('$GITHUB_WORKSPACE/compose.yaml', 'rb').read() else 1)"
+          cd "$GITHUB_WORKSPACE"
           /tmp/venv/bin/agent-memory --help
           set +e
           /tmp/venv/bin/agent-memory-server 2> /tmp/server.err

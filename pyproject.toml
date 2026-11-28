@@ -46,4 +46,8 @@ py-modules = [
 ]
 # The server. Its HTTP parts import Starlette from the server extra; the rest
 # is standard library, so the plain-python3 suite tests it too.
-packages = ["agent_memory_server"]
+packages = ["agent_memory_server", "agent_memory_assets"]
+
+[tool.setuptools.package-data]
+# The compose file the CLI writes for `agent-memory setup`.
+agent_memory_assets = ["compose.yaml"]

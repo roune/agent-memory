@@ -1,0 +1,52 @@
+# The agent-memory server, and Qdrant next to it, for one person on one laptop.
+# In a clone, `./scripts/setup` starts both. Without one (docs/deploy.md):
+#
+#   docker compose pull && docker compose up -d
+#
+# Only the server's port is published, and only on loopback, because auth is
+# off. Qdrant has no ports: the server reaches it as http://qdrant:6333 on the
+# compose network, and nothing on the laptop talks to it. A server other
+# machines reach is compose.team.yaml, with auth on.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+
+  server:
+    # The published image, pinned to this release (scripts/release-check keeps
+    # the tag equal to pyproject.toml's version). In a clone, setup runs
+    # `docker compose up --build`, which builds it from this checkout instead.
+    # Without a clone there is nothing to build, so pull first: with `build:`
+    # set, a plain `up` builds a missing image rather than pulling it.
+    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    # The host user's ids, from .env (scripts/setup writes them), so the files
+    # in data/server are yours.
+    user: "${AGENT_MEMORY_UID:-1000}:${AGENT_MEMORY_GID:-1000}"
+    environment:
+      # Auth off is safe only because the port below is published on loopback.
+      # The server's browser rules keep web pages on this machine out.
+      # Anywhere else, leave auth on (the default) and mint tokens with
+      # `agent-memory-server token create` (docs/server.md, "Auth and tokens").
+      AGENT_MEMORY_AUTH: "off"
+      AGENT_MEMORY_QDRANT_URL: http://qdrant:6333
+      # Set these in .env. Switching the embedder also needs a reindex
+      # (docs/server.md, "Commands"). If you publish another port, add it to
+      # the allowed hosts and keep 127.0.0.1:8765, which the health check uses.
+      AGENT_MEMORY_EMBEDDER: ${AGENT_MEMORY_EMBEDDER:-fastembed}
+      AGENT_MEMORY_EMBED_MODEL: ${AGENT_MEMORY_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      AGENT_MEMORY_ALLOWED_HOSTS: ${AGENT_MEMORY_ALLOWED_HOSTS:-127.0.0.1:8765,localhost:8765}
+      AGENT_MEMORY_ALLOWED_ORIGINS: ${AGENT_MEMORY_ALLOWED_ORIGINS:-}
+      AGENT_MEMORY_QDRANT_API_KEY: ${AGENT_MEMORY_QDRANT_API_KEY:-}
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data/server:/data

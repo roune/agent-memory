@@ -196,7 +196,7 @@ agent-memory doesn't run on native Windows. The CLI exits with a pointer to this
 
 Only the repository owner does these steps. Pushing a tag is the release.
 
-1. **Choose the version.** Set it in `pyproject.toml` (`version`), and in the `image:` line of both `compose.yaml` and `compose.team.yaml`. Run `uv lock` and `scripts/release-check v<version>`. CI runs the same check on every PR, so a version bump that misses one of the three files fails there.
+1. **Choose the version.** Set it in `pyproject.toml` (`version`), and in the `image:` line of both `compose.yaml` and `compose.team.yaml`. The copy of `compose.yaml` at `scripts/agent_memory_assets/compose.yaml`, which the wheel carries for `agent-memory setup`, must be byte-for-byte the same, so copy it after you edit the root file. Run `uv lock` and `scripts/release-check v<version>`. CI runs the same check on every PR, so a version bump that misses one of these files, or a packaged copy that differs, fails there.
 2. **Merge** to `main`.
 3. **Tag the merge commit and push the tag:**
 

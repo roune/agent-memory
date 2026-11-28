@@ -8,6 +8,7 @@
 !NOTICE
 !scripts/*.py
 !scripts/agent_memory_server/
+!scripts/agent_memory_assets/
 scripts/test_*.py
 scripts/server_doubles.py
 **/__pycache__
