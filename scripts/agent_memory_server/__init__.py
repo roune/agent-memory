@@ -29,7 +29,8 @@ DIST = "roune-agent-memory"
 REQUIRED = ("mcp", "fastembed")
 INSTALL_HINT = (
     "this command needs the server extra: "
-    f"uv tool install '{DIST}[server] @ git+https://github.com/roune/agent-memory'"
+    f"uv tool install '{DIST}[server]', "
+    f"or uv tool install '{DIST}[server] @ git+https://github.com/roune/agent-memory' for the unreleased main"
 )
 
 

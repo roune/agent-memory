@@ -5,7 +5,7 @@ There are three ways to run it. Each one has two parts: the `agent-memory` CLI o
 | Setup | CLI | Server | Auth |
 | --- | --- | --- | --- |
 | [One laptop, from a clone](#one-laptop-from-a-clone) | `./scripts/install` (editable) | `./scripts/setup`, built from the clone | off, loopback only |
-| [One laptop, without a clone](#one-laptop-without-a-clone) | `uv tool install git+https://github.com/roune/agent-memory` | `agent-memory setup`, with `compose.yaml` from the package and the published image | off, loopback only |
+| [One laptop, without a clone](#one-laptop-without-a-clone) | `uv tool install roune-agent-memory` (from v0.2.0; before that, from git) | `agent-memory setup`, with `compose.yaml` from the package and the published image | off, loopback only |
 | [A team server](#a-team-server) | the same tool install on each laptop | `compose.team.yaml`, the published image | on |
 
 The image is `ghcr.io/roune/agent-memory-server:<version>`, for `linux/amd64` and `linux/arm64`. `compose.yaml` and `compose.team.yaml` pin the version of their release. To run another image, set `AGENT_MEMORY_IMAGE` in `.env`.
@@ -57,7 +57,7 @@ uv tool install git+https://github.com/roune/agent-memory
 agent-memory install
 ```
 
-From a clone, run `./scripts/install --force` instead of the second line. The hook path, `~/.local/bin/agent-memory`, doesn't change.
+From a clone, run `./scripts/install --force` instead of the second line. From v0.2.0 the second line can be `uv tool install roune-agent-memory`. The hook path, `~/.local/bin/agent-memory`, doesn't change.
 
 `agent-memory install` refuses to write hooks from a run that won't last, such as `uvx` or `pipx run`: the copy it runs sits in a cache that gets cleaned. Install the CLI first, then run `agent-memory install`. `agent-memory --version` prints the installed version.
 
@@ -95,10 +95,20 @@ agent-memory connect --editor claude-code   # optional: MCP in the editor
 You need [uv](https://docs.astral.sh/uv/) and Docker with Compose.
 
 ```
-uv tool install git+https://github.com/roune/agent-memory
+uv tool install roune-agent-memory
 agent-memory setup
 agent-memory install         # editor hooks, after a yes
 ```
+
+The PyPI package exists from v0.2.0. Until then, and for the unreleased main, install from git: `uv tool install git+https://github.com/roune/agent-memory`.
+
+### Other ways to install the CLI
+
+- **pipx:** `pipx install roune-agent-memory`.
+- **Try without installing:** `uvx --from roune-agent-memory agent-memory setup` starts the server from a throwaway copy. `agent-memory install` refuses such a run, so install the CLI before you connect hooks.
+- **mise:** `mise use -g pipx:roune-agent-memory`. mise's pipx backend uses uv when uv is installed.
+  - With `mise activate`, `PATH` holds a versioned folder, `…/mise/installs/pipx-roune-agent-memory/<version>/bin`. After a `mise upgrade`, run `agent-memory install` again, so the hooks point at the new version.
+  - Use `mise activate`, not mise's shims. mise installs through uv, with links in `…/installs/pipx-roune-agent-memory/<version>/bin`, so with `mise activate` on `PATH`, `install` accepts the command. A shim is a link to the mise binary, so `install` refuses it. (Checked against mise's pipx backend and a real wheel. A later release could let `install` accept a shim.)
 
 `setup` does what `./scripts/setup` does in a clone, with the published image. It checks everything first and writes nothing until every check has passed:
 
@@ -167,15 +177,18 @@ To upgrade by hand, download `compose.yaml` from the new tag, then run `docker c
 
 | Install | Upgrade the CLI | Then |
 | --- | --- | --- |
+| PyPI with uv (from v0.2.0) | `uv tool upgrade roune-agent-memory` | `agent-memory setup` |
+| PyPI with pipx | `pipx upgrade roune-agent-memory` | `agent-memory setup` |
+| mise | `mise upgrade pipx:roune-agent-memory` | `agent-memory install`, then `agent-memory setup` |
 | uv from git | `uv tool upgrade roune-agent-memory` | `agent-memory setup` |
 | a clone | `git pull` | `./scripts/setup` |
 
-The other ways to install the CLI will appear here as they exist.
+Homebrew and `install.sh` will appear here as they exist.
 
 - **`setup` is the upgrade for the server.** It rewrites `compose.yaml` for the new version, keeps `.env` and `data/`, pulls the new image and restarts. The server moves to the new image only then.
 - **The CLI tells you when they differ.** `/v1/health` reports the server's `version`. `agent-memory setup` and `agent-memory review` compare it with the CLI's own, and print one line when they differ: `the server runs 0.2.0 and this CLI is 0.3.0: run agent-memory setup to upgrade the server`. A server whose `/v1/health` has no version is older than 0.2.0, and the line says so. `capture`, `git-hook` and `sync --quiet` never ask, so the hooks stay fast and silent. `review` asks with a short timeout and says nothing when the server doesn't answer.
 - **A server you started another way** (the manual steps, a team host) is upgraded the way you started it.
-- **The hooks keep working.** They run the command as it was called, which uv's tool bin link keeps across an upgrade (see [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages)).
+- **The hooks keep working.** They run the command as it was called, which uv's and pipx's bin links keep across an upgrade; mise is the exception (see [mise](#other-ways-to-install-the-cli)). See [Git hooks in a folder Cursor manages](#git-hooks-in-a-folder-cursor-manages).
 
 ### If Qdrant won't start after an upgrade
 
@@ -252,7 +265,7 @@ Send the token to its person by a private channel. `migrate` needs a separate ad
 ### On each laptop
 
 ```
-uv tool install git+https://github.com/roune/agent-memory
+uv tool install roune-agent-memory   # from v0.2.0; before that, from git
 agent-memory connect --url https://memory.acme.internal --token-stdin < token.txt
 agent-memory install
 agent-memory connect --editor claude-code,cursor,codex
@@ -264,13 +277,18 @@ agent-memory connect --editor claude-code,cursor,codex
 
 agent-memory doesn't run on native Windows. The CLI exits with a pointer to this section. Use WSL 2, where everything below works as it does on Linux.
 
-- **Install the CLI inside WSL**, in a WSL shell: `uv tool install git+https://github.com/roune/agent-memory`. The Windows `PATH` isn't enough, because the CLI is a Linux program.
+- **Install the CLI inside WSL**, in a WSL shell: `uv tool install roune-agent-memory` (from v0.2.0). The Windows `PATH` isn't enough, because the CLI is a Linux program.
 - **Docker** comes from Docker Desktop with its WSL integration turned on for your distribution, or from Docker Engine installed inside WSL. Run `docker compose` from the WSL shell too, so `data/` sits on the WSL filesystem.
 - **The editors have to run in WSL too.** That means Claude Code or Codex in a WSL shell, or Cursor or VS Code attached to WSL. A hook in the Windows-side `%USERPROFILE%\.cursor` can't run a CLI that lives in WSL, so don't point Windows-side editors at it.
 
 ## Releasing
 
 Only the repository owner does these steps. Pushing a tag is the release.
+
+**One-time setup for PyPI**, before the first tag that should reach it (v0.2.0). The workflow stores no token. It uses trusted publishing:
+
+- On pypi.org, under Your account → Publishing, add a *pending publisher*: project `roune-agent-memory`, owner `roune`, repository `agent-memory`, workflow `release.yml`, environment `pypi`. It doesn't reserve the name until the first upload, so register it early, which also makes PyPI check the name now.
+- In the repository's Settings → Environments, create an environment called `pypi`. Add a required reviewer if you want a pause before every upload.
 
 1. **Choose the version.** Set it in `pyproject.toml` (`version`), and in the `image:` line of both `compose.yaml` and `compose.team.yaml`. The copy of `compose.yaml` at `scripts/agent_memory_assets/compose.yaml`, which the wheel carries for `agent-memory setup`, must be byte-for-byte the same, so copy it after you edit the root file. Run `uv lock` and `scripts/release-check v<version>`. CI runs the same check on every PR, so a version bump that misses one of these files, or a packaged copy that differs, fails there.
 2. **Merge** to `main`.
@@ -285,6 +303,8 @@ Only the repository owner does these steps. Pushing a tag is the release.
    - `check` runs `scripts/release-check` on the tag.
    - `publish` builds `linux/amd64` and `linux/arm64` and pushes `ghcr.io/roune/agent-memory-server:<version>`.
    - `verify` pulls that tag on an amd64 runner and an arm64 runner, and runs `scripts/image-health`. That checks `/v1/health` with auth on, that `/v1/whoami` needs a token, the architecture, and the version label.
+   - `build` runs `uv build` and keeps `dist/` as an artifact.
+   - `pypi` runs after `verify`, so a release whose image failed never reaches PyPI. It uploads the wheel and the sdist from `build`. An upload can't be taken back: a version can be yanked, never uploaded twice.
 5. **Make the package public, once.** GHCR creates the package as private on its first push. The no-clone and team setups pull without logging in, so they fail until it is public.
    - Go to github.com/roune → Packages → `agent-memory-server` → Package settings → Danger Zone → Change visibility → Public.
    - The image's `org.opencontainers.image.source` label links the package to this repo, so the workflow's token can push later versions.
