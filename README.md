@@ -179,4 +179,5 @@ Required Notice: Copyright (c) 2026 Miguel Porcar (https://github.com/roune/agen
 - [docs/embedding-model.md](docs/embedding-model.md) — the model the server runs, and the pinned checkpoint.
 - [docs/research.md](docs/research.md) — the “what already does this” question, still open.
 - [docs/server-plan.md](docs/server-plan.md) — the approved plan for moving to one server in Docker, in ordered PRs.
+- [docs/distribution-plan.md](docs/distribution-plan.md) — the plan for installing without a clone: `agent-memory setup`, PyPI, and a Homebrew tap.
 - [docs/server.md](docs/server.md) — the server: routes, auth, browser rules, the outbox, and `reindex`.
