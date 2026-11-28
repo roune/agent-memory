@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roune-agent-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "File coding-agent sessions and git history, keep only what a person approves, and index that."
 # Not README.md: PyPI doesn't resolve its relative links or its image, and
 # absolute links would make the GitHub README worse on branches and forks.

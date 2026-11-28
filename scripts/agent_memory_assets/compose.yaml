@@ -23,7 +23,7 @@ services:
     # `docker compose up --build`, which builds it from this checkout instead.
     # Without a clone there is nothing to build, so pull first: with `build:`
     # set, a plain `up` builds a missing image rather than pulling it.
-    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.1.0}
+    image: ${AGENT_MEMORY_IMAGE:-ghcr.io/roune/agent-memory-server:0.2.0}
     build: .
     restart: unless-stopped
     depends_on:
