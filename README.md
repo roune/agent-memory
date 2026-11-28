@@ -45,6 +45,8 @@ You need [uv](https://docs.astral.sh/uv/) and Docker with Compose. From a clone 
 
 Without a clone, install the CLI with `uv tool install git+https://github.com/roune/agent-memory`, and run the published image `ghcr.io/roune/agent-memory-server` with the release's `compose.yaml`. [docs/deploy.md](docs/deploy.md) has those steps, a team server with auth on (`compose.team.yaml`), and how a release is made.
 
+The distribution is named `roune-agent-memory`; the command is `agent-memory`. On Windows, run everything inside WSL 2: see [Windows (WSL 2)](docs/deploy.md#windows-wsl-2).
+
 The CLI keeps its inbox, outbox, `review.json` and `capture.log` in `${XDG_DATA_HOME:-~/.local/share}/agent-memory/`, or in `AGENT_MEMORY_DIR` when that is set. An older install kept them in the clone. The first command after the upgrade moves them, and `agent-memory install` points the hooks it wrote at the installed command. See [Upgrading the CLI](docs/deploy.md#upgrading-the-cli-to-the-tool-install).
 
 `install` leaves Cursor, Claude Code, Codex, and Pi alone. Connecting those is a second command, and it asks before it writes:

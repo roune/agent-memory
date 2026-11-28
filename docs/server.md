@@ -120,7 +120,7 @@ Approve asks again for a git bundle stored as a change: it reads the outbox, the
 
 | Route | Scope | Purpose |
 | --- | --- | --- |
-| `GET /v1/health` | none | Liveness, Qdrant readiness, auth on or off, the embedder and its collection, and the counts of memories and pending rows. |
+| `GET /v1/health` | none | Liveness, the server's `version` (the installed package's, for example `0.2.0`). A server with no `version` field is older than 0.2.0, Qdrant readiness, auth on or off, the embedder and its collection, and the counts of memories and pending rows. |
 | `GET /v1/whoami` | any token | The token's id, label, person, org, team, the orgs and teams it may write as, and its scopes. With auth off, it says identity comes from the request body. |
 | `GET /v1/memories?team&org&repo&person&kind&domain&tool&session_id&since&until&limit&offset` | read | Metadata query. `since` and `until` are ISO-8601 times with a zone, or a date; they are compared in UTC, and anything else is a 400. |
 | `GET /v1/memories/{id}` | read | One memory with its commits. 404 when missing. |

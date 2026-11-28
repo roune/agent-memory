@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 import urllib.request
 from pathlib import Path
@@ -211,6 +212,8 @@ class ReadRouteTest(AppCase):
         health = self.client.get("/v1/health").json()
         self.assertEqual((health["status"], health["auth"], health["qdrant"]), ("ok", "off", {"ready": True}))
         self.assertEqual((health["memories"], health["pending"]), (1, 0))
+        with open(ROOT / "pyproject.toml", "rb") as handle:
+            self.assertEqual(health["version"], tomllib.load(handle)["project"]["version"])
         self.assertEqual(health["embedder"]["state"], "ready")
         self.assertEqual(health["embedder"]["collection"], self.embedding.collection)
         whoami = self.client.get("/v1/whoami").json()

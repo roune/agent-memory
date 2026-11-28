@@ -23,7 +23,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import hashlib
+import importlib.metadata
+import tomllib
 import webbrowser
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +45,17 @@ import memory_store
 import outbox
 import server_client
 HOME = Path.home()
+# The name on PyPI, which uv and pipx also name the tool after. Every metadata
+# lookup and install hint uses it. agent_memory_server keeps its own copy.
+DIST = "roune-agent-memory"
+INSTALL_HINT = (
+    "`uv tool install git+https://github.com/roune/agent-memory`, "
+    f"or `uv tool install {DIST}` once it is on PyPI"
+)
+WINDOWS_MESSAGE = (
+    "agent-memory runs on macOS, Linux and WSL 2. On Windows, install it inside WSL: "
+    "https://github.com/roune/agent-memory/blob/main/docs/deploy.md#windows-wsl-2"
+)
 # The clone's own wrapper. Hooks point here only when install runs from a clone
 # without a tool install; see hook_bin().
 BIN = ROOT / "bin" / "agent-memory"
@@ -2868,6 +2882,67 @@ def present_tools():
     return found
 
 
+def cli_version():
+    """This CLI's version: the installed package's, or pyproject.toml in a clone with no install."""
+    try:
+        return importlib.metadata.version(DIST)
+    except importlib.metadata.PackageNotFoundError:
+        with open(ROOT / "pyproject.toml", "rb") as handle:
+            return tomllib.load(handle)["project"]["version"]
+
+
+class VersionAction(argparse.Action):
+    """--version. The lookup runs only when the flag is used, so a clone copied
+    without pyproject.toml can still run every other command."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f"agent-memory {cli_version()}")
+        parser.exit()
+
+
+def path_without_own_env():
+    """PATH minus the folder of the environment this code runs in.
+
+    uvx and `pipx run` put their temporary environment's bin first on PATH, so
+    a plain which() finds the cached copy itself. A tool install, pipx install
+    or Homebrew puts a link in another folder (~/.local/bin, $(brew --prefix)/bin),
+    which stays. The price: a pip install into an activated venv is refused too,
+    because its bin is the running environment's own.
+    """
+    own = os.path.realpath(sysconfig.get_path("scripts"))
+    keep = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry and os.path.realpath(entry) != own]
+    return os.pathsep.join(keep)
+
+
+def lasting_agent_memory():
+    """The agent-memory on PATH that isn't this run's own temporary environment, or None."""
+    return shutil.which("agent-memory", path=path_without_own_env())
+
+
+def lasting_command(command):
+    """Refuse a command that won't be there when a hook fires: a uvx or pipx run.
+
+    The clone's own bin/agent-memory is fine. Otherwise the running file must be
+    the agent-memory on PATH, which is what a tool install or Homebrew gives.
+    """
+    if command == BIN:
+        return command
+    found = lasting_agent_memory()
+    try:
+        if found and os.path.samefile(found, sys.argv[0]):
+            return command
+    except OSError:
+        pass
+    if found:
+        why = f"this is {command}; `agent-memory` on PATH is {found}"
+    else:
+        why = f"this is {command}, and no `agent-memory` that lasts is on PATH"
+    raise SystemExit(
+        f"{why}. Hooks that point at this run could break when it is cleaned up, so nothing was written. "
+        f"Install the CLI first with {INSTALL_HINT}, then run this command again."
+    )
+
+
 def hook_bin():
     """The command the hooks run: the agent-memory that is running install.
 
@@ -2879,15 +2954,17 @@ def hook_bin():
     """
     called = Path(sys.argv[0])
     if called.name == "agent-memory" and called.is_file():
-        return Path(os.path.abspath(called))
+        return lasting_command(Path(os.path.abspath(called)))
     if BIN.is_file():
         return BIN
-    found = shutil.which("agent-memory")
+    # python -m agent_memory, or a script run by path: the command is the one on
+    # PATH, found without this run's own temporary environment.
+    found = lasting_agent_memory()
     if found:
         return Path(os.path.abspath(found))
     raise SystemExit(
         "could not find the agent-memory command for the hooks to run. Install it with "
-        "`uv tool install git+https://github.com/roune/agent-memory`, then run `agent-memory install` again."
+        f"{INSTALL_HINT}, then run `agent-memory install` again."
     )
 
 
@@ -3723,6 +3800,7 @@ def migrate_cmd(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="agent-memory")
+    parser.add_argument("--version", action=VersionAction, nargs=0, help="print the version and exit")
     sub = parser.add_subparsers(dest="command", required=True)
 
     capture_parser = sub.add_parser("capture", help="write an inbox bundle from hook JSON on stdin")
@@ -3925,6 +4003,11 @@ def move_old_state():
 
 
 def main():
+    # Before anything else: the rest of the CLI assumes POSIX (flock, signals,
+    # sh hooks), and WSL 2 reports itself as Linux.
+    if os.name == "nt":
+        print(WINDOWS_MESSAGE, file=sys.stderr)
+        raise SystemExit(2)
     parser = build_parser()
     args = parser.parse_args()
     move_old_state()

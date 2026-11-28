@@ -98,7 +98,7 @@ jobs:
           ./scripts/install | tee "$RUNNER_TEMP/install.out"
           grep -q "Removed the old link" "$RUNNER_TEMP/install.out"
           "$UV_TOOL_BIN_DIR/agent-memory" --help > /dev/null
-          "$UV_TOOL_DIR/agent-memory/bin/python" -c "import agent_memory; print(agent_memory.__file__)" \
+          "$UV_TOOL_DIR/roune-agent-memory/bin/python" -c "import agent_memory; print(agent_memory.__file__)" \
             | grep -qx "$GITHUB_WORKSPACE/scripts/agent_memory.py"
 
   server:
